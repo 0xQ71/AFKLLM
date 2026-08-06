@@ -227,16 +227,14 @@ Thank you for your support and contributions!
 # Contributors
 
 <a href="https://github.com/0xQ71/AFKLLM/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=0xQ71/AFKLLM" alt="Contributors" />
+  <img src="docs/images/contributors.svg" alt="Contributors" />
 </a>
 
 ---
 
 # GitHub Stats
 
-<!-- Paste Cherry-style Repobeats SVG here after login at https://repobeats.axiom.co → 0xQ71/AFKLLM
-![Repobeats analytics image](https://repobeats.axiom.co/api/embed/YOUR_HASH.svg)
--->
+![GitHub Stats](docs/images/github-stats.svg)
 
 ---
 
