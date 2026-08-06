@@ -234,7 +234,7 @@ Thank you for your support and contributions!
 
 # GitHub Stats
 
-![GitHub Stats](docs/images/github-stats.svg)
+![Repobeats analytics image](https://repobeats.axiom.co/api/embed/00ab57f116cd65c83f25a728e12c224a87296930.svg)
 
 ---
 
