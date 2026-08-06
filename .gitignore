@@ -1,0 +1,17 @@
+node_modules
+out
+dist
+*.log
+.DS_Store
+.env
+.env.local
+*.tsbuildinfo
+bin/*
+!bin/.gitkeep
+!bin/README.md
+models/*.gguf
+release
+*.exe.blockmap
+*.pfx
+build/afkllm-codesign-dev.pfx
+build/codesign-dev.env

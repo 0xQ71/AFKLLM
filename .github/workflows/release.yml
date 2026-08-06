@@ -1,0 +1,104 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0)"
+        required: true
+        default: "v0.1.0"
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Resolved tag=$TAG version=$VERSION"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Set package.json version
+        shell: bash
+        run: |
+          npm version "${{ steps.tag.outputs.version }}" --no-git-tag-version --allow-same-version
+
+      - name: Build app
+        run: npm run build
+        env:
+          NODE_OPTIONS: --max-old-space-size=8192
+
+      - name: Package Windows
+        run: npx electron-builder --win --config --publish never
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NODE_OPTIONS: --max-old-space-size=8192
+          # Keep CI unsigned until SignPath Foundation is approved, then sign
+          # the setup.exe via SignPath and attach the signed artifact instead.
+          # See docs/guides/code-signing.md
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+      - name: Load release notes
+        id: notes
+        shell: bash
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          FILE="docs/releases/${TAG}.md"
+          if [ -f "$FILE" ]; then
+            {
+              echo "body<<EOF"
+              cat "$FILE"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "body<<EOF"
+              echo "AFKLLM ${{ steps.tag.outputs.version }}"
+              echo ""
+              echo "See CHANGELOG.md for details."
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: AFKLLM ${{ steps.tag.outputs.version }}
+          body: ${{ steps.notes.outputs.body }}
+          draft: false
+          make_latest: true
+          files: |
+            release/AFKLLM-*-x64-setup.exe
+            release/*.blockmap
+            release/latest.yml
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

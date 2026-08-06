@@ -1,0 +1,74 @@
+appId: com.afkllm.app
+productName: AFKLLM
+copyright: Copyright © 2026 0xQ71
+directories:
+  buildResources: build
+  output: release
+files:
+  # Force-include build output (also listed in .gitignore)
+  - out/**/*
+  - package.json
+  - '!**/.vscode/*'
+  - '!src/*'
+  - '!scripts/*'
+  - '!models/*'
+  - '!bin/*'
+  - '!release/*'
+  - '!electron.vite.config.{js,ts,mjs,cjs}'
+  - '!{.eslintignore,.eslintrc.cjs,.prettierignore,.prettierrc.yaml,dev-app-update.yml,CHANGELOG.md,README.md}'
+  - '!{.env,.env.*,.npmrc,pnpm-lock.yaml}'
+  - '!{tsconfig.json,tsconfig.node.json,tsconfig.web.json,tsconfig.web.tsbuildinfo,tailwind.config.js,postcss.config.js}'
+  - '!**/._*'
+  # Renderer packages are Vite-bundled into out/renderer — don't ship a second copy
+  - '!node_modules/monaco-editor/**'
+  - '!node_modules/@monaco-editor/**'
+  - '!node_modules/react/**'
+  - '!node_modules/react-dom/**'
+  - '!node_modules/@xterm/**'
+  # Windows x64 only — drop other node-pty prebuilds
+  - '!node_modules/node-pty/prebuilds/darwin-*/**'
+  - '!node_modules/node-pty/prebuilds/linux-*/**'
+  - '!node_modules/node-pty/prebuilds/win32-arm64/**'
+  - '!node_modules/node-pty/{src,scripts,deps,typings}/**'
+  - LICENSE
+  - NOTICE
+  - THIRD_PARTY_NOTICES.md
+asarUnpack:
+  - '**/*.node'
+  - '**/node-pty/**'
+# Thin client: do NOT ship llama-server / CUDA DLLs (downloaded on first Load
+# from https://github.com/ggml-org/llama.cpp/releases). Dev still uses ./bin.
+extraResources:
+  - from: .
+    to: legal
+    filter:
+      - LICENSE
+      - NOTICE
+      - THIRD_PARTY_NOTICES.md
+win:
+  executableName: AFKLLM
+  icon: build/icon.ico
+  signtoolOptions:
+    publisherName: 0xQ71
+  target:
+    - target: nsis
+      arch:
+        - x64
+nsis:
+  artifactName: ${productName}-${version}-x64-setup.${ext}
+  shortcutName: ${productName}
+  uninstallDisplayName: ${productName}
+  installerIcon: build/icon.ico
+  uninstallerIcon: build/icon.ico
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: always
+  createStartMenuShortcut: true
+  runAfterFinish: true
+  license: build/license.txt
+npmRebuild: false
+publish:
+  - provider: github
+    owner: 0xQ71
+    repo: AFKLLM
+    releaseType: release

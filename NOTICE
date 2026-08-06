@@ -1,0 +1,33 @@
+AFKLLM
+=======
+
+Copyright (c) 2026 0xQ71
+
+Author: 0xQ71
+GitHub profile: https://github.com/0xQ71
+Repository: https://github.com/0xQ71/AFKLLM
+  (update this URL if the public repo name/owner differs)
+
+When you use, copy, modify, redistribute, or build upon AFKLLM (including in
+commercial or closed-source products), please keep the MIT copyright notice
+and retain attribution to the original author and project links above.
+
+AI model weights (.gguf and similar) are not part of this software license;
+each model has its own terms.
+
+Third-party software
+--------------------
+
+Open-source components used by AFKLLM, including package names, SPDX license
+identifiers, repository links, and reproduced LICENSE texts for direct
+dependencies, are listed in:
+
+  THIRD_PARTY_NOTICES.md
+
+Regenerate that file after changing dependencies:
+
+  npm run licenses:third-party
+
+Redistributors of AFKLLM binaries should retain LICENSE, NOTICE, and
+THIRD_PARTY_NOTICES.md (or equivalent notices). Electron/Chromium ships
+additional notices inside the Electron distribution (LICENSES.chromium.html).
