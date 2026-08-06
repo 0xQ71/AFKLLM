@@ -39,6 +39,11 @@ asarUnpack:
 # Thin client: do NOT ship llama-server / CUDA DLLs (downloaded on first Load
 # from https://github.com/ggml-org/llama.cpp/releases). Dev still uses ./bin.
 extraResources:
+  # Outside asar — required for Tray / NativeImage on Windows
+  - from: build/icon.ico
+    to: icon.ico
+  - from: build/icon.png
+    to: icon.png
   - from: .
     to: legal
     filter:

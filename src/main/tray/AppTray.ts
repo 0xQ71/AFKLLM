@@ -1,7 +1,6 @@
-import { Menu, Tray, nativeImage, type BrowserWindow, app } from 'electron'
-import { existsSync } from 'node:fs'
-import { join } from 'node:path'
+import { Menu, Tray, nativeImage, type BrowserWindow } from 'electron'
 import type { UiLanguage } from '../../shared/i18n'
+import { loadTrayIcon, resolveAppIconPath } from '../appIcon'
 
 export type TrayCallbacks = {
   show: () => void
@@ -39,20 +38,6 @@ let trayCb: TrayCallbacks | null = null
 let trayLang: UiLanguage = 'en'
 let balloonShown = false
 
-function resolveTrayIcon(): Electron.NativeImage {
-  const candidates = [
-    join(app.getAppPath(), 'build', 'icon.ico'),
-    join(process.cwd(), 'build', 'icon.ico'),
-    join(__dirname, '../../build/icon.ico')
-  ]
-  for (const p of candidates) {
-    if (!existsSync(p)) continue
-    const img = nativeImage.createFromPath(p)
-    if (!img.isEmpty()) return img
-  }
-  return nativeImage.createEmpty()
-}
-
 function copyFor(lang: UiLanguage): TrayCopy {
   return TRAY_I18N[lang] ?? TRAY_I18N.en
 }
@@ -81,7 +66,7 @@ export function createAppTray(cb: TrayCallbacks, lang: UiLanguage = 'en'): Tray 
   trayCb = cb
   trayLang = lang
   balloonShown = false
-  const icon = resolveTrayIcon()
+  const icon = loadTrayIcon()
   tray = new Tray(icon.isEmpty() ? nativeImage.createEmpty() : icon)
   applyTrayMenu()
   tray.on('click', () => cb.show())
@@ -122,9 +107,11 @@ export function hideMainWindowToTray(win: BrowserWindow | null): void {
     balloonShown = true
     const c = copyFor(trayLang)
     try {
+      const balloonIcon = resolveAppIconPath()
       tray.displayBalloon({
         title: c.balloonTitle,
-        content: c.balloonBody
+        content: c.balloonBody,
+        ...(balloonIcon ? { icon: balloonIcon } : {})
       })
     } catch {
       /* balloon unsupported on some platforms */

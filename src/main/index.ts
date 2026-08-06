@@ -55,6 +55,7 @@ import {
   setTrayLanguage,
   showMainWindow
 } from './tray/AppTray'
+import { resolveAppIconPath } from './appIcon'
 import type { AgentToolCall, LLMCompletionRequest } from '../shared/types'
 import type { PersistedChatMessage } from '../shared/chats'
 import type { AppSettings, LlmRuntimeStatus } from '../shared/settings'
@@ -180,20 +181,8 @@ function watchProject(root: string): void {
   }
 }
 
-function resolveAppIcon(): string | undefined {
-  const candidates = [
-    join(app.getAppPath(), 'build', 'icon.ico'),
-    join(process.cwd(), 'build', 'icon.ico'),
-    join(__dirname, '../../build/icon.ico')
-  ]
-  for (const p of candidates) {
-    if (existsSync(p)) return p
-  }
-  return undefined
-}
-
 function createWindow(): void {
-  const icon = resolveAppIcon()
+  const icon = resolveAppIconPath()
   const isMac = process.platform === 'darwin'
   mainWindow = new BrowserWindow({
     width: 1440,
