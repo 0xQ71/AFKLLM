@@ -12,7 +12,8 @@ import type {
   HfDownloadProgress,
   HfModelDetail,
   HfModelListItem,
-  HfStoreHomeResult
+  HfStoreHomeResult,
+  StoreDownloadTarget
 } from '../shared/hfStore'
 import type {
   ChatSession,
@@ -61,6 +62,8 @@ import type {
   LlamaRuntimeStatus
 } from '../shared/llamaRuntime'
 import type { TelemetryEvent, TelemetryReportResult } from '../shared/telemetry'
+import type { ModelSlot, ModelSlotStatus } from '../shared/modelSlots'
+import type { SdRuntimeProgress, SdRuntimeStatus } from '../shared/sdRuntime'
 
 const api = {
   getVersion: (): Promise<string> => ipcRenderer.invoke('app:get-version'),
@@ -192,6 +195,10 @@ const api = {
     pickFolder: (): Promise<string | null> => ipcRenderer.invoke('workspace:pick-folder'),
     pickFile: (): Promise<string | null> => ipcRenderer.invoke('workspace:pick-file'),
     pickModel: (): Promise<string | null> => ipcRenderer.invoke('workspace:pick-model'),
+    pickMmproj: (): Promise<string | null> => ipcRenderer.invoke('workspace:pick-mmproj'),
+    pickImageGenModel: (): Promise<string | null> =>
+      ipcRenderer.invoke('workspace:pick-image-gen-model'),
+    pickSdCli: (): Promise<string | null> => ipcRenderer.invoke('workspace:pick-sd-cli'),
     pickModelsDir: (): Promise<string | null> =>
       ipcRenderer.invoke('workspace:pick-models-dir'),
     list: (dirPath?: string): Promise<AgentToolResult> =>
@@ -292,7 +299,44 @@ const api = {
     status: (): Promise<LlmRuntimeStatus> => ipcRenderer.invoke('llm:status'),
     restart: (): Promise<LlmRuntimeStatus> => ipcRenderer.invoke('llm:restart'),
     unload: (): Promise<LlmRuntimeStatus> => ipcRenderer.invoke('llm:unload'),
-    listModels: (): Promise<DiscoveredModel[]> => ipcRenderer.invoke('llm:list-models')
+    listModels: (): Promise<DiscoveredModel[]> => ipcRenderer.invoke('llm:list-models'),
+    listMmproj: (): Promise<DiscoveredModel[]> => ipcRenderer.invoke('llm:list-mmproj')
+  },
+
+  slots: {
+    status: (): Promise<ModelSlotStatus> => ipcRenderer.invoke('slots:status'),
+    ensure: (slot: ModelSlot): Promise<ModelSlotStatus> =>
+      ipcRenderer.invoke('slots:ensure', slot),
+    onStatus: (cb: (status: ModelSlotStatus) => void): (() => void) => {
+      const listener = (_: unknown, status: ModelSlotStatus): void => cb(status)
+      ipcRenderer.on('slots:status', listener)
+      return () => ipcRenderer.removeListener('slots:status', listener)
+    }
+  },
+
+  chatImages: {
+    import: (payload: {
+      sessionId?: string
+      sourcePath?: string
+      dataBase64?: string
+      mime?: string
+      name?: string
+    }): Promise<{ id: string; path: string; mime: string; name?: string }> =>
+      ipcRenderer.invoke('chat-images:import', payload),
+    readDataUrl: (absPath: string): Promise<string> =>
+      ipcRenderer.invoke('chat-images:read-data-url', absPath),
+    pick: (): Promise<string[]> => ipcRenderer.invoke('chat-images:pick')
+  },
+
+  sdRuntime: {
+    status: (): Promise<SdRuntimeStatus> => ipcRenderer.invoke('sd-runtime:status'),
+    ensure: (): Promise<SdRuntimeStatus> => ipcRenderer.invoke('sd-runtime:ensure'),
+    progress: (): Promise<SdRuntimeProgress> => ipcRenderer.invoke('sd-runtime:progress'),
+    onProgress: (cb: (p: SdRuntimeProgress) => void): (() => void) => {
+      const listener = (_: unknown, p: SdRuntimeProgress): void => cb(p)
+      ipcRenderer.on('sd-runtime:progress', listener)
+      return () => ipcRenderer.removeListener('sd-runtime:progress', listener)
+    }
   },
 
   llamaRuntime: {
@@ -311,12 +355,20 @@ const api = {
   },
 
   hf: {
-    search: (params?: { query?: string; limit?: number }): Promise<HfModelListItem[]> =>
-      ipcRenderer.invoke('hf:search', params ?? {}),
-    home: (): Promise<HfStoreHomeResult> => ipcRenderer.invoke('hf:home'),
+    search: (params?: {
+      query?: string
+      limit?: number
+      target?: StoreDownloadTarget
+    }): Promise<HfModelListItem[]> => ipcRenderer.invoke('hf:search', params ?? {}),
+    home: (target?: StoreDownloadTarget): Promise<HfStoreHomeResult> =>
+      ipcRenderer.invoke('hf:home', target),
     gpu: (): Promise<GpuInfo | null> => ipcRenderer.invoke('hf:gpu'),
-    model: (repoId: string, preferredFile?: string): Promise<HfModelDetail> =>
-      ipcRenderer.invoke('hf:model', repoId, preferredFile),
+    model: (
+      repoId: string,
+      preferredFile?: string,
+      target?: StoreDownloadTarget
+    ): Promise<HfModelDetail> =>
+      ipcRenderer.invoke('hf:model', repoId, preferredFile, target),
     download: (input: {
       repoId: string
       filename: string

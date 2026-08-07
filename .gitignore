@@ -15,3 +15,8 @@ release
 *.pfx
 build/afkllm-codesign-dev.pfx
 build/codesign-dev.env
+android/.gradle/
+android/**/build/
+android/**/.cxx/
+android/local.properties
+third_party/llama.cpp/

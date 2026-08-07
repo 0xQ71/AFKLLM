@@ -1,13 +1,23 @@
 import {
+  HF_IMAGE_GEN_CLIP_G_MODELS,
+  HF_IMAGE_GEN_CLIP_L_MODELS,
+  HF_IMAGE_GEN_LLM_MODELS,
+  HF_IMAGE_GEN_RECOMMENDED_MODELS,
+  HF_IMAGE_GEN_T5_MODELS,
+  HF_IMAGE_GEN_VAE_MODELS,
   HF_RECOMMENDED_MODELS,
+  HF_VISION_RECOMMENDED_MODELS,
   findInstalledGgufPath,
+  isImageGenStoreTarget,
   selectRecommendedForVram,
   type GpuInfo,
   type HfModelDetail,
   type HfModelListItem,
+  type HfRecommendedModel,
   type HfRepoFile,
   type HfSearchParams,
-  type HfStoreHomeResult
+  type HfStoreHomeResult,
+  type StoreDownloadTarget
 } from '../../shared/hfStore'
 import { detectModelBrand } from '../../shared/modelBrand'
 import { detectGpuInfo } from '../hardware/GpuInfo'
@@ -37,6 +47,14 @@ async function hfJson<T>(url: string): Promise<T> {
   })
   if (!res.ok) {
     const body = await res.text().catch(() => '')
+    if (res.status === 401 || res.status === 403) {
+      throw new Error(
+        `HF API ${res.status}: repo gated or unavailable (sign in / accept license on the Hub).`
+      )
+    }
+    if (res.status === 404) {
+      throw new Error(`HF API 404: model not found — check the repo id.`)
+    }
     throw new Error(`HF API ${res.status}: ${body.slice(0, 200) || res.statusText}`)
   }
   return (await res.json()) as T
@@ -44,25 +62,104 @@ async function hfJson<T>(url: string): Promise<T> {
 
 function markRecommended(
   id: string,
-  preferredFile?: string
+  preferredFile?: string,
+  catalog: HfRecommendedModel[] = HF_RECOMMENDED_MODELS,
+  target: StoreDownloadTarget = 'chat'
 ): {
   recommended: boolean
   preferredFile?: string
   description?: string
   sizeGb?: number
 } {
-  const hits = HF_RECOMMENDED_MODELS.filter((r) => r.repoId === id)
+  const hits = catalog.filter((r) => r.repoId === id)
   if (!hits.length) return { recommended: false }
   const hit =
     (preferredFile
-      ? hits.find((h) => h.preferredFile === preferredFile)
+      ? hits.find(
+          (h) =>
+            h.preferredFile === preferredFile ||
+            h.preferredMmproj === preferredFile
+        )
       : undefined) ?? hits[0]
+  const preferred =
+    target === 'mmproj'
+      ? (hit.preferredMmproj ?? hit.preferredFile)
+      : hit.preferredFile
   return {
     recommended: true,
-    preferredFile: hit.preferredFile,
+    preferredFile: preferred,
     description: hit.description,
     sizeGb: hit.sizeGb
   }
+}
+
+function catalogForTarget(target: StoreDownloadTarget): HfRecommendedModel[] {
+  if (target === 'vision' || target === 'mmproj') return HF_VISION_RECOMMENDED_MODELS
+  if (target === 'imageGen') return HF_IMAGE_GEN_RECOMMENDED_MODELS
+  if (target === 'imageGenVae') return HF_IMAGE_GEN_VAE_MODELS
+  if (target === 'imageGenClipL') return HF_IMAGE_GEN_CLIP_L_MODELS
+  if (target === 'imageGenClipG') return HF_IMAGE_GEN_CLIP_G_MODELS
+  if (target === 'imageGenT5') return HF_IMAGE_GEN_T5_MODELS
+  if (target === 'imageGenLlm') return HF_IMAGE_GEN_LLM_MODELS
+  return HF_RECOMMENDED_MODELS
+}
+
+function acceptWeightFile(path: string, target: StoreDownloadTarget): boolean {
+  const lower = path.toLowerCase()
+  const base = lower.split(/[/\\]/).pop() ?? lower
+  const isGguf = lower.endsWith('.gguf')
+  const isMmproj = isGguf && /mmproj/i.test(path)
+  const isSt =
+    lower.endsWith('.safetensors') || lower.endsWith('.ckpt') || lower.endsWith('.sft')
+
+  if (target === 'mmproj') return isMmproj
+
+  if (target === 'imageGenVae') {
+    if (!(isSt || isGguf)) return false
+    return (
+      /^ae(\.|$)/i.test(base) ||
+      /vae/i.test(base) ||
+      /flux2_ae/i.test(base) ||
+      /\/vae\//i.test(lower)
+    )
+  }
+  if (target === 'imageGenClipL') {
+    return isSt && /clip_l/i.test(base)
+  }
+  if (target === 'imageGenClipG') {
+    return isSt && /clip_g/i.test(base)
+  }
+  if (target === 'imageGenT5') {
+    return isSt && /t5xxl/i.test(base)
+  }
+  if (target === 'imageGenLlm') {
+    return isGguf && !isMmproj
+  }
+
+  if (target === 'imageGen') {
+    if (isMmproj) return false
+    if (isGguf) {
+      // Skip text-encoder GGUFs parked in diffusion repos
+      if (/^(clip_|t5xxl)/i.test(base)) return false
+      return true
+    }
+    if (isSt) {
+      if (
+        /vae|text_encoder|tokenizer|scheduler|openai_clip|open_clip|lora|embedding|clip_[lg]|t5xxl|^ae\.safetensors/i.test(
+          lower
+        )
+      ) {
+        // Allow all-in-one packs that embed clips in the filename
+        if (/incl_clips|includes?_clip|all.?in.?one/i.test(base)) return true
+        return false
+      }
+      return true
+    }
+    return false
+  }
+
+  // chat / vision: chat weights only (skip mmproj side-cars)
+  return isGguf && !isMmproj
 }
 
 /** Social thumbnail URL (not author avatar). */
@@ -110,16 +207,38 @@ function annotateInstalled(
 
 export async function searchHfGgufModels(
   params: HfSearchParams = {},
-  localModels: Array<{ path: string; id: string }> = []
+  localModels: Array<{ path: string; id: string }> = [],
+  target: StoreDownloadTarget = 'chat'
 ): Promise<HfModelListItem[]> {
   const limit = Math.min(Math.max(params.limit ?? 30, 1), 50)
   const q = (params.query ?? '').trim()
   const sp = new URLSearchParams()
-  sp.set('filter', 'gguf')
+  if (target === 'imageGen') {
+    // Prefer GGUF diffusion weights (sd.cpp); plain text-to-image hubs are often Diffusers-only.
+    sp.set('filter', 'gguf')
+    sp.set('search', q || 'FLUX SDXL "stable-diffusion-3.5" OR sdxl OR flux')
+  } else if (target === 'imageGenVae') {
+    sp.set('search', q || 'FLUX ae.safetensors VAE')
+  } else if (target === 'imageGenClipL' || target === 'imageGenClipG') {
+    sp.set('search', q || 'flux_text_encoders clip stable-diffusion-3.5')
+  } else if (target === 'imageGenT5') {
+    sp.set('search', q || 't5xxl flux_text_encoders')
+  } else if (target === 'imageGenLlm') {
+    sp.set('filter', 'gguf')
+    sp.set('search', q || 'Qwen3-4B OR Mistral-Small-3.2')
+  } else if (target === 'mmproj') {
+    sp.set('filter', 'gguf')
+    sp.set('search', q || 'Qwen3-VL MiniCPM-V gemma-3 VL vision')
+  } else if (target === 'vision') {
+    sp.set('filter', 'gguf')
+    sp.set('search', q || 'Qwen3-VL MiniCPM-V gemma-3 VL vision')
+  } else {
+    sp.set('filter', 'gguf')
+    if (q) sp.set('search', q)
+  }
   sp.set('sort', 'downloads')
   sp.set('direction', '-1')
   sp.set('limit', String(limit))
-  if (q) sp.set('search', q)
 
   type Raw = {
     id: string
@@ -131,9 +250,10 @@ export async function searchHfGgufModels(
   }
 
   const raw = await hfJson<Raw[]>(`${HF_API}/models?${sp.toString()}`)
+  const catalog = catalogForTarget(target)
   const items = await Promise.all(
     raw.map(async (m) => {
-      const rec = markRecommended(m.id)
+      const rec = markRecommended(m.id, undefined, catalog, target)
       const [avatarUrl, readme] = await Promise.all([
         resolveAvatarUrl(m.id).catch(() => null),
         fetchReadmeBlurb(m.id).catch(() => undefined)
@@ -191,15 +311,50 @@ export async function listRecommendedModels(
   )
 }
 
-/** Empty-search home: GPU picks first, then popular Hub GGUF (deduped). */
+/** Empty-search home: GPU picks first, then popular Hub models (deduped). */
 export async function listStoreHome(
-  localModels: Array<{ path: string; id: string }> = []
+  localModels: Array<{ path: string; id: string }> = [],
+  target: StoreDownloadTarget = 'chat'
 ): Promise<HfStoreHomeResult> {
   const gpu = await detectGpuInfo()
-  const picks = await listRecommendedModels(gpu, localModels)
+  const catalog = catalogForTarget(target)
+  let picks: HfModelListItem[]
+  if (target === 'chat') {
+    picks = await listRecommendedModels(gpu, localModels)
+  } else {
+    picks = await Promise.all(
+      catalog.slice(0, 8).map(async (r) => {
+        const [avatarUrl, readme] = await Promise.all([
+          resolveAvatarUrl(r.repoId).catch(() => null),
+          fetchReadmeBlurb(r.repoId).catch(() => undefined)
+        ])
+        const preferredFile =
+          target === 'mmproj'
+            ? (r.preferredMmproj ?? r.preferredFile)
+            : r.preferredFile
+        const item: HfModelListItem = {
+          id: r.repoId,
+          downloads: 0,
+          likes: 0,
+          recommended: true,
+          pipeline_tag: isImageGenStoreTarget(target)
+            ? 'text-to-image'
+            : 'image-text-to-text',
+          tags: [...r.tags],
+          description: readme || r.description,
+          avatarUrl,
+          sizeGb: r.sizeGb,
+          preferredFile,
+          recommendReason: 'hardware',
+          brand: detectModelBrand(r.repoId, r.title)
+        }
+        return annotateInstalled(item, localModels)
+      })
+    )
+  }
   const seen = new Set(picks.map((p) => p.id))
   try {
-    const top = await searchHfGgufModels({ limit: 20 }, localModels)
+    const top = await searchHfGgufModels({ limit: 20 }, localModels, target)
     const popular = top
       .filter((m) => !seen.has(m.id))
       .slice(0, 16)
@@ -317,7 +472,8 @@ async function fetchReadmeRaw(repoId: string): Promise<string | undefined> {
 export async function getHfModelDetail(
   repoId: string,
   preferredFileHint?: string,
-  localModels: Array<{ path: string; id: string }> = []
+  localModels: Array<{ path: string; id: string }> = [],
+  target: StoreDownloadTarget = 'chat'
 ): Promise<HfModelDetail> {
   const id = repoId
     .trim()
@@ -352,8 +508,7 @@ export async function getHfModelDetail(
   const ggufFiles: HfRepoFile[] = []
   for (const f of tree) {
     if (f.type === 'directory') continue
-    if (!f.path.toLowerCase().endsWith('.gguf')) continue
-    if (/mmproj/i.test(f.path)) continue
+    if (!acceptWeightFile(f.path, target)) continue
     const size = f.lfs?.size ?? f.size ?? 0
     const installedPath = findInstalledGgufPath(f.path, localModels)
     ggufFiles.push({
@@ -366,7 +521,8 @@ export async function getHfModelDetail(
   }
   ggufFiles.sort((a, b) => a.size - b.size)
 
-  const rec = markRecommended(meta.id || id, preferredFileHint)
+  const catalog = catalogForTarget(target)
+  const rec = markRecommended(meta.id || id, preferredFileHint, catalog, target)
   const readmeBlurb = readmeRaw ? parseReadmeBlurb(readmeRaw) : undefined
   const description =
     readmeBlurb ||

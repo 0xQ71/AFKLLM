@@ -20,6 +20,11 @@ import { isUiLanguage } from '../../shared/i18n'
 import { isLlamaRuntimeSelection } from '../../shared/llamaRuntime'
 import { sanitizeMcpServers } from '../../shared/mcp'
 import { scanGgufModels } from '../llama/ModelScanner'
+import {
+  autofillImageGenPaths,
+  clearMissingImageGenPaths,
+  imageGenPathsNeedAutofill
+} from '../imagegen/ImageGenAutofill'
 
 export class SettingsStore {
   private path: string
@@ -47,6 +52,7 @@ export class SettingsStore {
       await this.persist()
     }
     await this.repairMissingModel()
+    await this.autofillImageGenIfNeeded()
     if (
       this.cache.modelPath &&
       existsSync(this.cache.modelPath) &&
@@ -58,17 +64,38 @@ export class SettingsStore {
     return this.get()
   }
 
+  /** Fill empty image-gen paths from modelsDir when sidecars exist on disk. */
+  async autofillImageGenIfNeeded(): Promise<AppSettings> {
+    if (!imageGenPathsNeedAutofill(this.cache)) return this.get()
+    const cleared = clearMissingImageGenPaths(this.cache)
+    const base =
+      Object.keys(cleared).length > 0
+        ? sanitize({ ...this.cache, ...cleared })
+        : this.cache
+    const filled = await autofillImageGenPaths(base)
+    if (Object.keys(cleared).length === 0 && Object.keys(filled).length === 0) {
+      return this.get()
+    }
+    this.cache = sanitize({ ...base, ...filled })
+    await this.persist()
+    return this.get()
+  }
+
   private async repairMissingModel(): Promise<void> {
     if (this.cache.modelPath && existsSync(this.cache.modelPath)) return
 
-    const dirs = [this.cache.modelsDir, DEFAULT_MODELS_DIR].filter(
+    const preferredDir = this.cache.modelsDir?.trim() || ''
+    const dirs = [preferredDir, DEFAULT_MODELS_DIR].filter(
       (d, i, arr) => d && arr.indexOf(d) === i
     )
     for (const dir of dirs) {
       const models = await scanGgufModels(dir)
       if (models.length === 0) continue
-      this.cache = switchModelPath(this.cache, models[0].path)
-      this.cache.modelsDir = dir
+      this.cache = switchModelPath(this.cache, models[0]!.path)
+      // Keep the user's modelsDir; only fill it when unset.
+      if (!preferredDir) {
+        this.cache.modelsDir = dir
+      }
       await this.persist()
       return
     }
@@ -99,6 +126,8 @@ export class SettingsStore {
     }
     this.cache = merged
     await this.persist()
+    // Fill any still-empty image-gen slots from modelsDir (e.g. after download / clear).
+    await this.autofillImageGenIfNeeded()
     return this.get()
   }
 
@@ -204,6 +233,68 @@ function sanitize(input: Record<string, unknown> | AppSettings): AppSettings {
   next.ctxSize = Math.max(0, Number(next.ctxSize) || 0)
   next.nGpuLayers = Number(next.nGpuLayers)
   if (Number.isNaN(next.nGpuLayers)) next.nGpuLayers = DEFAULT_SETTINGS.nGpuLayers
+
+  next.modelsDir =
+    typeof next.modelsDir === 'string' && next.modelsDir.trim()
+      ? next.modelsDir.trim()
+      : DEFAULT_MODELS_DIR
+  next.modelPath = typeof next.modelPath === 'string' ? next.modelPath : ''
+
+  next.visionModelPath = typeof next.visionModelPath === 'string' ? next.visionModelPath : ''
+  next.visionMmprojPath = typeof next.visionMmprojPath === 'string' ? next.visionMmprojPath : ''
+  next.imageGenModelPath =
+    typeof next.imageGenModelPath === 'string' ? next.imageGenModelPath : ''
+  next.imageGenVaePath =
+    typeof next.imageGenVaePath === 'string' ? next.imageGenVaePath : ''
+  next.imageGenClipLPath =
+    typeof next.imageGenClipLPath === 'string' ? next.imageGenClipLPath : ''
+  next.imageGenClipGPath =
+    typeof next.imageGenClipGPath === 'string' ? next.imageGenClipGPath : ''
+  next.imageGenT5Path =
+    typeof next.imageGenT5Path === 'string' ? next.imageGenT5Path : ''
+  next.imageGenLlmPath =
+    typeof next.imageGenLlmPath === 'string' ? next.imageGenLlmPath : ''
+  next.sdCppPath = typeof next.sdCppPath === 'string' ? next.sdCppPath : ''
+  next.imageGenSteps = Math.max(1, Math.min(150, Number(next.imageGenSteps) || DEFAULT_SETTINGS.imageGenSteps))
+  next.imageGenWidth = Math.max(64, Math.min(2048, Number(next.imageGenWidth) || DEFAULT_SETTINGS.imageGenWidth))
+  next.imageGenHeight = Math.max(64, Math.min(2048, Number(next.imageGenHeight) || DEFAULT_SETTINGS.imageGenHeight))
+  next.imageGenCfg = Math.max(
+    0,
+    Math.min(30, Number.isFinite(Number(next.imageGenCfg)) ? Number(next.imageGenCfg) : 0)
+  )
+  const weightOk = ['disk', 'ram', 'vram'].includes(
+    String(next.imageGenWeightStorage ?? '')
+  )
+  if (weightOk) {
+    /* keep */
+  } else if (next.imageGenOffloadCpu === true) {
+    next.imageGenWeightStorage = 'ram'
+  } else {
+    next.imageGenWeightStorage = DEFAULT_SETTINGS.imageGenWeightStorage
+  }
+  // Drop legacy flag from runtime object (still accepted on load above).
+  delete next.imageGenOffloadCpu
+
+  next.imageGenHires =
+    typeof next.imageGenHires === 'boolean'
+      ? next.imageGenHires
+      : DEFAULT_SETTINGS.imageGenHires
+  next.imageGenHiresScale = Math.max(
+    1.05,
+    Math.min(
+      4,
+      Number(next.imageGenHiresScale) || DEFAULT_SETTINGS.imageGenHiresScale
+    )
+  )
+  next.imageGenHiresDenoising = Math.max(
+    0.05,
+    Math.min(
+      1,
+      Number.isFinite(Number(next.imageGenHiresDenoising))
+        ? Number(next.imageGenHiresDenoising)
+        : DEFAULT_SETTINGS.imageGenHiresDenoising
+    )
+  )
 
   const fallbackProfile = defaultModelProfile()
   const profilesIn = raw.modelProfiles

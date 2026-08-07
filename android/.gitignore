@@ -1,0 +1,12 @@
+# Android Studio / local SDK
+local.properties
+.gradle/
+**/build/
+captures/
+.idea/
+*.iml
+.DS_Store
+*.apk
+*.aab
+*.keystore
+llama.cpp/

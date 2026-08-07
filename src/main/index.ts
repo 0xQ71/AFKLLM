@@ -4,10 +4,24 @@ import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { getLLMQueue } from './llama/LLMQueueManager'
 import { LlamaProcessManager } from './llama/LlamaProcessManager'
+import type { LlamaProcessOptions } from './llama/LlamaProcessManager'
 import { llamaRuntime } from './llama/LlamaRuntimeManager'
+import { ModelSlotOrchestrator } from './llama/ModelSlotOrchestrator'
+import { findMmprojForModel, scanGgufModels, scanMmprojFiles, scanWeightFiles } from './llama/ModelScanner'
+import type { StoreDownloadTarget } from '../shared/hfStore'
+import { isImageGenStoreTarget, isStoreDownloadTarget } from '../shared/hfStore'
+import { sdRuntime } from './imagegen/SdRuntimeManager'
+import { killActiveSdCli, runSdCli } from './imagegen/SdCliRunner'
+import { imageGenPathsNeedAutofill } from './imagegen/ImageGenAutofill'
+import {
+  CHAT_IMAGE_MAX_COUNT,
+  importChatImage,
+  readChatImageDataUrl
+} from './chats/ChatImages'
 import type { LlamaRuntimeEnsureOptions } from '../shared/llamaRuntime'
 import { isLlamaRuntimeSelection } from '../shared/llamaRuntime'
-import { scanGgufModels } from './llama/ModelScanner'
+import type { ModelSlot } from '../shared/modelSlots'
+import { isModelSlot } from '../shared/modelSlots'
 import {
   getHfModelDetail,
   listStoreHome,
@@ -67,6 +81,7 @@ let mainWindow: BrowserWindow | null = null
 /** When true, close events are allowed to destroy the window (real quit). */
 let isQuitting = false
 let llama: LlamaProcessManager | null = null
+let slotOrch: ModelSlotOrchestrator | null = null
 let tools: AgentToolRegistry | null = null
 let settingsStore: SettingsStore | null = null
 let chatStore: ChatStore | null = null
@@ -83,6 +98,8 @@ const tsLsp = new TsLanguageService()
 const debugSession = new NodeDebugSession()
 let folderWatcher: FSWatcher | null = null
 let watchTimer: ReturnType<typeof setTimeout> | null = null
+/** When true, agent turn requested a slot switch — allow through busy gate. */
+let slotSwitchFromAgent = false
 
 /** Prefer a real project folder over a drive root (mkdir D:\\ → EPERM). */
 function pickSafeProjectRoot(candidate: string): string {
@@ -217,6 +234,7 @@ function createWindow(): void {
   appUpdater.setWindow(mainWindow)
   hfDownloads.setWindow(mainWindow)
   llamaRuntime.setWindow(mainWindow)
+  sdRuntime.setWindow(mainWindow)
   const reveal = (): void => {
     if (!mainWindow || mainWindow.isDestroyed()) return
     if (!mainWindow.isVisible()) mainWindow.show()
@@ -239,6 +257,7 @@ function createWindow(): void {
     appUpdater.setWindow(null)
     hfDownloads.setWindow(null)
     llamaRuntime.setWindow(null)
+  sdRuntime.setWindow(null)
     mainWindow = null
   })
   mainWindow.webContents.setWindowOpenHandler((details) => {
@@ -258,14 +277,19 @@ function createWindow(): void {
 function runtimeStatus(): LlmRuntimeStatus {
   const queue = getLLMQueue()
   const settings = settingsStore?.peek()
+  const slot = slotOrch?.getStatus()
+  const activePath =
+    slot?.slot === 'vision'
+      ? settings?.visionModelPath ?? null
+      : settings?.modelPath ?? null
   return {
     state: llama?.currentState ?? 'stopped',
     baseUrl: llama?.baseUrl ?? settings?.baseUrl ?? null,
-    modelPath: settings?.modelPath ?? null,
+    modelPath: activePath,
     ctxSize: settings?.ctxSize ?? null,
     pending: queue.pendingCount,
-    error: bootError ?? llama?.error,
-    detail: llama?.detail
+    error: bootError ?? llama?.error ?? slot?.error,
+    detail: slot?.phase === 'switching' ? slot.detail : llama?.detail || slot?.detail
   }
 }
 
@@ -273,15 +297,22 @@ function applyQueueSettings(settings: AppSettings): void {
   getLLMQueue(settings.baseUrl, 'local')
 }
 
-function settingsToLlamaOpts(settings: AppSettings) {
+function settingsToLlamaOpts(
+  settings: AppSettings,
+  slot: 'chat' | 'vision' = 'chat',
+  mmprojPath?: string | null
+): LlamaProcessOptions {
   const custom = settings.llamaServerPath?.trim()
   const resolved = custom
     ? custom
     : llamaRuntime.resolveStatus(undefined, settings.llamaRuntimeVariant).binaryPath ||
       undefined
+  const modelPath =
+    slot === 'vision' ? settings.visionModelPath || settings.modelPath : settings.modelPath
   return {
     binaryPath: resolved,
-    modelPath: settings.modelPath,
+    modelPath,
+    ...(slot === 'vision' && mmprojPath ? { mmprojPath } : {}),
     host: settings.host,
     port: settings.port,
     nGpuLayers: settings.nGpuLayers,
@@ -300,6 +331,46 @@ function settingsToLlamaOpts(settings: AppSettings) {
     loadMode: settings.loadMode,
     contextShift: settings.contextOverflow === 'context_shift'
   }
+}
+
+function emitSlotStatus(): void {
+  if (!slotOrch || !mainWindow || mainWindow.isDestroyed()) return
+  mainWindow.webContents.send('slots:status', slotOrch.getStatus())
+}
+
+function initSlotOrchestrator(): void {
+  slotOrch = new ModelSlotOrchestrator({
+    getLlama: () => llama,
+    setLlama: (mgr) => {
+      llama = mgr
+    },
+    createLlama: (opts) => new LlamaProcessManager(opts),
+    optsFor: async (slot) => {
+      const settings = settingsStore!.get()
+      if (slot === 'vision') {
+        const mm = await findMmprojForModel(
+          settings.visionModelPath,
+          settings.visionMmprojPath
+        )
+        return settingsToLlamaOpts(settings, 'vision', mm)
+      }
+      return settingsToLlamaOpts(settings, 'chat')
+    },
+    ensureRuntime: async () => {
+      const settings = settingsStore!.get()
+      if (!settings.llamaServerPath?.trim()) {
+        const rt = await llamaRuntime.ensure(
+          { variant: settings.llamaRuntimeVariant },
+          settings.llamaServerPath,
+          settings.llamaRuntimeVariant
+        )
+        if (!rt.ready || !rt.binaryPath) {
+          throw new Error('llama.cpp runtime is not installed')
+        }
+      }
+    }
+  })
+  slotOrch.on('status', () => emitSlotStatus())
 }
 
 function registerIpc(): void {
@@ -413,7 +484,13 @@ function registerIpc(): void {
       ...patch,
       baseUrl: `http://${patch.host ?? cur.host}:${patch.port ?? cur.port}`
     })
-    llama?.updateOptions(settingsToLlamaOpts(next))
+    const slot = slotOrch?.getStatus().slot
+    if (slot === 'vision') {
+      const mm = await findMmprojForModel(next.visionModelPath, next.visionMmprojPath)
+      llama?.updateOptions(settingsToLlamaOpts(next, 'vision', mm))
+    } else {
+      llama?.updateOptions(settingsToLlamaOpts(next, 'chat'))
+    }
     applyQueueSettings(next)
     if (mcpManager) {
       mcpManager.setCwd(projectRoot)
@@ -503,6 +580,42 @@ function registerIpc(): void {
     const result = await dialog.showOpenDialog({
       properties: ['openFile'],
       filters: [{ name: 'GGUF models', extensions: ['gguf'] }]
+    })
+    return result.canceled ? null : (result.filePaths[0] ?? null)
+  })
+
+  ipcMain.handle('workspace:pick-mmproj', async () => {
+    const result = await dialog.showOpenDialog({
+      title: 'Select vision mmproj (.gguf)',
+      properties: ['openFile'],
+      filters: [{ name: 'mmproj GGUF', extensions: ['gguf'] }]
+    })
+    return result.canceled ? null : (result.filePaths[0] ?? null)
+  })
+
+  ipcMain.handle('workspace:pick-image-gen-model', async () => {
+    const result = await dialog.showOpenDialog({
+      title: 'Select image generation model',
+      properties: ['openFile'],
+      filters: [
+        {
+          name: 'Diffusion weights',
+          extensions: ['safetensors', 'gguf', 'ckpt', 'pt']
+        },
+        { name: 'All files', extensions: ['*'] }
+      ]
+    })
+    return result.canceled ? null : (result.filePaths[0] ?? null)
+  })
+
+  ipcMain.handle('workspace:pick-sd-cli', async () => {
+    const result = await dialog.showOpenDialog({
+      title: 'Select sd-cli binary',
+      properties: ['openFile'],
+      filters:
+        process.platform === 'win32'
+          ? [{ name: 'Executable', extensions: ['exe'] }]
+          : [{ name: 'All files', extensions: ['*'] }]
     })
     return result.canceled ? null : (result.filePaths[0] ?? null)
   })
@@ -757,6 +870,7 @@ function registerIpc(): void {
 
   ipcMain.handle('llm:cancel-all', () => {
     queue.cancelAll('user_stop')
+    killActiveSdCli()
     return { ok: true }
   })
 
@@ -771,10 +885,14 @@ function registerIpc(): void {
 
   /** Kill llama-server and free VRAM; does not auto-restart. */
   ipcMain.handle('llm:unload', async () => {
-    queue.cancelAll('model_unloaded')
     bootError = undefined
     try {
-      await llama?.stop()
+      if (slotOrch) {
+        await slotOrch.ensureSlot('idle')
+      } else {
+        getLLMQueue().cancelAll('model_unloaded')
+        await llama?.stop()
+      }
     } catch (err) {
       bootError = err instanceof Error ? err.message : String(err)
     }
@@ -791,6 +909,84 @@ function registerIpc(): void {
       return runtimeStatus()
     }
   })
+
+  ipcMain.handle('slots:status', () => slotOrch?.getStatus() ?? { slot: 'idle', phase: 'ready', detail: '' })
+
+  ipcMain.handle('slots:ensure', async (_e, target: unknown) => {
+    if (!isModelSlot(target)) throw new Error(`Invalid slot: ${String(target)}`)
+    if (!slotOrch) throw new Error('Slot orchestrator not ready')
+    slotSwitchFromAgent = true
+    try {
+      bootError = undefined
+      const status = await slotOrch.ensureSlot(target as ModelSlot)
+      applyQueueSettings(settingsStore!.get())
+      return status
+    } catch (err) {
+      bootError = err instanceof Error ? err.message : String(err)
+      throw err
+    } finally {
+      slotSwitchFromAgent = false
+    }
+  })
+
+  ipcMain.handle(
+    'chat-images:import',
+    async (
+      _e,
+      payload: {
+        sessionId?: string
+        sourcePath?: string
+        dataBase64?: string
+        mime?: string
+        name?: string
+      }
+    ) => {
+      const sessionId = String(payload?.sessionId || 'draft')
+      return importChatImage({
+        sessionId,
+        sourcePath: payload?.sourcePath,
+        dataBase64: payload?.dataBase64,
+        mime: payload?.mime,
+        name: payload?.name
+      })
+    }
+  )
+
+  ipcMain.handle('chat-images:read-data-url', async (_e, absPath: unknown) => {
+    const p = String(absPath ?? '')
+    if (!p) throw new Error('path required')
+    return readChatImageDataUrl(p)
+  })
+
+  ipcMain.handle('chat-images:pick', async () => {
+    if (!mainWindow) return null
+    const result = await dialog.showOpenDialog(mainWindow, {
+      properties: ['openFile', 'multiSelections'],
+      filters: [
+        { name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif'] }
+      ]
+    })
+    if (result.canceled || !result.filePaths.length) return []
+    return result.filePaths.slice(0, CHAT_IMAGE_MAX_COUNT)
+  })
+
+  ipcMain.handle('llm:list-mmproj', async () => {
+    const dir = settingsStore?.get().modelsDir
+    if (!dir) return []
+    return scanMmprojFiles(dir)
+  })
+
+  ipcMain.handle('sd-runtime:status', () => {
+    const settings = settingsStore?.get()
+    return sdRuntime.resolveStatus(settings?.sdCppPath)
+  })
+
+  ipcMain.handle('sd-runtime:ensure', async () => {
+    const settings = settingsStore?.get()
+    return sdRuntime.ensure(settings?.sdCppPath)
+  })
+
+  ipcMain.handle('sd-runtime:progress', () => sdRuntime.getProgress())
 
   ipcMain.handle('llama-runtime:status', () => {
     const settings = settingsStore?.get()
@@ -852,23 +1048,50 @@ function registerIpc(): void {
     return isUiLanguage(v) ? v : 'en'
   }
 
-  ipcMain.handle('hf:search', async (_e, params: { query?: string; limit?: number }) => {
-    const q = (params?.query ?? '').trim()
-    const modelsDir = settingsStore?.get().modelsDir
-    const local = modelsDir ? await scanGgufModels(modelsDir) : []
-    const lang = storeLang()
-    if (!q) {
-      const home = await listStoreHome(local)
-      return (await localizeHfHome(home, lang)).items
+  ipcMain.handle(
+    'hf:search',
+    async (_e, params: { query?: string; limit?: number; target?: string }) => {
+      const q = (params?.query ?? '').trim()
+      const target: StoreDownloadTarget = isStoreDownloadTarget(params?.target)
+        ? params.target
+        : 'chat'
+      const modelsDir = settingsStore?.get().modelsDir
+      const local =
+        isImageGenStoreTarget(target)
+          ? modelsDir
+            ? await scanWeightFiles(modelsDir)
+            : []
+          : modelsDir
+            ? await scanGgufModels(modelsDir)
+            : []
+      const lang = storeLang()
+      if (!q) {
+        const home = await listStoreHome(local, target)
+        return (await localizeHfHome(home, lang)).items
+      }
+      const items = await searchHfGgufModels(
+        { query: q, limit: params?.limit ?? 30 },
+        local,
+        target
+      )
+      return localizeHfListItems(items, lang)
     }
-    const items = await searchHfGgufModels({ query: q, limit: params?.limit ?? 30 }, local)
-    return localizeHfListItems(items, lang)
-  })
+  )
 
-  ipcMain.handle('hf:home', async () => {
+  ipcMain.handle('hf:home', async (_e, targetRaw?: unknown) => {
+    const target: StoreDownloadTarget = isStoreDownloadTarget(targetRaw)
+      ? targetRaw
+      : 'chat'
     const modelsDir = settingsStore?.get().modelsDir
-    const local = modelsDir ? await scanGgufModels(modelsDir) : []
-    const home = await listStoreHome(local)
+    const local =
+      isImageGenStoreTarget(target)
+        ? modelsDir
+          ? await scanWeightFiles(modelsDir)
+          : []
+        : modelsDir
+          ? await scanGgufModels(modelsDir)
+          : []
+    const home = await listStoreHome(local, target)
     return localizeHfHome(home, storeLang())
   })
 
@@ -876,13 +1099,24 @@ function registerIpc(): void {
 
   ipcMain.handle(
     'hf:model',
-    async (_e, repoId: string, preferredFile?: string) => {
+    async (_e, repoId: string, preferredFile?: string, targetRaw?: unknown) => {
+      const target: StoreDownloadTarget = isStoreDownloadTarget(targetRaw)
+        ? targetRaw
+        : 'chat'
       const modelsDir = settingsStore?.get().modelsDir
-      const local = modelsDir ? await scanGgufModels(modelsDir) : []
+      const local =
+        isImageGenStoreTarget(target)
+          ? modelsDir
+            ? await scanWeightFiles(modelsDir)
+            : []
+          : modelsDir
+            ? await scanGgufModels(modelsDir)
+            : []
       const detail = await getHfModelDetail(
         String(repoId ?? ''),
         preferredFile || undefined,
-        local
+        local,
+        target
       )
       const lang = storeLang()
       const localized = await localizeHfDetail(detail, lang)
@@ -1177,26 +1411,8 @@ async function bootInference(forceRestart = false): Promise<void> {
     return
   }
 
-  // Fetch llama-server (+ CUDA cudart) from GitHub if missing
-  if (!settings.llamaServerPath?.trim()) {
-    const rt = await llamaRuntime.ensure(
-      { variant: settings.llamaRuntimeVariant },
-      settings.llamaServerPath,
-      settings.llamaRuntimeVariant
-    )
-    if (!rt.ready || !rt.binaryPath) {
-      throw new Error('llama.cpp runtime is not installed')
-    }
-  }
-
-  const opts = settingsToLlamaOpts(settingsStore.get())
-  if (!llama) {
-    llama = new LlamaProcessManager(opts)
-  } else {
-    llama.updateOptions(opts)
-  }
-
-  await llama.restart()
+  if (!slotOrch) initSlotOrchestrator()
+  await slotOrch!.ensureSlot('chat')
   applyQueueSettings(settingsStore.get())
 }
 
@@ -1206,6 +1422,7 @@ app.whenReady().then(async () => {
   projectRoot = ''
   settingsStore = new SettingsStore()
   await settingsStore.load()
+  initSlotOrchestrator()
   setCollectLogsToFile(() => settingsStore?.get().collectLogsToFile !== false)
   applyQueueSettings(settingsStore.get())
 
@@ -1299,6 +1516,139 @@ app.whenReady().then(async () => {
     },
     onOpenPreview: (url) => {
       mainWindow?.webContents.send('browser:open-url', { url })
+    },
+    generateImage: async (args) => {
+      let settings = settingsStore?.get()
+      if (settingsStore && imageGenPathsNeedAutofill(settings ?? settingsStore.get())) {
+        settings = await settingsStore.autofillImageGenIfNeeded()
+        // Push updated paths to renderer so Settings UI stays in sync.
+        mainWindow?.webContents.send('settings:changed', settings)
+      }
+      if (!settings?.imageGenModelPath?.trim()) {
+        return {
+          id: '',
+          name: 'generate_image',
+          ok: false,
+          content: '',
+          error:
+            'imageGenModelPath is not set. Put FLUX/SDXL weights in Models dir or set Settings → Multimodal.'
+        }
+      }
+      if (!slotOrch) {
+        return {
+          id: '',
+          name: 'generate_image',
+          ok: false,
+          content: '',
+          error: 'Slot orchestrator not ready'
+        }
+      }
+      const prompt = String(args.prompt ?? '').trim()
+      if (!prompt) {
+        return {
+          id: '',
+          name: 'generate_image',
+          ok: false,
+          content: '',
+          error: 'prompt is required'
+        }
+      }
+      const relRaw =
+        String(args.relative_path ?? '').trim() ||
+        `generated/img-${Date.now()}.png`
+      const rel = relRaw.replace(/\\/g, '/').replace(/^\/+/, '')
+      if (!rel || rel.includes('..')) {
+        return {
+          id: '',
+          name: 'generate_image',
+          ok: false,
+          content: '',
+          error: 'relative_path must be inside the project (no ..)'
+        }
+      }
+      const root = projectRoot || noWorkspaceDir()
+      const abs = join(root, rel)
+      const restoreChat = async (): Promise<void> => {
+        if (!slotOrch) return
+        try {
+          // Brief pause so the OS can reclaim RAM after sd-cli exits before
+          // llama-server maps the chat GGUF (avoids peak-RAM OOM → auto-stop).
+          await new Promise((r) => setTimeout(r, 750))
+          slotOrch.setDetail('Restoring chat model…', 'switching')
+          // Do not cancelPending — this tool IPC is still part of the agent turn.
+          await slotOrch.ensureSlot('chat', { cancelPending: false })
+        } catch (restoreErr) {
+          console.error('[generate_image] chat restore failed', restoreErr)
+        }
+      }
+      try {
+        slotSwitchFromAgent = true
+        await slotOrch.ensureSlot('imageGen')
+        const rt = await sdRuntime.ensure(settings.sdCppPath)
+        if (!rt.ready || !rt.binaryPath) {
+          throw new Error('sd-cli runtime is not installed')
+        }
+        const result = await runSdCli({
+          binaryPath: rt.binaryPath,
+          modelPath: settings.imageGenModelPath,
+          vaePath: settings.imageGenVaePath,
+          clipLPath: settings.imageGenClipLPath,
+          clipGPath: settings.imageGenClipGPath,
+          t5Path: settings.imageGenT5Path,
+          llmPath: settings.imageGenLlmPath,
+          prompt,
+          outputPath: abs,
+          negativePrompt: String(args.negative_prompt ?? '') || undefined,
+          width:
+            typeof args.width === 'number' ? args.width : settings.imageGenWidth,
+          height:
+            typeof args.height === 'number' ? args.height : settings.imageGenHeight,
+          steps:
+            typeof args.steps === 'number' ? args.steps : settings.imageGenSteps,
+          cfgScale: settings.imageGenCfg,
+          weightStorage: settings.imageGenWeightStorage,
+          hires: settings.imageGenHires,
+          hiresScale: settings.imageGenHiresScale,
+          hiresDenoising: settings.imageGenHiresDenoising,
+          onProgress: (p) => {
+            slotOrch?.setDetail(p.detail, 'switching')
+          }
+        })
+        const posix = rel.replace(/\\/g, '/')
+        if (result.ok) {
+          emitWorkspaceChanged([posix])
+          // Restore after success is recorded — restore failure must not hide the image.
+          await restoreChat()
+          return {
+            id: '',
+            name: 'generate_image',
+            ok: true,
+            content:
+              `OK: image saved to ${posix}. IMAGE_DONE: do not read_file or edit this file — the UI already shows it. Reply with one short confirmation only.`,
+            filePath: posix
+          }
+        }
+        await restoreChat()
+        return {
+          id: '',
+          name: 'generate_image',
+          ok: false,
+          content: '',
+          error: result.error || 'Image generation failed',
+          filePath: posix
+        }
+      } catch (err) {
+        await restoreChat()
+        return {
+          id: '',
+          name: 'generate_image',
+          ok: false,
+          content: '',
+          error: err instanceof Error ? err.message : String(err)
+        }
+      } finally {
+        slotSwitchFromAgent = false
+      }
     }
   })
 

@@ -18,12 +18,14 @@ import {
   parseThinkBlocks,
   formatNowForAgent,
   stripChecklistBlock,
+  stripCompactBlocks,
   evaluateAcceptanceGate,
   fingerprintToolCall,
   looksLikeToolMarkupLeak,
   coerceToolRelativePath,
   resolveWriteFilePath,
   inferWritePathFromContent,
+  apiContentText,
   type AgentChecklist,
   type ApiMessage
 } from './agentPure'
@@ -155,6 +157,7 @@ export interface ChatMessage {
   streaming?: boolean
   codePreview?: string
   filePath?: string
+  images?: Array<{ id: string; path: string; mime: string; name?: string }>
   stats?: ChatMessageStats
   editReview?: { path: string; status: 'pending' | 'accepted' | 'rejected' }
   activity?: ComposerActivity
@@ -170,6 +173,69 @@ export interface EditorSelectionContext {
 export interface FileAttachment {
   path: string
   content: string
+}
+
+export interface ImageAttachment {
+  id: string
+  path: string
+  mime: string
+  name?: string
+  /** Optional preview data URL for composer thumbnails */
+  previewUrl?: string
+}
+
+/** Cold-swap to vision, describe images, restore chat. Returns text for chat agent. */
+async function describeImagesWithVision(params: {
+  queue: QueueManager
+  userText: string
+  images: Array<{ id: string; path: string; mime: string; name?: string }>
+  signal?: AbortSignal
+}): Promise<string> {
+  await window.api.slots.ensure('vision')
+  if (params.signal?.aborted) {
+    await window.api.slots.ensure('chat').catch(() => undefined)
+    throw new Error('aborted')
+  }
+
+  const parts: Array<
+    | { type: 'text'; text: string }
+    | { type: 'image_url'; image_url: { url: string } }
+  > = [
+    {
+      type: 'text',
+      text:
+        'Describe the attached image(s) in detail for a coding agent. Focus on UI layout, text, errors, diagrams, and anything relevant to this user request. Be concrete and concise (max ~400 words).\n\nUser request:\n' +
+        params.userText.slice(0, 2000)
+    }
+  ]
+
+  for (const img of params.images.slice(0, 4)) {
+    try {
+      const url = await window.api.chatImages.readDataUrl(img.path)
+      parts.push({ type: 'image_url', image_url: { url } })
+    } catch {
+      /* skip unreadable */
+    }
+  }
+
+  try {
+    const res = await params.queue.chatStream({
+      messages: [
+        {
+          role: 'system',
+          content:
+            'You are a vision assistant. Describe images accurately for a software engineer. No tools. Plain text only.'
+        },
+        { role: 'user', content: parts }
+      ],
+      maxTokens: 768,
+      priority: 'NORMAL',
+      signal: params.signal
+    })
+    return (res.text ?? '').trim()
+  } finally {
+    await window.api.slots.ensure('chat')
+  }
 }
 
 const AGENT_RULES = `
@@ -212,6 +278,11 @@ Rules for multi-file work (critical):
   1) Only claim Task completed after required tools ran (tests green, web_search if required, tree verified).
   2) If the user gave an exact acceptance format, follow it; cite a web_ref URL that came from a web_search tool result, not a guessed link.
 - Local web preview: when you start a landing/dev server (vite, npm run dev, python -m http.server, etc.), AFKLLM auto-opens the in-app Browser on the Local/localhost URL from the terminal — do not ask the user to open an external browser.
+- Images / photos (critical):
+  1) To CREATE an image: call generate_image with a clear prompt (+ optional relative_path). Do not claim success without the tool.
+  2) After generate_image succeeds: STOP. Confirm the saved path in one short sentence. Do NOT read_file the PNG, do NOT write_file/edit it, do NOT describe pixels from disk.
+  3) To UNDERSTAND a user-attached photo: only the built-in vision attach path (images on the user message). Never read_file images (.png/.jpg/.webp/.gif/…).
+  4) Image generation is independent of coding context — do not dump file contents or long plans into the image prompt unless the user asked.
 - Do NOT ask for permission in chat — call tools.`
 
 /** Exported for Context Usage estimates (without embedding in SYSTEM twice). */
@@ -293,7 +364,7 @@ FORBIDDEN: write_file overwrite=true, regenerating the whole page/app, new dupli
 `
 
 const DEFAULT_MAX_ROUNDS = 64
-const TOOL_RESULT_CHARS = 10_000
+const TOOL_RESULT_CHARS = 6_000
 /** 4096 often truncates mid-tool-JSON. */
 const AGENT_MAX_TOKENS = 8192
 /** Cyrillic/code runs denser than English. */
@@ -309,6 +380,12 @@ const MAX_MARKUP_REPAIR_ATTEMPTS = 2
 /** Absolute safety cap for a single tool-arguments JSON blob. */
 const MAX_TOOL_ARG_CHARS = 48_000
 const MAX_MISSING_PATH_HITS = 3
+/** Stop overflow compact/retry loops that inflate context. */
+const MAX_OVERFLOW_REPAIRS = 2
+/** Hard cap for system prompt after compact. */
+const COMPACT_SYSTEM_MAX_CHARS = 6_000
+const COMPACT_TAIL_MAX_MSGS = 6
+const COMPACT_TOOL_RESULT_MAX = 600
 
 async function fetchProjectRules(): Promise<string> {
   try {
@@ -521,7 +598,7 @@ function upsertPlanBubble(
 function injectChecklistIntoSystem(apiMessages: ApiMessage[], cl: AgentChecklist): void {
   if (apiMessages[0]?.role !== 'system') return
   const block = formatChecklist(cl)
-  const base = stripChecklistBlock(apiMessages[0].content ?? '')
+  const base = stripCompactBlocks(stripChecklistBlock(apiContentText(apiMessages[0].content)))
   apiMessages[0] = { ...apiMessages[0], content: block ? base + block : base }
 }
 
@@ -703,7 +780,7 @@ function parseToolArguments(raw: string): {
 function estimateChars(msgs: ApiMessage[]): number {
   let n = 0
   for (const m of msgs) {
-    n += (m.content?.length ?? 0) + 32
+    n += apiContentText(m.content).length + 32
     if (m.tool_calls) {
       for (const t of m.tool_calls) {
         n += t.function.name.length + t.function.arguments.length + 64
@@ -741,33 +818,183 @@ function slimToolArgs(name: string, argsJson: string): string {
 
 function slimMessage(m: ApiMessage): ApiMessage {
   if (m.role === 'tool') {
-    const c = m.content ?? ''
-    if (c.length <= 900) return m
+    const c = apiContentText(m.content)
+    if (c.length <= COMPACT_TOOL_RESULT_MAX) return { ...m, content: c }
     return {
       ...m,
-      content: c.slice(0, 500) + '\n…[truncated]…\n' + c.slice(-300)
+      content:
+        c.slice(0, 280) +
+        '\n…[truncated]…\n' +
+        c.slice(-200)
     }
   }
   if (m.role === 'assistant' && m.tool_calls?.length) {
     return {
       ...m,
+      content: apiContentText(m.content).slice(0, 800),
       tool_calls: m.tool_calls.map((t) => ({
         ...t,
         function: {
           ...t.function,
           arguments:
-            t.function.arguments.length > 600
+            t.function.arguments.length > 400
               ? slimToolArgs(t.function.name, t.function.arguments)
               : t.function.arguments
         }
       }))
     }
   }
-  if ((m.content?.length ?? 0) > 2_000 && m.role === 'user') {
-    const c = m.content ?? ''
-    return { ...m, content: c.slice(0, 1_200) + '\n…\n' + c.slice(-400) }
+  if (apiContentText(m.content).length > 1_500 && (m.role === 'user' || m.role === 'assistant')) {
+    const c = apiContentText(m.content)
+    return { ...m, content: c.slice(0, 900) + '\n…\n' + c.slice(-300) }
   }
   return m
+}
+
+/** Last-resort shrink: system (capped) + single continue user. Always fits 8k. */
+function nuclearFitMessages(msgs: ApiMessage[], ctxSize: number): ApiMessage[] {
+  const sys = msgs.find((m) => m.role === 'system')
+  let sysText = stripCompactBlocks(
+    stripChecklistBlock(apiContentText(sys?.content ?? ''))
+  ).trim()
+  if (sysText.length > COMPACT_SYSTEM_MAX_CHARS) {
+    sysText = sysText.slice(0, COMPACT_SYSTEM_MAX_CHARS) + '\n…[system truncated]'
+  }
+  const lastUser = [...msgs].reverse().find((m) => m.role === 'user')
+  const userText = apiContentText(lastUser?.content ?? '').slice(0, 1_500) ||
+    'Continue the unfinished task. Prefer short tool calls. Do not read binary/image files as text.'
+  const out = normalizeApiMessages([
+    { role: 'system', content: sysText },
+    { role: 'user', content: userText }
+  ])
+  // If somehow still huge, truncate system further against budget.
+  const budgetChars = Math.max(2000, (ctxSize > 0 ? ctxSize : 8192) * CHARS_PER_TOKEN * 0.5)
+  if (estimateChars(out) > budgetChars && out[0]) {
+    out[0] = {
+      ...out[0],
+      content: apiContentText(out[0].content).slice(0, Math.floor(budgetChars * 0.6))
+    }
+  }
+  return out
+}
+
+async function compactApiMessages(
+  msgs: ApiMessage[],
+  checklist?: AgentChecklist,
+  queue?: QueueManager,
+  ctxSize = 8192
+): Promise<{ messages: ApiMessage[]; summary: string }> {
+  const slimmedAll = msgs.map(slimMessage)
+
+  if (slimmedAll.length < 4) {
+    let messages = normalizeApiMessages(slimmedAll)
+    if (shouldCompactForOverflow(messages, ctxSize)) {
+      messages = nuclearFitMessages(messages, ctxSize)
+    }
+    return { messages, summary: '' }
+  }
+
+  const head = slimmedAll.slice(0, 1) // system
+  const rawTail = slimmedAll.slice(-COMPACT_TAIL_MAX_MSGS).map(slimMessage)
+  const middle = slimmedAll.slice(1, -COMPACT_TAIL_MAX_MSGS)
+
+  const digestLines: string[] = []
+  const written = new Set<string>()
+  for (const m of middle) {
+    if (m.role === 'tool') {
+      const brief = apiContentText(m.content).slice(0, 120).replace(/\s+/g, ' ')
+      digestLines.push(`- tool: ${brief}`)
+      const pathMatch2 = apiContentText(m.content).match(
+        /(?:to|on)\s+"?([A-Za-z0-9_./\\-]+\.[a-zA-Z0-9]+)"?/
+      )
+      if (pathMatch2?.[1]) written.add(pathMatch2[1].replace(/\\/g, '/'))
+    } else if (m.role === 'assistant' && m.tool_calls?.length) {
+      for (const t of m.tool_calls) {
+        digestLines.push(`- called: ${t.function.name}`)
+        const p = extractJsonStringField(t.function.arguments || '', 'relative_path')
+        if (p) written.add(p.replace(/\\/g, '/'))
+      }
+    } else if (m.role === 'user' || m.role === 'assistant') {
+      const brief = apiContentText(m.content).slice(0, 100).replace(/\s+/g, ' ')
+      if (brief) digestLines.push(`- ${m.role}: ${brief}`)
+    }
+  }
+
+  let llmSummary = ''
+  if (queue && middle.length > 0 && estimateChars(middle) < 40_000) {
+    llmSummary = await llmSummarizeMiddle(queue, middle)
+  }
+
+  const tree = await fetchProjectTreeDigest()
+  const fromHeuristic =
+    written.size > 0
+      ? `\nAlready touched paths (do NOT recreate; append or apply_patch only):\n` +
+        [...written].slice(-40).map((p) => `- ${p}`).join('\n')
+      : ''
+
+  let cl = checklist
+    ? {
+        ...checklist,
+        done: [...checklist.done],
+        incomplete: [...checklist.incomplete],
+        failed: [...checklist.failed],
+        shells: [...checklist.shells]
+      }
+    : emptyChecklist()
+  if (checklist) {
+    for (const p of written) {
+      if (
+        !cl.done.some((d) => normPath(d) === normPath(p)) &&
+        !cl.incomplete.some((d) => normPath(d) === normPath(p))
+      ) {
+        pushUnique(cl.done, p)
+      }
+    }
+  } else {
+    for (const p of written) pushUnique(cl.done, p)
+  }
+  const checklistBlock = formatChecklist(cl) || fromHeuristic
+
+  const sys = head[0] ?? { role: 'system' as const, content: '' }
+  const memoryBody =
+    (llmSummary.trim() || digestLines.slice(-30).join('\n') || '(no prior middle turns)').slice(
+      0,
+      2_500
+    )
+  const digestBlock =
+    '\n\n[Context compacted due to context-window pressure]\n' +
+    memoryBody +
+    checklistBlock +
+    tree.slice(0, 2_000) +
+    '\n\nCRITICAL: Continue from EXISTING files only. Never rewrite a file that already exists; use append=true or apply_patch. Do not create alternate filenames. Never read .png/.jpg/.webp/.gif as text.'
+
+  // Drop orphan tool rows from tail (must follow an assistant tool_calls)
+  let tail = rawTail
+  while (tail.length && tail[0]?.role === 'tool') {
+    tail = tail.slice(1)
+  }
+
+  let sysContent =
+    stripCompactBlocks(stripChecklistBlock(apiContentText(sys.content))) + digestBlock
+  if (sysContent.length > COMPACT_SYSTEM_MAX_CHARS) {
+    sysContent = sysContent.slice(0, COMPACT_SYSTEM_MAX_CHARS) + '\n…[compact truncated]'
+  }
+
+  let compacted: ApiMessage[] = [
+    {
+      role: 'system',
+      content: sysContent
+    },
+    ...tail
+  ]
+  let messages = normalizeApiMessages(compacted.map(slimMessage))
+  if (shouldCompactForOverflow(messages, ctxSize)) {
+    messages = nuclearFitMessages(messages, ctxSize)
+  }
+  return {
+    messages,
+    summary: memoryBody
+  }
 }
 
 /** Never insert a user turn after tools — breaks Devstral Jinja. */
@@ -776,7 +1003,7 @@ function appendToolHint(msgs: ApiMessage[], hint: string): void {
     if (msgs[i]?.role === 'tool') {
       msgs[i] = {
         ...msgs[i]!,
-        content: `${msgs[i]!.content ?? ''}\n\n[AGENT_HINT]: ${hint}`
+        content: `${apiContentText(msgs[i]!.content)}\n\n[AGENT_HINT]: ${hint}`
       }
       return
     }
@@ -794,106 +1021,9 @@ function pushUserMessage(msgs: ApiMessage[], content: string): void {
   }
   const end = msgs[msgs.length - 1]
   if (end?.role === 'user') {
-    end.content = `${end.content ?? ''}\n\n${content}`
+    end.content = `${apiContentText(end.content)}\n\n${content}`
   } else {
     msgs.push({ role: 'user', content })
-  }
-}
-
-async function compactApiMessages(
-  msgs: ApiMessage[],
-  checklist?: AgentChecklist,
-  queue?: QueueManager
-): Promise<{ messages: ApiMessage[]; summary: string }> {
-  if (msgs.length < 6) {
-    return {
-      messages: normalizeApiMessages(msgs.map(slimMessage)),
-      summary: ''
-    }
-  }
-
-  const head = msgs.slice(0, 1) // system
-  // Slim write_file payloads so one compact pass is enough
-  const rawTail = msgs.slice(-10).map(slimMessage)
-  const middle = msgs.slice(1, -10)
-
-  const digestLines: string[] = []
-  const written = new Set<string>()
-  for (const m of middle) {
-    if (m.role === 'tool') {
-      const brief = (m.content ?? '').slice(0, 180).replace(/\s+/g, ' ')
-      digestLines.push(`- tool: ${brief}`)
-      const pathMatch2 = (m.content ?? '').match(
-        /(?:to|on)\s+"?([A-Za-z0-9_./\\-]+\.[a-zA-Z0-9]+)"?/
-      )
-      if (pathMatch2?.[1]) written.add(pathMatch2[1].replace(/\\/g, '/'))
-    } else if (m.role === 'assistant' && m.tool_calls?.length) {
-      for (const t of m.tool_calls) {
-        digestLines.push(`- called: ${t.function.name}`)
-        const p = extractJsonStringField(t.function.arguments || '', 'relative_path')
-        if (p) written.add(p.replace(/\\/g, '/'))
-      }
-    } else if (m.role === 'user' || m.role === 'assistant') {
-      const brief = (m.content ?? '').slice(0, 120).replace(/\s+/g, ' ')
-      if (brief) digestLines.push(`- ${m.role}: ${brief}`)
-    }
-  }
-
-  let llmSummary = ''
-  if (queue && middle.length > 0) {
-    llmSummary = await llmSummarizeMiddle(queue, middle)
-  }
-
-  const tree = await fetchProjectTreeDigest()
-  const fromHeuristic =
-    written.size > 0
-      ? `\nAlready touched paths (do NOT recreate; append or apply_patch only):\n` +
-        [...written].slice(-60).map((p) => `- ${p}`).join('\n')
-      : ''
-
-  let cl = checklist ? { ...checklist, done: [...checklist.done], incomplete: [...checklist.incomplete], failed: [...checklist.failed], shells: [...checklist.shells] } : emptyChecklist()
-  if (checklist) {
-    for (const p of written) {
-      if (
-        !cl.done.some((d) => normPath(d) === normPath(p)) &&
-        !cl.incomplete.some((d) => normPath(d) === normPath(p))
-      ) {
-        pushUnique(cl.done, p)
-      }
-    }
-  } else {
-    for (const p of written) pushUnique(cl.done, p)
-  }
-  const checklistBlock = formatChecklist(cl) || fromHeuristic
-
-  const sys = head[0] ?? { role: 'system', content: '' }
-  const memoryBody =
-    llmSummary.trim() ||
-    digestLines.slice(-40).join('\n') ||
-    '(no prior middle turns)'
-  const digestBlock =
-    '\n\n[Context compacted due to context-window pressure]\n' +
-    memoryBody +
-    checklistBlock +
-    tree +
-    '\n\nCRITICAL: Continue from EXISTING files only. Never rewrite a file that already exists; use append=true or apply_patch. Do not create alternate filenames.'
-
-  // Drop orphan tool rows from tail (must follow an assistant tool_calls)
-  let tail = rawTail
-  while (tail.length && tail[0]?.role === 'tool') {
-    tail = tail.slice(1)
-  }
-
-  const compacted: ApiMessage[] = [
-    {
-      role: 'system',
-      content: `${stripChecklistBlock(sys.content ?? '')}${digestBlock}`
-    },
-    ...tail
-  ]
-  return {
-    messages: normalizeApiMessages(compacted),
-    summary: memoryBody
   }
 }
 
@@ -903,18 +1033,27 @@ async function llmSummarizeMiddle(
 ): Promise<string> {
   const lines: string[] = []
   for (const m of middle) {
+    const text =
+      typeof m.content === 'string'
+        ? m.content
+        : Array.isArray(m.content)
+          ? m.content
+              .filter((p): p is { type: 'text'; text: string } => p.type === 'text')
+              .map((p) => p.text)
+              .join('\n')
+          : ''
     if (m.role === 'tool') {
-      lines.push(`tool: ${(m.content ?? '').slice(0, 200).replace(/\s+/g, ' ')}`)
+      lines.push(`tool: ${text.slice(0, 200).replace(/\s+/g, ' ')}`)
     } else if (m.role === 'assistant' && m.tool_calls?.length) {
       for (const t of m.tool_calls) {
         const p = extractJsonStringField(t.function.arguments || '', 'relative_path')
         lines.push(`called ${t.function.name}${p ? ` ${p}` : ''}`)
       }
-      if (m.content?.trim()) {
-        lines.push(`assistant: ${m.content.slice(0, 160).replace(/\s+/g, ' ')}`)
+      if (text.trim()) {
+        lines.push(`assistant: ${text.slice(0, 160).replace(/\s+/g, ' ')}`)
       }
     } else if (m.role === 'user' || m.role === 'assistant') {
-      const brief = (m.content ?? '').slice(0, 240).replace(/\s+/g, ' ')
+      const brief = text.slice(0, 240).replace(/\s+/g, ' ')
       if (brief) lines.push(`${m.role}: ${brief}`)
     }
   }
@@ -1305,6 +1444,7 @@ export async function runAgentTurn(params: {
   openFile?: { path: string; content: string }
   selection?: EditorSelectionContext | null
   attachments?: FileAttachment[]
+  images?: ImageAttachment[]
   onUpdate: (messages: ChatMessage[]) => void
   onStats?: (stats: ChatMessageStats) => void
   onOpenPath?: (relativePath: string) => void
@@ -1330,9 +1470,20 @@ export async function runAgentTurn(params: {
   const tAgent = (key: 'chat.agent.pausedRounds' | 'chat.agent.genTimeout', vars?: Record<string, string | number>) =>
     translate(uiLang, key, vars)
   const userMessageId = params.reverbContinue?.messageId ?? uid()
+  const imageRefs = (params.images ?? []).slice(0, 4).map((img) => ({
+    id: img.id,
+    path: img.path,
+    mime: img.mime,
+    ...(img.name ? { name: img.name } : {})
+  }))
   const messages: ChatMessage[] = [
     ...params.history.filter((m) => !m.pending && !m.streaming),
-    { id: userMessageId, role: 'user', content: params.userText }
+    {
+      id: userMessageId,
+      role: 'user',
+      content: params.userText,
+      ...(imageRefs.length ? { images: imageRefs } : {})
+    }
   ]
   params.onUserMessageCreated?.(userMessageId)
   params.onUpdate([...messages])
@@ -1392,12 +1543,46 @@ export async function runAgentTurn(params: {
     params.onUpdate([...messages])
   }
 
-  const apiUserText = params.reverbContinue
+  let effectiveUserText = params.reverbContinue
     ? formatReverbPrompt(params.userText)
     : params.userText
+
+  if (imageRefs.length > 0) {
+    if (!appSettings.visionModelPath?.trim()) {
+      messages.push({
+        id: uid(),
+        role: 'assistant',
+        content:
+          'Images are attached, but no vision model is configured. Set Vision model (+ mmproj) in Settings → Multimodal, then retry.'
+      })
+      return finishWithTiming(messages)
+    }
+    try {
+      const description = await describeImagesWithVision({
+        queue: params.queue,
+        userText: params.userText,
+        images: imageRefs,
+        signal: params.signal
+      })
+      if (params.signal?.aborted) return finishStopped()
+      if (description.trim()) {
+        effectiveUserText =
+          `${effectiveUserText}\n\n[Attached image analysis]\n${description.trim()}`.trim()
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      messages.push({
+        id: uid(),
+        role: 'assistant',
+        content: `Vision analysis failed: ${msg}`
+      })
+      return finishWithTiming(messages)
+    }
+  }
+
   let apiMessages: ApiMessage[] = await buildApiMessages(
     params.history,
-    apiUserText,
+    effectiveUserText,
     params.openFile,
     appSettings,
     checklist,
@@ -1410,6 +1595,7 @@ export async function runAgentTurn(params: {
   let earlyDoneNudges = 0
   let roleRepairAttempts = 0
   let jsonRepairAttempts = 0
+  let overflowRepairs = 0
   let markupRepairAttempts = 0
   let toolLoopHits = 0
   let missingPathHits = 0
@@ -1450,12 +1636,13 @@ export async function runAgentTurn(params: {
       const compacted = await compactApiMessages(
         apiMessages,
         checklist,
-        params.queue
+        params.queue,
+        ctxSize
       )
       apiMessages = compacted.messages
       if (compacted.summary) upsertThreadSummary(messages, compacted.summary)
       if (shouldCompactForOverflow(apiMessages, ctxSize)) {
-        apiMessages = normalizeApiMessages(apiMessages.map(slimMessage))
+        apiMessages = nuclearFitMessages(apiMessages, ctxSize)
       }
       messages.push({
         id: uid(),
@@ -1725,16 +1912,19 @@ export async function runAgentTurn(params: {
         errText
       )
       const isOverflow =
-        /context|overflow|oom|too many tokens|n_keep|exceed/i.test(errText)
+        /context|overflow|oom|too many tokens|n_keep|exceed|413/i.test(errText)
 
       if (isRoleError) roleRepairAttempts++
       else roleRepairAttempts = 0
       if (isJsonToolError) jsonRepairAttempts++
       else if (!isRoleError) jsonRepairAttempts = 0
+      if (isOverflow) overflowRepairs++
 
+      const overflowBudgetOk = !isOverflow || overflowRepairs <= MAX_OVERFLOW_REPAIRS
       const repairBudgetOk =
         (!isRoleError || roleRepairAttempts <= 2) &&
-        (!isJsonToolError || jsonRepairAttempts <= 2)
+        (!isJsonToolError || jsonRepairAttempts <= 2) &&
+        overflowBudgetOk
       const recoverable =
         repairBudgetOk &&
         (isRoleError ||
@@ -1747,8 +1937,10 @@ export async function runAgentTurn(params: {
         id: uid(),
         role: 'assistant',
         content: recoverable
-          ? `⚠ ${errText}\n${isOverflow ? 'Compacting…' : isJsonToolError ? 'Retry with smaller tool args…' : 'Repairing message roles…'} retrying`
-          : `Error: ${errText}`
+          ? `⚠ ${errText.slice(0, 500)}\n${isOverflow ? 'Compacting…' : isJsonToolError ? 'Retry with smaller tool args…' : 'Repairing message roles…'} retrying`
+          : isOverflow && !overflowBudgetOk
+            ? `Error: context still exceeds ${ctxSize} tokens after ${MAX_OVERFLOW_REPAIRS} compact attempts. Start a new chat or raise ctx size. Do not read image/binary files as text.`
+            : `Error: ${errText.slice(0, 800)}`
       })
       params.onUpdate([...messages])
 
@@ -1758,25 +1950,31 @@ export async function runAgentTurn(params: {
         const compacted = await compactApiMessages(
           apiMessages,
           checklist,
-          params.queue
+          params.queue,
+          ctxSize
         )
         apiMessages = compacted.messages
         if (compacted.summary) upsertThreadSummary(messages, compacted.summary)
+        if (shouldCompactForOverflow(apiMessages, ctxSize)) {
+          apiMessages = nuclearFitMessages(apiMessages, ctxSize)
+        }
       } else {
-        apiMessages = normalizeApiMessages(apiMessages)
+        apiMessages = normalizeApiMessages(apiMessages.map(slimMessage))
       }
       // Never insert user after tools — attach hint to last tool or merge into last user
       const last = apiMessages[apiMessages.length - 1]
       const repairHint = isJsonToolError
         ? 'Previous tool JSON was invalid. Prefer apply_diff with a short unique search_block, or write_file with ≤800 chars. Do not resend a huge apply_patch.'
-        : `Previous model response failed: ${errText.slice(0, 240)}\n` +
-          'Continue the unfinished task. Prefer smaller write_file chunks and relative paths only. Never overwrite existing files — append=true or apply_diff.'
+        : isOverflow
+          ? 'Context was compacted. Continue with short tool calls only. Never read .png/.jpg/.webp as text; never paste image bytes into write_file.'
+          : `Previous model response failed: ${errText.slice(0, 240)}\n` +
+            'Continue the unfinished task. Prefer smaller write_file chunks and relative paths only. Never overwrite existing files — append=true or apply_diff.'
       if (last?.role === 'tool') {
         appendToolHint(apiMessages, repairHint)
       } else {
         pushUserMessage(apiMessages, repairHint)
       }
-      apiMessages = normalizeApiMessages(apiMessages)
+      apiMessages = normalizeApiMessages(apiMessages.map(slimMessage))
       continue
       }
     }
@@ -1853,6 +2051,11 @@ export async function runAgentTurn(params: {
         content: result.text?.trim() ? result.text : null,
         tool_calls: toolCalls
       })
+
+      const imageGenOkPaths: string[] = []
+      let imageGenOnlyRound = toolCalls.every(
+        (c) => c.function.name === 'generate_image'
+      )
 
       for (const [index, call] of toolCalls.entries()) {
         const name = call.function.name as AgentToolName
@@ -2217,16 +2420,29 @@ export async function runAgentTurn(params: {
 
         applyToolToChecklist(checklist, name, args, toolResult)
 
-        const content = toolResult.ok
+        let content = toolResult.ok
           ? toolResult.content.slice(0, TOOL_RESULT_CHARS)
           : `${toolResult.error ? `ERROR: ${toolResult.error}\n` : ''}${toolResult.content}`.slice(
               0,
               TOOL_RESULT_CHARS
             )
+        // Keep image-gen out of the context window — never pass bytes or long blobs back.
+        if (name === 'generate_image') {
+          const out =
+            toolResult.filePath ||
+            (typeof args.relative_path === 'string' ? args.relative_path : 'generated/image.png')
+          if (toolResult.ok) {
+            imageGenOkPaths.push(out.replace(/\\/g, '/'))
+            content = `OK: saved ${out.replace(/\\/g, '/')}. IMAGE_DONE — do not read_file or edit.`
+          } else {
+            content = `ERROR: ${(toolResult.error || 'image gen failed').slice(0, 400)}`
+          }
+        }
 
         if (
-          params.signal?.aborted ||
-          /USER_STOPPED|Interrupted by Stop/i.test(content)
+          !toolResult.ok &&
+          (params.signal?.aborted ||
+            /USER_STOPPED|Interrupted by Stop/i.test(content))
         ) {
           const idx = messages.findIndex((m) => m.id === statusId)
           if (idx !== -1) {
@@ -2239,6 +2455,58 @@ export async function runAgentTurn(params: {
           }
           params.onUpdate([...messages])
           return finishStopped()
+        }
+
+        // generate_image succeeded — keep the result even if the user/system
+        // aborted during chat-model restore (otherwise the PNG is invisible).
+        if (
+          toolResult.ok &&
+          name === 'generate_image' &&
+          params.signal?.aborted
+        ) {
+          const idx = messages.findIndex((m) => m.id === statusId)
+          const outPath =
+            toolResult.filePath ||
+            (typeof args.relative_path === 'string'
+              ? args.relative_path
+              : filePath)
+          let images = messages[idx]?.images
+          if (outPath && params.sessionId) {
+            try {
+              const root = await window.api.workspace.getRoot()
+              if (root) {
+                const abs = outPath.match(/^[a-zA-Z]:[\\/]/)
+                  ? outPath
+                  : `${root.replace(/[\\/]+$/, '')}/${outPath.replace(/^[/\\]+/, '')}`
+                const meta = await window.api.chatImages.import({
+                  sessionId: params.sessionId,
+                  sourcePath: abs.replace(/\//g, '\\'),
+                  name: outPath.split(/[/\\]/).pop()
+                })
+                images = [meta]
+              }
+            } catch {
+              /* preview optional */
+            }
+          }
+          if (idx !== -1) {
+            const doneActivity = activityForTool(name, args, {
+              streaming: false,
+              ok: true,
+              resultContent: content
+            })
+            messages[idx] = {
+              ...messages[idx],
+              content: formatActivityLabel(doneActivity),
+              toolName: name,
+              streaming: false,
+              activity: doneActivity,
+              filePath: outPath ?? messages[idx].filePath,
+              images
+            }
+          }
+          params.onUpdate([...messages])
+          return finishStopped('⏹ Stopped after image gen (chat restore). Image was saved.')
         }
 
         const idx = messages.findIndex((m) => m.id === statusId)
@@ -2286,7 +2554,9 @@ export async function runAgentTurn(params: {
           })
           const errNote =
             !toolResult.ok && (toolResult.error || toolResult.content)
-              ? ` — ${(toolResult.error || toolResult.content).replace(/\s+/g, ' ').slice(0, 140)}`
+              ? ` — ${(toolResult.error || toolResult.content)
+                  .replace(/\s+/g, ' ')
+                  .slice(0, name === 'generate_image' ? 400 : 140)}`
               : ''
           messages[idx] = {
             ...messages[idx],
@@ -2300,12 +2570,45 @@ export async function runAgentTurn(params: {
               name === 'apply_patch'
                 ? (codePreview ?? messages[idx].codePreview)
                 : undefined,
-            filePath: filePath ?? messages[idx].filePath,
+            filePath:
+              toolResult.filePath ||
+              filePath ||
+              messages[idx].filePath,
             editReview: showReview
               ? { path: reviewPath!, status: 'pending' }
               : autoApprove && reviewPath && toolResult.ok
                 ? { path: reviewPath, status: 'accepted' }
                 : messages[idx].editReview
+          }
+
+          if (toolResult.ok && name === 'generate_image' && params.sessionId) {
+            const outPath =
+              toolResult.filePath ||
+              (typeof args.relative_path === 'string'
+                ? args.relative_path
+                : filePath)
+            if (outPath) {
+              try {
+                const root = await window.api.workspace.getRoot()
+                if (root) {
+                  const abs = /^[a-zA-Z]:[\\/]/.test(outPath)
+                    ? outPath
+                    : `${root.replace(/[\\/]+$/, '')}\\${outPath.replace(/^[/\\]+/, '').replace(/\//g, '\\')}`
+                  const meta = await window.api.chatImages.import({
+                    sessionId: params.sessionId,
+                    sourcePath: abs,
+                    name: outPath.split(/[/\\]/).pop()
+                  })
+                  messages[idx] = {
+                    ...messages[idx],
+                    filePath: outPath.replace(/\\/g, '/'),
+                    images: [meta]
+                  }
+                }
+              } catch {
+                /* preview optional — file is still on disk */
+              }
+            }
           }
 
           if (
@@ -2352,11 +2655,35 @@ export async function runAgentTurn(params: {
         // Users open paths from chat file chips / explorer when they want a tab.
       }
 
+      // Image-only turns: do not call the LLM again (avoids context compact storms).
+      if (
+        imageGenOnlyRound &&
+        imageGenOkPaths.length > 0 &&
+        imageGenOkPaths.length === toolCalls.length
+      ) {
+        const paths = imageGenOkPaths.join(', ')
+        messages.push({
+          id: uid(),
+          role: 'assistant',
+          content:
+            imageGenOkPaths.length === 1
+              ? `Saved \`${paths}\`.`
+              : `Saved images: ${paths}.`
+        })
+        params.onUpdate([...messages])
+        return finishWithTiming(messages)
+      }
+
       // Hints on tool result — inserting `user` after `tool` breaks Devstral Jinja
       const lastTool = apiMessages[apiMessages.length - 1]
       if (lastTool?.role === 'tool') {
-        const tc = lastTool.content ?? ''
-        if (/INCOMPLETE_WRITE_LIMIT/i.test(tc)) {
+        const tc = apiContentText(lastTool.content)
+        if (/IMAGE_DONE/i.test(tc)) {
+          appendToolHint(
+            apiMessages,
+            'IMAGE_DONE: do not read_file the PNG. One short confirmation only, then stop.'
+          )
+        } else if (/INCOMPLETE_WRITE_LIMIT/i.test(tc)) {
           appendToolHint(
             apiMessages,
             'INCOMPLETE_WRITE_LIMIT: do not append tiny chunks to that path. Write a larger chunk (≥200 chars) once, or move on to the next unfinished file.'
@@ -2433,7 +2760,7 @@ export async function runAgentTurn(params: {
     if (finalText) {
       const lastApi = apiMessages[apiMessages.length - 1]
       if (lastApi?.role === 'assistant' && !lastApi.tool_calls?.length) {
-        lastApi.content = `${lastApi.content ?? ''}\n\n${finalText}`
+        lastApi.content = `${apiContentText(lastApi.content)}\n\n${finalText}`
       } else {
         apiMessages.push({ role: 'assistant', content: finalText })
       }

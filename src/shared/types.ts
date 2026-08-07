@@ -75,6 +75,7 @@ export type AgentToolName =
   | 'read_terminal'
   | 'delete_file'
   | 'create_directory'
+  | 'generate_image'
 
 export interface AgentToolCall {
   id: string
@@ -98,6 +99,8 @@ export interface AgentToolResult {
   needsConfirmation?: boolean
   /** Present after a successful write/apply_diff/apply_patch — UI can Accept/Reject (undo) */
   editReview?: AgentEditReview
+  /** Relative workspace path for tools that create/touch a file (e.g. generate_image) */
+  filePath?: string
 }
 
 export interface FimContext {
@@ -360,6 +363,36 @@ export const AGENT_TOOL_SCHEMAS = [
             description: 'Max characters to return from the end of the scrollback (default 8000)'
           }
         }
+      }
+    }
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'generate_image',
+      description:
+        'Generate a PNG with local stable-diffusion.cpp (text-to-image). Unloads chat VRAM, generates, restores chat. ' +
+        'After success: do NOT read_file or edit the image — only report the path. Photos are never read as text (vision attach only for user images).',
+      parameters: {
+        type: 'object',
+        properties: {
+          prompt: {
+            type: 'string',
+            description: 'Positive text prompt for the image (keep focused; do not paste large code/context)'
+          },
+          relative_path: {
+            type: 'string',
+            description: 'Optional output path relative to project root (e.g. generated/hero.png)'
+          },
+          negative_prompt: {
+            type: 'string',
+            description: 'Optional negative prompt'
+          },
+          width: { type: 'integer', description: 'Width in pixels (default from settings)' },
+          height: { type: 'integer', description: 'Height in pixels (default from settings)' },
+          steps: { type: 'integer', description: 'Denoising steps (default from settings)' }
+        },
+        required: ['prompt']
       }
     }
   }

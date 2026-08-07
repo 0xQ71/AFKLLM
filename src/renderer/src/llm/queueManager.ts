@@ -153,7 +153,7 @@ export class QueueManager {
   async chatStream(params: {
     messages: Array<{
       role: string
-      content: string | null
+      content: string | null | Array<unknown>
       tool_call_id?: string
       tool_calls?: unknown
       name?: string

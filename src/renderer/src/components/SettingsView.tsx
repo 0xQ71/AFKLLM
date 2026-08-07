@@ -16,6 +16,7 @@ import { parseTelemetryLogText } from '../../../shared/telemetry'
 import { applyMonacoTheme } from '../editor/monacoSetup'
 import { useI18n } from '../i18n/I18nProvider'
 import { ModelStorePanel } from './ModelStorePanel'
+import type { StoreDownloadTarget } from '../../../shared/hfStore'
 import type {
   LlamaRuntimePack,
   LlamaRuntimeSelection,
@@ -60,8 +61,10 @@ export function SettingsView({
   const [models, setModels] = useState<DiscoveredModel[]>([])
   const [busy, setBusy] = useState(false)
   const [message, setMessage] = useState<string | null>(null)
+  const [saveOk, setSaveOk] = useState(false)
   const [modelActionBusy, setModelActionBusy] = useState(false)
   const [storeOpen, setStoreOpen] = useState(false)
+  const [storeTarget, setStoreTarget] = useState<StoreDownloadTarget>('chat')
   const [mcpStatus, setMcpStatus] = useState<McpServerStatus[]>([])
   const [runtime, setRuntime] = useState<LlamaRuntimeStatus | null>(null)
   const [runtimeBusy, setRuntimeBusy] = useState(false)
@@ -70,6 +73,7 @@ export function SettingsView({
     if (!open) return
     setPage(initialPage)
     setMessage(null)
+    setSaveOk(false)
     void (async () => {
       const s = await window.api.settings.get()
       setSettings(s)
@@ -88,6 +92,15 @@ export function SettingsView({
     })()
     return window.api.mcp.onChanged((st) => setMcpStatus(st))
   }, [open, initialPage])
+
+  useEffect(() => {
+    if (!saveOk) return
+    const tmr = window.setTimeout(() => {
+      setSaveOk(false)
+      setMessage((m) => (m === t('settings.msg.saved') ? null : m))
+    }, 3500)
+    return () => window.clearTimeout(tmr)
+  }, [saveOk, t])
 
   if (!open) return null
 
@@ -110,6 +123,7 @@ export function SettingsView({
   const save = async (): Promise<void> => {
     setBusy(true)
     setMessage(null)
+    setSaveOk(false)
     try {
       const next = await window.api.settings.save({
         ...settings,
@@ -117,15 +131,40 @@ export function SettingsView({
       })
       setSettings(next)
       try {
+        setModels(await window.api.llm.listModels())
+      } catch {
+        /* ignore */
+      }
+      try {
         setMcpStatus(await window.api.mcp.status())
       } catch {
         /* ignore */
       }
+      setSaveOk(true)
       setMessage(t('settings.msg.saved'))
     } catch (err) {
+      setSaveOk(false)
       setMessage(err instanceof Error ? err.message : String(err))
     } finally {
       setBusy(false)
+    }
+  }
+
+  const applyModelsDir = async (dir: string): Promise<void> => {
+    setSettings((prev) => (prev ? { ...prev, modelsDir: dir } : prev))
+    try {
+      let next = await window.api.settings.save({ modelsDir: dir })
+      const list = await window.api.llm.listModels()
+      setModels(list)
+      if (
+        list.length > 0 &&
+        (!next.modelPath || !list.some((m) => m.path === next.modelPath))
+      ) {
+        next = await window.api.settings.save({ modelPath: list[0]!.path })
+      }
+      setSettings(next)
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : String(err))
     }
   }
 
@@ -212,7 +251,11 @@ export function SettingsView({
                     setModelActionBusy={setModelActionBusy}
                     onLoadModel={onLoadModel}
                     onUnloadModel={onUnloadModel}
-                    onOpenStore={() => setStoreOpen(true)}
+                    onModelsDirChange={applyModelsDir}
+                    onOpenStore={(target: StoreDownloadTarget = 'chat') => {
+                      setStoreTarget(target)
+                      setStoreOpen(true)
+                    }}
                   />
                 )}
                 {page === 'performance' && (
@@ -242,22 +285,31 @@ export function SettingsView({
                   />
                 )}
 
-                {message && (
-                  <p className="max-h-32 overflow-auto whitespace-pre-wrap rounded-lg border border-ink-line bg-ink-900 px-3 py-2 font-mono text-xs text-ink-soft">
+                {message && !saveOk ? (
+                  <p className="max-h-32 overflow-auto whitespace-pre-wrap rounded-lg border border-danger/40 bg-danger-muted px-3 py-2 font-mono text-xs text-danger">
                     {message}
                   </p>
-                )}
+                ) : null}
               </div>
             </div>
 
-            <div className="flex shrink-0 justify-end gap-2 border-t border-ink-line px-5 py-3">
+            <div className="flex shrink-0 items-center justify-end gap-3 border-t border-ink-line px-5 py-3">
+              {saveOk ? (
+                <div
+                  role="status"
+                  className="mr-auto rounded-md border border-signal/40 bg-signal/15 px-3 py-1.5 text-[12px] text-signal"
+                >
+                  ✓ {t('settings.msg.saved')}
+                  <span className="ml-2 text-ink-mute">{t('settings.msg.savedHint')}</span>
+                </div>
+              ) : null}
               <button
                 type="button"
                 disabled={busy}
                 onClick={() => void save()}
                 className={settingsPrimaryBtnClass + ' px-4 py-2 text-sm'}
               >
-                {t('settings.save')}
+                {busy ? '…' : t('settings.save')}
               </button>
             </div>
           </div>
@@ -266,9 +318,37 @@ export function SettingsView({
 
       <ModelStorePanel
         open={storeOpen}
+        target={storeTarget}
         onClose={() => setStoreOpen(false)}
         onDownloaded={(localPath: string) => {
-          setSettings((prev) => (prev ? switchModelPath(prev, localPath) : prev))
+          setSettings((prev) => {
+            if (!prev) return prev
+            if (storeTarget === 'vision') {
+              return { ...prev, visionModelPath: localPath }
+            }
+            if (storeTarget === 'mmproj') {
+              return { ...prev, visionMmprojPath: localPath }
+            }
+            if (storeTarget === 'imageGen') {
+              return { ...prev, imageGenModelPath: localPath }
+            }
+            if (storeTarget === 'imageGenVae') {
+              return { ...prev, imageGenVaePath: localPath }
+            }
+            if (storeTarget === 'imageGenClipL') {
+              return { ...prev, imageGenClipLPath: localPath }
+            }
+            if (storeTarget === 'imageGenClipG') {
+              return { ...prev, imageGenClipGPath: localPath }
+            }
+            if (storeTarget === 'imageGenT5') {
+              return { ...prev, imageGenT5Path: localPath }
+            }
+            if (storeTarget === 'imageGenLlm') {
+              return { ...prev, imageGenLlmPath: localPath }
+            }
+            return switchModelPath(prev, localPath)
+          })
           setStoreOpen(false)
           setMessage(t('store.imported', { path: localPath }))
           void window.api.llm.listModels().then(setModels).catch(() => {
@@ -606,6 +686,7 @@ function ModelPage({
   setModelActionBusy,
   onLoadModel,
   onUnloadModel,
+  onModelsDirChange,
   onOpenStore
 }: {
   settings: AppSettings
@@ -617,12 +698,13 @@ function ModelPage({
   setModelActionBusy: (v: boolean) => void
   onLoadModel?: () => void | Promise<void>
   onUnloadModel?: () => void | Promise<void>
-  onOpenStore: () => void
+  onModelsDirChange: (dir: string) => void | Promise<void>
+  onOpenStore: (target?: StoreDownloadTarget) => void
 }): React.JSX.Element {
   const { t } = useI18n()
   const pickModelsDir = async (): Promise<void> => {
     const dir = await window.api.workspace.pickModelsDir()
-    if (dir) patch('modelsDir', dir)
+    if (dir) await onModelsDirChange(dir)
   }
   return (
     <>
@@ -676,7 +758,7 @@ function ModelPage({
                 </option>
               ))}
             </select>
-            <button type="button" onClick={onOpenStore} className={settingsBtnClass + ' text-signal border-signal/40'}>
+            <button type="button" onClick={() => onOpenStore('chat')} className={settingsBtnClass + ' text-signal border-signal/40'}>
               {t('settings.model.storeShort')}
             </button>
             <button
@@ -755,12 +837,295 @@ function ModelPage({
             <input
               value={settings.modelsDir}
               onChange={(e) => patch('modelsDir', e.target.value)}
+              onBlur={(e) => {
+                const dir = e.target.value.trim()
+                if (dir) void onModelsDirChange(dir)
+              }}
               className={settingsInputClass + ' min-w-0 flex-1 font-mono text-xs'}
             />
             <button type="button" onClick={() => void pickModelsDir()} className={settingsBtnClass}>
               {t('settings.model.pickDir')}
             </button>
           </div>
+        </SettingRow>
+      </Well>
+      <PageIntro>{t('settings.multimodal.intro')}</PageIntro>
+      <Well>
+        <Field label={t('settings.multimodal.visionModel')}>
+          <div className="flex gap-2">
+            <select
+              value={settings.visionModelPath}
+              onChange={(e) => patch('visionModelPath', e.target.value)}
+              className={settingsInputClass + ' font-mono text-xs'}
+            >
+              <option value="">{t('settings.multimodal.none')}</option>
+              {models.map((m) => (
+                <option key={m.path} value={m.path}>
+                  {m.id}
+                </option>
+              ))}
+              {settings.visionModelPath &&
+                !models.some((m) => m.path === settings.visionModelPath) && (
+                  <option value={settings.visionModelPath}>
+                    {settings.visionModelPath.split(/[/\\]/).pop()}
+                  </option>
+                )}
+            </select>
+            <button
+              type="button"
+              className={settingsBtnClass + ' text-signal border-signal/40'}
+              onClick={() => onOpenStore('vision')}
+            >
+              {t('settings.model.storeShort')}
+            </button>
+            <button
+              type="button"
+              className={settingsBtnClass}
+              onClick={() => {
+                void window.api.workspace.pickModel().then((p) => {
+                  if (p) patch('visionModelPath', p)
+                })
+              }}
+            >
+              {t('settings.model.browse')}
+            </button>
+          </div>
+        </Field>
+        <Field label={t('settings.multimodal.mmproj')}>
+          <div className="flex gap-2">
+            <input
+              value={settings.visionMmprojPath}
+              onChange={(e) => patch('visionMmprojPath', e.target.value)}
+              placeholder={t('settings.multimodal.mmprojHint')}
+              className={settingsInputClass + ' min-w-0 flex-1 font-mono text-xs'}
+            />
+            <button
+              type="button"
+              className={settingsBtnClass + ' text-signal border-signal/40'}
+              onClick={() => onOpenStore('mmproj')}
+            >
+              {t('settings.model.storeShort')}
+            </button>
+            <button
+              type="button"
+              className={settingsBtnClass}
+              onClick={() => {
+                void window.api.workspace.pickMmproj().then((p) => {
+                  if (p) patch('visionMmprojPath', p)
+                })
+              }}
+            >
+              {t('settings.model.browse')}
+            </button>
+          </div>
+        </Field>
+        <Field label={t('settings.multimodal.imageGenModel')}>
+          <div className="flex gap-2">
+            <input
+              value={settings.imageGenModelPath}
+              onChange={(e) => patch('imageGenModelPath', e.target.value)}
+              placeholder={t('settings.multimodal.imageGenHint')}
+              className={settingsInputClass + ' min-w-0 flex-1 font-mono text-xs'}
+            />
+            <button
+              type="button"
+              className={settingsBtnClass + ' text-signal border-signal/40'}
+              onClick={() => onOpenStore('imageGen')}
+            >
+              {t('settings.model.storeShort')}
+            </button>
+            <button
+              type="button"
+              className={settingsBtnClass}
+              onClick={() => {
+                void window.api.workspace.pickImageGenModel().then((p) => {
+                  if (p) patch('imageGenModelPath', p)
+                })
+              }}
+            >
+              {t('settings.model.browse')}
+            </button>
+          </div>
+        </Field>
+        <p className="px-1 text-[11px] leading-snug text-ink-mute">
+          {t('settings.multimodal.stackHint')}
+        </p>
+        <p className="px-1 text-[11px] leading-snug text-ink-mute">
+          {t('settings.multimodal.imageGenAutofillHint')}
+        </p>
+        {(
+          [
+            [
+              'imageGenVaePath',
+              'settings.multimodal.vae',
+              'settings.multimodal.vaeHint',
+              'imageGenVae'
+            ],
+            [
+              'imageGenClipLPath',
+              'settings.multimodal.clipL',
+              'settings.multimodal.clipLHint',
+              'imageGenClipL'
+            ],
+            [
+              'imageGenClipGPath',
+              'settings.multimodal.clipG',
+              'settings.multimodal.clipGHint',
+              'imageGenClipG'
+            ],
+            [
+              'imageGenT5Path',
+              'settings.multimodal.t5',
+              'settings.multimodal.t5Hint',
+              'imageGenT5'
+            ],
+            [
+              'imageGenLlmPath',
+              'settings.multimodal.llm',
+              'settings.multimodal.llmHint',
+              'imageGenLlm'
+            ]
+          ] as const
+        ).map(([key, labelKey, hintKey, storeKey]) => (
+          <Field key={key} label={t(labelKey)}>
+            <div className="flex gap-2">
+              <input
+                value={settings[key]}
+                onChange={(e) => patch(key, e.target.value)}
+                placeholder={t(hintKey)}
+                className={settingsInputClass + ' min-w-0 flex-1 font-mono text-xs'}
+              />
+              <button
+                type="button"
+                className={settingsBtnClass + ' text-signal border-signal/40'}
+                onClick={() => onOpenStore(storeKey)}
+              >
+                {t('settings.model.storeShort')}
+              </button>
+              <button
+                type="button"
+                className={settingsBtnClass}
+                onClick={() => {
+                  void window.api.workspace.pickImageGenModel().then((p) => {
+                    if (p) patch(key, p)
+                  })
+                }}
+              >
+                {t('settings.model.browse')}
+              </button>
+            </div>
+          </Field>
+        ))}
+        <Field label={t('settings.multimodal.sdCppPath')}>
+          <div className="flex gap-2">
+            <input
+              value={settings.sdCppPath}
+              onChange={(e) => patch('sdCppPath', e.target.value)}
+              placeholder={t('settings.multimodal.sdCppHint')}
+              className={settingsInputClass + ' min-w-0 flex-1 font-mono text-xs'}
+            />
+            <button
+              type="button"
+              className={settingsBtnClass}
+              onClick={() => {
+                void window.api.workspace.pickSdCli().then((p) => {
+                  if (p) patch('sdCppPath', p)
+                })
+              }}
+            >
+              {t('settings.model.browse')}
+            </button>
+          </div>
+        </Field>
+        <Field label={t('settings.multimodal.weightStorage')}>
+          <select
+            value={settings.imageGenWeightStorage}
+            onChange={(e) =>
+              patch(
+                'imageGenWeightStorage',
+                e.target.value as AppSettings['imageGenWeightStorage']
+              )
+            }
+            className={settingsInputClass}
+          >
+            <option value="disk">{t('settings.multimodal.weightStorage.disk')}</option>
+            <option value="ram">{t('settings.multimodal.weightStorage.ram')}</option>
+            <option value="vram">{t('settings.multimodal.weightStorage.vram')}</option>
+          </select>
+          <p className="mt-1 text-[11px] text-ink-mute">
+            {t('settings.multimodal.weightStorageHint')}
+          </p>
+        </Field>
+        <div className="grid gap-0 sm:grid-cols-2">
+          {(
+            [
+              ['imageGenSteps', 'settings.multimodal.steps'],
+              ['imageGenWidth', 'settings.multimodal.width'],
+              ['imageGenHeight', 'settings.multimodal.height'],
+              ['imageGenCfg', 'settings.multimodal.cfg']
+            ] as const
+          ).map(([key, labelKey]) => (
+            <Field key={key} label={t(labelKey)}>
+              <input
+                type="number"
+                value={settings[key]}
+                onChange={(e) => patch(key, Number(e.target.value))}
+                className={settingsInputClass}
+              />
+            </Field>
+          ))}
+        </div>
+        <p className="px-1 text-[11px] text-ink-mute">{t('settings.multimodal.cfgHint')}</p>
+        <SettingRow
+          title={t('settings.multimodal.hires')}
+          description={t('settings.multimodal.hiresHint')}
+        >
+          <input
+            type="checkbox"
+            checked={settings.imageGenHires}
+            onChange={(e) => patch('imageGenHires', e.target.checked)}
+          />
+        </SettingRow>
+        <div className="grid gap-0 sm:grid-cols-2">
+          <Field label={t('settings.multimodal.hiresScale')}>
+            <input
+              type="number"
+              step={0.05}
+              min={1.05}
+              max={4}
+              disabled={!settings.imageGenHires}
+              value={settings.imageGenHiresScale}
+              onChange={(e) => patch('imageGenHiresScale', Number(e.target.value))}
+              className={settingsInputClass}
+            />
+          </Field>
+          <Field label={t('settings.multimodal.hiresDenoising')}>
+            <input
+              type="number"
+              step={0.05}
+              min={0.05}
+              max={1}
+              disabled={!settings.imageGenHires}
+              value={settings.imageGenHiresDenoising}
+              onChange={(e) =>
+                patch('imageGenHiresDenoising', Number(e.target.value))
+              }
+              className={settingsInputClass}
+            />
+          </Field>
+        </div>
+        <SettingRow title={t('settings.multimodal.sdRuntime')}>
+          <button
+            type="button"
+            className={settingsBtnClass}
+            onClick={() => {
+              void window.api.sdRuntime.ensure().catch((err: unknown) => {
+                console.error(err)
+              })
+            }}
+          >
+            {t('settings.multimodal.ensureSd')}
+          </button>
         </SettingRow>
       </Well>
     </>

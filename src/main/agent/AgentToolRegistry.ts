@@ -61,6 +61,11 @@ export interface AgentToolRegistryOptions {
     isReady(): boolean
     query(q: string): CodebaseQueryResult | null
   }
+  /**
+   * Local image generation (sd-cli). Unloads LLM, generates, restores chat.
+   * Provided by main process (slot orchestrator + SdRuntimeManager).
+   */
+  generateImage?: (args: Record<string, unknown>) => Promise<AgentToolResult>
 }
 
 /**
@@ -80,6 +85,7 @@ export class AgentToolRegistry {
   private readTerminalScrollback?: AgentToolRegistryOptions['readTerminalScrollback']
   private onOpenPreview?: AgentToolRegistryOptions['onOpenPreview']
   private contextIndex?: AgentToolRegistryOptions['contextIndex']
+  private generateImageFn?: AgentToolRegistryOptions['generateImage']
   /** First-edit-per-path snapshot for Accept/Reject undo */
   private pendingEdits = new Map<string, PendingEdit>()
 
@@ -93,6 +99,7 @@ export class AgentToolRegistry {
     this.readTerminalScrollback = options.readTerminalScrollback
     this.onOpenPreview = options.onOpenPreview
     this.contextIndex = options.contextIndex
+    this.generateImageFn = options.generateImage
     this.handlers = new Map([
       ['read_file', (a) => this.readFile(a)],
       ['write_file', (a) => this.writeFile(a)],
@@ -104,7 +111,8 @@ export class AgentToolRegistry {
       ['delete_file', (a) => this.deleteFileTool(a)],
       ['create_directory', (a) => this.createDirectory(a)],
       ['execute_terminal_command', (a) => this.executeTerminal(a)],
-      ['read_terminal', (a) => this.readTerminal(a)]
+      ['read_terminal', (a) => this.readTerminal(a)],
+      ['generate_image', (a) => this.generateImage(a)]
     ])
   }
 
@@ -398,7 +406,30 @@ export class AgentToolRegistry {
   private async readFile(args: Record<string, unknown>): Promise<AgentToolResult> {
     const relativePath = String(args.relative_path ?? '')
     const abs = this.safeResolve(relativePath)
-    const raw = await fs.readFile(abs, 'utf8')
+    const lower = relativePath.toLowerCase()
+    if (/\.(png|jpe?g|gif|webp|bmp|ico|pdf|zip|7z|rar|exe|dll|so|dylib|wasm|gguf|safetensors|bin|mp[34]|wav|ogg)$/i.test(lower)) {
+      return {
+        id: '',
+        name: 'read_file',
+        ok: false,
+        content: '',
+        error:
+          `BINARY_FILE: "${relativePath}" is not text. Do not read images/binaries with read_file. ` +
+          'For generated images, refer to the path only (already on disk).'
+      }
+    }
+    const buf = await fs.readFile(abs)
+    // Reject obvious binary even with a text-looking extension
+    if (buf.includes(0)) {
+      return {
+        id: '',
+        name: 'read_file',
+        ok: false,
+        content: '',
+        error: `BINARY_FILE: "${relativePath}" contains null bytes — not readable as text.`
+      }
+    }
+    const raw = buf.toString('utf8')
     const startRaw = Number(args.start_line)
     const endRaw = Number(args.end_line)
     const hasStart = Number.isFinite(startRaw) && startRaw >= 1
@@ -444,6 +475,17 @@ export class AgentToolRegistry {
         error:
           'MISSING_PATH: relative_path is required (e.g. "index.html" or "src/app.js"). ' +
           'Put the path in relative_path BEFORE content. Do not write to the project root.'
+      }
+    }
+    if (/\.(png|jpe?g|gif|webp|bmp|ico|gguf|safetensors)$/i.test(relativePath)) {
+      return {
+        id: '',
+        name: 'write_file',
+        ok: false,
+        content: '',
+        error:
+          `BINARY_FILE: do not write/edit image or model binaries via write_file ("${relativePath}"). ` +
+          'Use generate_image to create PNGs.'
       }
     }
     const abs = this.safeResolve(relativePath)
@@ -922,6 +964,20 @@ export class AgentToolRegistry {
           ? `TERMINAL_ERROR_FOCUS (fix this first):\n${focus}\n\n--- full recent scrollback ---\n`
           : '') + text.slice(-maxChars)
     }
+  }
+
+  private async generateImage(args: Record<string, unknown>): Promise<AgentToolResult> {
+    if (!this.generateImageFn) {
+      return {
+        id: '',
+        name: 'generate_image',
+        ok: false,
+        content: '',
+        error:
+          'Image generation is not configured. Set imageGenModelPath (and FLUX sidecars if needed) in Settings → Multimodal.'
+      }
+    }
+    return this.generateImageFn(args)
   }
 
   private formatShellResult(

@@ -2,6 +2,14 @@
 
 export type PersistedChatRole = 'system' | 'user' | 'assistant' | 'tool'
 
+export interface PersistedChatImage {
+  id: string
+  /** Absolute path under userData/chat-images */
+  path: string
+  mime: string
+  name?: string
+}
+
 export interface PersistedChatMessageStats {
   tps?: number
   promptTps?: number
@@ -19,6 +27,7 @@ export interface PersistedChatMessage {
   content: string
   toolName?: string
   filePath?: string
+  images?: PersistedChatImage[]
   stats?: PersistedChatMessageStats
   activity?: {
     kind: string
@@ -78,6 +87,25 @@ export function sanitizePersistedMessages(
       content: m.content.slice(0, CHAT_MAX_CONTENT_CHARS),
       ...(m.toolName ? { toolName: String(m.toolName) } : {}),
       ...(m.filePath ? { filePath: String(m.filePath) } : {})
+    }
+    if (Array.isArray(m.images) && m.images.length > 0) {
+      cleaned.images = m.images
+        .filter(
+          (img) =>
+            img &&
+            typeof img === 'object' &&
+            typeof img.id === 'string' &&
+            typeof img.path === 'string' &&
+            typeof img.mime === 'string'
+        )
+        .slice(0, 4)
+        .map((img) => ({
+          id: String(img.id),
+          path: String(img.path),
+          mime: String(img.mime),
+          ...(typeof img.name === 'string' ? { name: img.name } : {})
+        }))
+      if (!cleaned.images.length) delete cleaned.images
     }
     const stats = sanitizeStats(m.stats)
     if (stats) cleaned.stats = stats

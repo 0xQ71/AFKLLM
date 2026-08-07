@@ -207,6 +207,16 @@ export function buildActivityFromTool(params: {
         path,
         status
       }
+    case 'generate_image':
+      return {
+        kind: 'other',
+        verb: streaming ? 'Generating image' : 'Generated image',
+        path:
+          typeof args.relative_path === 'string' ? args.relative_path : path,
+        detail:
+          typeof args.prompt === 'string' ? args.prompt.slice(0, 72) : undefined,
+        status
+      }
     case 'list_directory':
       return {
         kind: 'list',

@@ -9,6 +9,8 @@ import type { CacheQuant, FlashAttnMode, LoadMode } from '../../shared/settings'
 export interface LlamaProcessOptions {
   binaryPath?: string
   modelPath: string
+  /** Multimodal projector for vision GGUFs (--mmproj) */
+  mmprojPath?: string
   host?: string
   port?: number
   nGpuLayers?: number
@@ -106,6 +108,10 @@ export class LlamaProcessManager extends EventEmitter {
     return this.options.modelPath
   }
 
+  get port(): number {
+    return this.options.port
+  }
+
   updateOptions(patch: Partial<LlamaProcessOptions>): void {
     this.options = { ...this.options, ...patch }
   }
@@ -166,7 +172,7 @@ export class LlamaProcessManager extends EventEmitter {
 
     this.startEpoch++
     await this.killManagedProcess()
-    this.killOrphansOnPort(this.options.port)
+    LlamaProcessManager.killListenersOnPort(this.options.port)
     const epoch = this.startEpoch
 
     this.setState('starting')
@@ -219,6 +225,16 @@ export class LlamaProcessManager extends EventEmitter {
 
     if (this.options.contextShift) args.push('--context-shift')
     else args.push('--no-context-shift')
+
+    const mmproj = this.options.mmprojPath?.trim()
+    if (mmproj) {
+      if (!existsSync(mmproj)) {
+        this.lastError = `mmproj not found: ${mmproj}`
+        this.setState('error')
+        throw new Error(this.lastError)
+      }
+      args.push('--mmproj', mmproj)
+    }
 
     this.process = spawn(binary, args, {
       cwd: dirname(binary),
@@ -274,30 +290,59 @@ export class LlamaProcessManager extends EventEmitter {
   async stop(): Promise<void> {
     this.startEpoch++
     await this.killManagedProcess()
+    LlamaProcessManager.killListenersOnPort(this.options.port)
     this.setState('stopped')
     this.statusDetail = ''
+    this.recentLogs = ''
   }
 
   private async killManagedProcess(): Promise<void> {
     const proc = this.process
     this.process = null
     if (!proc) return
+    const pid = proc.pid
     await new Promise<void>((resolve) => {
-      const done = (): void => resolve()
+      let settled = false
+      const done = (): void => {
+        if (settled) return
+        settled = true
+        resolve()
+      }
       proc.once('exit', done)
-      try {
-        proc.kill()
-      } catch {
-        done()
+      // Windows: taskkill /T kills the process tree; SIGKILL is unreliable here.
+      if (process.platform === 'win32' && pid) {
+        try {
+          execSync(`taskkill /PID ${pid} /T /F`, { stdio: 'ignore' })
+        } catch {
+          try {
+            proc.kill()
+          } catch {
+            done()
+          }
+        }
+      } else {
+        try {
+          proc.kill()
+        } catch {
+          done()
+        }
       }
       setTimeout(() => {
-        try {
-          proc.kill('SIGKILL')
-        } catch {
-          /* already dead */
+        if (process.platform === 'win32' && pid) {
+          try {
+            execSync(`taskkill /PID ${pid} /T /F`, { stdio: 'ignore' })
+          } catch {
+            /* already dead */
+          }
+        } else {
+          try {
+            proc.kill('SIGKILL')
+          } catch {
+            /* already dead */
+          }
         }
         done()
-      }, 5_000).unref?.()
+      }, 2_000).unref?.()
     })
   }
 
@@ -370,8 +415,8 @@ export class LlamaProcessManager extends EventEmitter {
     throw new Error(this.lastError)
   }
 
-  /** Kill stray listeners on our port (Windows). */
-  private killOrphansOnPort(port: number): void {
+  /** Kill stray listeners on our port (Windows). Safe to call without a manager instance. */
+  static killListenersOnPort(port: number): void {
     if (process.platform !== 'win32') return
     try {
       const out = execSync(`netstat -ano | findstr :${port}`, { encoding: 'utf8' })
@@ -384,7 +429,7 @@ export class LlamaProcessManager extends EventEmitter {
       }
       for (const pid of pids) {
         try {
-          execSync(`taskkill /PID ${pid} /F`, { stdio: 'ignore' })
+          execSync(`taskkill /PID ${pid} /T /F`, { stdio: 'ignore' })
         } catch {
           /* ignore */
         }

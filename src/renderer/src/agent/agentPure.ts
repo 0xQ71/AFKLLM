@@ -14,15 +14,29 @@ export interface ChatMessageLite {
   filePath?: string
 }
 
+export type ApiMessageContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'image_url'; image_url: { url: string } }
+
 export type ApiMessage = {
   role: string
-  content: string | null
+  content: string | null | ApiMessageContentPart[]
   tool_call_id?: string
   tool_calls?: Array<{
     id: string
     type: 'function'
     function: { name: string; arguments: string }
   }>
+}
+
+/** Flatten multimodal content to plain text (ignores image parts). */
+export function apiContentText(content: ApiMessage['content']): string {
+  if (content == null) return ''
+  if (typeof content === 'string') return content
+  return content
+    .filter((p): p is { type: 'text'; text: string } => p?.type === 'text')
+    .map((p) => p.text)
+    .join('\n')
 }
 
 export const AGENT_CHECKLIST_MSG_ID = 'agent-checklist'
@@ -108,6 +122,13 @@ export function stripChecklistBlock(text: string): string {
   return text
     .replace(/\n\n\[Agent checklist\][\s\S]*?\[\/Agent checklist\]/g, '')
     .replace(/\n\n\[Agent checklist\][\s\S]*$/g, '')
+}
+
+/** Remove prior compaction digests so each compact replaces, never stacks. */
+export function stripCompactBlocks(text: string): string {
+  return text
+    .replace(/\n\n\[Context compacted due to context-window pressure\][\s\S]*$/g, '')
+    .replace(/\n\n\[Context compacted due to context-window pressure\][\s\S]*?(?=\n\n\[Context compacted|\n\n\[Agent checklist\]|$)/g, '')
 }
 
 export function buildChecklistFromHistory(history: ChatMessageLite[]): AgentChecklist {
@@ -253,7 +274,10 @@ export function normalizeApiMessages(msgs: ApiMessage[]): ApiMessage[] {
   if (systems.length) {
     out.push({
       role: 'system',
-      content: systems.map((s) => s.content ?? '').filter(Boolean).join('\n\n')
+      content: systems
+        .map((s) => apiContentText(s.content))
+        .filter(Boolean)
+        .join('\n\n')
     })
   }
 
@@ -271,7 +295,7 @@ export function normalizeApiMessages(msgs: ApiMessage[]): ApiMessage[] {
     bridgeAfterTools()
     const last = out[out.length - 1]
     if (last?.role === 'user') {
-      last.content = `${last.content ?? ''}\n\n${content}`
+      last.content = `${apiContentText(last.content)}\n\n${content}`
     } else {
       out.push({ role: 'user', content })
     }
@@ -282,19 +306,19 @@ export function normalizeApiMessages(msgs: ApiMessage[]): ApiMessage[] {
 
     if (m.role === 'tool') {
       if (last?.role === 'tool') {
-        out.push(m)
+        out.push({ ...m, content: apiContentText(m.content) })
         continue
       }
       if (last?.role === 'assistant' && last.tool_calls?.length) {
-        out.push(m)
+        out.push({ ...m, content: apiContentText(m.content) })
         continue
       }
-      pushUser(`[tool ${m.tool_call_id ?? ''}]\n${m.content ?? ''}`)
+      pushUser(`[tool ${m.tool_call_id ?? ''}]\n${apiContentText(m.content)}`)
       continue
     }
 
     if (m.role === 'user') {
-      pushUser(m.content ?? '')
+      pushUser(apiContentText(m.content))
       continue
     }
 
@@ -306,7 +330,7 @@ export function normalizeApiMessages(msgs: ApiMessage[]): ApiMessage[] {
       if (prev?.role === 'tool') {
         out.push({
           role: 'assistant',
-          content: m.content,
+          content: apiContentText(m.content),
           tool_calls: m.tool_calls
         })
         continue
@@ -316,18 +340,18 @@ export function normalizeApiMessages(msgs: ApiMessage[]): ApiMessage[] {
         !prev.tool_calls?.length &&
         !m.tool_calls?.length
       ) {
-        prev.content = `${prev.content ?? ''}\n\n${m.content ?? ''}`
+        prev.content = `${apiContentText(prev.content)}\n\n${apiContentText(m.content)}`
         continue
       }
       if (prev?.role === 'assistant' && prev.tool_calls?.length) {
         // Close open tool_calls without results
         prev.tool_calls = undefined
-        if (!prev.content?.trim()) prev.content = '(tool call interrupted)'
+        if (!apiContentText(prev.content).trim()) prev.content = '(tool call interrupted)'
         pushUser('Previous tool call was interrupted. Continue.')
       }
       out.push({
         role: 'assistant',
-        content: m.content,
+        content: apiContentText(m.content),
         tool_calls: m.tool_calls
       })
     }
@@ -336,7 +360,7 @@ export function normalizeApiMessages(msgs: ApiMessage[]): ApiMessage[] {
   const end = out[out.length - 1]
   if (end?.role === 'assistant' && end.tool_calls?.length) {
     end.tool_calls = undefined
-    if (!end.content?.trim()) end.content = '(incomplete tool call removed)'
+    if (!apiContentText(end.content).trim()) end.content = '(incomplete tool call removed)'
   }
 
   if (out[0]?.role === 'system' && out[1] && out[1].role !== 'user') {

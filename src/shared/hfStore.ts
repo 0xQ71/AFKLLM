@@ -10,6 +10,45 @@ export interface GpuInfo {
 
 export type HfRecommendFit = 'ideal' | 'comfortable' | 'tight' | 'heavy'
 
+/** Which setting a store download should fill. */
+export type StoreDownloadTarget =
+  | 'chat'
+  | 'vision'
+  | 'mmproj'
+  | 'imageGen'
+  | 'imageGenVae'
+  | 'imageGenClipL'
+  | 'imageGenClipG'
+  | 'imageGenT5'
+  | 'imageGenLlm'
+
+const STORE_TARGETS: StoreDownloadTarget[] = [
+  'chat',
+  'vision',
+  'mmproj',
+  'imageGen',
+  'imageGenVae',
+  'imageGenClipL',
+  'imageGenClipG',
+  'imageGenT5',
+  'imageGenLlm'
+]
+
+export function isStoreDownloadTarget(v: unknown): v is StoreDownloadTarget {
+  return typeof v === 'string' && (STORE_TARGETS as string[]).includes(v)
+}
+
+export function isImageGenStoreTarget(t: StoreDownloadTarget): boolean {
+  return (
+    t === 'imageGen' ||
+    t === 'imageGenVae' ||
+    t === 'imageGenClipL' ||
+    t === 'imageGenClipG' ||
+    t === 'imageGenT5' ||
+    t === 'imageGenLlm'
+  )
+}
+
 export interface HfRecommendedModel {
   repoId: string
   title: string
@@ -17,11 +56,13 @@ export interface HfRecommendedModel {
   /** Russian blurb for UI when language is RU (offline-safe). */
   descriptionRu: string
   preferredFile: string
+  /** Optional projector file when the same repo ships mmproj (vision stores). */
+  preferredMmproj?: string
   /** Approx on-disk GiB */
   sizeGb: number
   /** Soft min VRAM (GiB) for mostly-GPU offload; below → CPU-heavy fallback */
   minVramGb: number
-  tags: Array<'coding' | 'agent' | 'general' | 'popular'>
+  tags: Array<'coding' | 'agent' | 'general' | 'popular' | 'vision' | 'imageGen'>
 }
 
 /** Staff/hardware picks, roughly small → large. */
@@ -137,6 +178,217 @@ export const HF_RECOMMENDED_MODELS: HfRecommendedModel[] = [
     sizeGb: 31.0,
     minVramGb: 24,
     tags: ['general', 'popular']
+  }
+]
+
+/** Vision / VL GGUF staff picks for ~16 GB VRAM (pair with mmproj from the same repo). */
+export const HF_VISION_RECOMMENDED_MODELS: HfRecommendedModel[] = [
+  {
+    repoId: 'Qwen/Qwen3-VL-8B-Instruct-GGUF',
+    title: 'Qwen3-VL 8B',
+    description:
+      'Top open VL for UI/screenshots — Q4_K_M (~5.0 GB) + mmproj. Best default on 16 GB.',
+    descriptionRu:
+      'Топ open VL для UI/скринов — Q4_K_M (~5.0 ГБ) + mmproj. Лучший дефолт на 16 ГБ.',
+    preferredFile: 'Qwen3VL-8B-Instruct-Q4_K_M.gguf',
+    preferredMmproj: 'mmproj-Qwen3VL-8B-Instruct-F16.gguf',
+    sizeGb: 5.0,
+    minVramGb: 8,
+    tags: ['vision', 'popular']
+  },
+  {
+    repoId: 'ggml-org/MiniCPM-V-4.6-GGUF',
+    title: 'MiniCPM-V 4.6',
+    description:
+      'Strong OCR / document VL — Q4_K_M + mmproj. Great for text-heavy screenshots.',
+    descriptionRu:
+      'Сильный OCR / документы — Q4_K_M + mmproj. Отлично для скринов с текстом.',
+    preferredFile: 'MiniCPM-V-4.6-Q4_K_M.gguf',
+    preferredMmproj: 'mmproj-MiniCPM-V-4.6-Q8_0.gguf',
+    sizeGb: 5.2,
+    minVramGb: 8,
+    tags: ['vision', 'popular']
+  },
+  {
+    repoId: 'ggml-org/gemma-3-12b-it-GGUF',
+    title: 'Gemma 3 12B',
+    description:
+      'Long-context multimodal (128k) — Q4_K_M (~7+ GB) + mmproj. Heavier, strong OCR.',
+    descriptionRu:
+      'Мультимодал с длинным контекстом (128k) — Q4_K_M (~7+ ГБ) + mmproj. Тяжелее, сильный OCR.',
+    preferredFile: 'gemma-3-12b-it-Q4_K_M.gguf',
+    preferredMmproj: 'mmproj-model-f16.gguf',
+    sizeGb: 7.3,
+    minVramGb: 12,
+    tags: ['vision']
+  }
+]
+
+/**
+ * Diffusion staff picks for sd.cpp on ~16 GB VRAM (multi-file stacks).
+ * Pair with VAE / CLIP / T5 / LLM sidecars from the Image Gen sidecar Store buttons.
+ */
+export const HF_IMAGE_GEN_RECOMMENDED_MODELS: HfRecommendedModel[] = [
+  {
+    repoId: 'leejet/FLUX.2-klein-4B-GGUF',
+    title: 'FLUX.2 Klein 4B',
+    description:
+      'Best 16 GB FLUX.2 — Q4_0 + VAE (ae) + Qwen3-4B LLM. Fast (~4 steps). Needs sidecars.',
+    descriptionRu:
+      'Лучший FLUX.2 на 16 ГБ — Q4_0 + VAE (ae) + Qwen3-4B LLM. Быстро (~4 шага). Нужны sidecar’ы.',
+    preferredFile: 'flux-2-klein-4b-Q4_0.gguf',
+    sizeGb: 2.5,
+    minVramGb: 8,
+    tags: ['imageGen', 'popular']
+  },
+  {
+    repoId: 'city96/FLUX.1-dev-gguf',
+    title: 'FLUX.1 Dev',
+    description:
+      'Flagship FLUX.1 — Q4_K_S + VAE + CLIP-L + T5. Needs sidecars; cfg≈1.',
+    descriptionRu:
+      'Флагман FLUX.1 — Q4_K_S + VAE + CLIP-L + T5. Нужны sidecar’ы; cfg≈1.',
+    preferredFile: 'flux1-dev-Q4_K_S.gguf',
+    sizeGb: 6.5,
+    minVramGb: 12,
+    tags: ['imageGen', 'popular']
+  },
+  {
+    repoId: 'Comfy-Org/stable-diffusion-3.5-fp8',
+    title: 'SD 3.5 Medium (all-in-one)',
+    description:
+      'Single safetensors with clips+T5 included — works with −m alone. Great LoRA base.',
+    descriptionRu:
+      'Один safetensors с clips+T5 — хватает −m. Отличная база под LoRA.',
+    preferredFile: 'sd3.5_medium_incl_clips_t5xxlfp8scaled.safetensors',
+    sizeGb: 11.0,
+    minVramGb: 12,
+    tags: ['imageGen', 'popular']
+  }
+]
+
+/** VAE sidecars (FLUX.1 / FLUX.2 ae.safetensors). Prefer ungated mirrors — BFL repos need HF login. */
+export const HF_IMAGE_GEN_VAE_MODELS: HfRecommendedModel[] = [
+  {
+    repoId: 'camenduru/FLUX.1-dev',
+    title: 'FLUX.1 VAE (ae) — ungated',
+    description: 'ae.safetensors mirror (no BFL license gate). Use with FLUX.1 Dev GGUF.',
+    descriptionRu:
+      'Зеркало ae.safetensors без gate BFL. Для FLUX.1 Dev GGUF.',
+    preferredFile: 'ae.safetensors',
+    sizeGb: 0.3,
+    minVramGb: 4,
+    tags: ['imageGen', 'popular']
+  },
+  {
+    repoId: 'Kijai/flux-fp8',
+    title: 'FLUX VAE bf16 (Kijai)',
+    description: 'Alternate ungated FLUX VAE — flux-vae-bf16.safetensors.',
+    descriptionRu: 'Альтернативный ungated FLUX VAE — flux-vae-bf16.safetensors.',
+    preferredFile: 'flux-vae-bf16.safetensors',
+    sizeGb: 0.16,
+    minVramGb: 4,
+    tags: ['imageGen', 'popular']
+  },
+  {
+    repoId: 'black-forest-labs/FLUX.1-dev',
+    title: 'FLUX.1 VAE (official, gated)',
+    description:
+      'Official ae.safetensors — needs Hugging Face login + accept license on the Hub.',
+    descriptionRu:
+      'Официальный ae.safetensors — нужен логин HF и принятие лицензии на Hub.',
+    preferredFile: 'ae.safetensors',
+    sizeGb: 0.3,
+    minVramGb: 4,
+    tags: ['imageGen']
+  }
+]
+
+/** CLIP-L for FLUX.1 / SD3. */
+export const HF_IMAGE_GEN_CLIP_L_MODELS: HfRecommendedModel[] = [
+  {
+    repoId: 'comfyanonymous/flux_text_encoders',
+    title: 'FLUX CLIP-L',
+    description: 'CLIP-L for FLUX.1 (comfyanonymous pack).',
+    descriptionRu: 'CLIP-L для FLUX.1 (пакет comfyanonymous).',
+    preferredFile: 'clip_l.safetensors',
+    sizeGb: 0.2,
+    minVramGb: 4,
+    tags: ['imageGen', 'popular']
+  },
+  {
+    repoId: 'Comfy-Org/stable-diffusion-3.5-fp8',
+    title: 'SD3.5 CLIP-L',
+    description: 'CLIP-L for SD 3.5 when using split UNet + encoders.',
+    descriptionRu: 'CLIP-L для SD 3.5 при раздельном UNet + encoders.',
+    preferredFile: 'text_encoders/clip_l.safetensors',
+    sizeGb: 0.2,
+    minVramGb: 4,
+    tags: ['imageGen']
+  }
+]
+
+/** CLIP-G for SD3. */
+export const HF_IMAGE_GEN_CLIP_G_MODELS: HfRecommendedModel[] = [
+  {
+    repoId: 'Comfy-Org/stable-diffusion-3.5-fp8',
+    title: 'SD3.5 CLIP-G',
+    description: 'CLIP-G for SD 3.5 split stack.',
+    descriptionRu: 'CLIP-G для раздельного стека SD 3.5.',
+    preferredFile: 'text_encoders/clip_g.safetensors',
+    sizeGb: 1.3,
+    minVramGb: 4,
+    tags: ['imageGen', 'popular']
+  }
+]
+
+/** T5-XXL for FLUX.1 / SD3. */
+export const HF_IMAGE_GEN_T5_MODELS: HfRecommendedModel[] = [
+  {
+    repoId: 'comfyanonymous/flux_text_encoders',
+    title: 'FLUX T5-XXL FP8',
+    description: 'T5-XXL FP8 for FLUX.1 — smaller VRAM than FP16.',
+    descriptionRu: 'T5-XXL FP8 для FLUX.1 — меньше VRAM, чем FP16.',
+    preferredFile: 't5xxl_fp8_e4m3fn.safetensors',
+    sizeGb: 4.9,
+    minVramGb: 8,
+    tags: ['imageGen', 'popular']
+  },
+  {
+    repoId: 'Comfy-Org/stable-diffusion-3.5-fp8',
+    title: 'SD3.5 T5-XXL FP8',
+    description: 'T5-XXL for SD 3.5 split stack.',
+    descriptionRu: 'T5-XXL для раздельного стека SD 3.5.',
+    preferredFile: 'text_encoders/t5xxl_fp8_e4m3fn_scaled.safetensors',
+    sizeGb: 4.9,
+    minVramGb: 8,
+    tags: ['imageGen']
+  }
+]
+
+/** Text LLM for FLUX.2 (--llm). */
+export const HF_IMAGE_GEN_LLM_MODELS: HfRecommendedModel[] = [
+  {
+    repoId: 'unsloth/Qwen3-4B-GGUF',
+    title: 'Qwen3 4B (FLUX.2 Klein)',
+    description: 'Text backbone for FLUX.2 Klein 4B — Q4_K_M (~2.5 GB).',
+    descriptionRu: 'Текстовый бэкбон для FLUX.2 Klein 4B — Q4_K_M (~2.5 ГБ).',
+    preferredFile: 'Qwen3-4B-Q4_K_M.gguf',
+    sizeGb: 2.5,
+    minVramGb: 6,
+    tags: ['imageGen', 'popular']
+  },
+  {
+    repoId: 'unsloth/Mistral-Small-3.2-24B-Instruct-2506-GGUF',
+    title: 'Mistral Small 24B (FLUX.2 Dev)',
+    description:
+      'Required for full FLUX.2 Dev — heavy; use with --offload-to-cpu on 16 GB.',
+    descriptionRu:
+      'Нужен для полного FLUX.2 Dev — тяжёлый; на 16 ГБ с --offload-to-cpu.',
+    preferredFile: 'Mistral-Small-3.2-24B-Instruct-2506-Q4_K_M.gguf',
+    sizeGb: 13.0,
+    minVramGb: 16,
+    tags: ['imageGen']
   }
 ]
 

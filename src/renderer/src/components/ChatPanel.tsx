@@ -3,7 +3,8 @@ import type {
   ChatMessage,
   ChatMessageStats,
   EditorSelectionContext,
-  FileAttachment
+  FileAttachment,
+  ImageAttachment
 } from '../agent/runAgentTurn'
 import {
   AGENT_CHECKLIST_MSG_ID,
@@ -109,6 +110,8 @@ export function ChatPanel({
   ])
   const [input, setInput] = useState('')
   const [attachments, setAttachments] = useState<FileAttachment[]>([])
+  const [images, setImages] = useState<ImageAttachment[]>([])
+  const [slotBanner, setSlotBanner] = useState<string>('')
   const [busy, setBusy] = useState(false)
   /** Bumps on Stop so an in-flight turn's finally cannot re-lock the composer. */
   const turnGenRef = useRef(0)
@@ -117,6 +120,34 @@ export function ChatPanel({
   const [activeUserMsgId, setActiveUserMsgId] = useState<string | null>(null)
   const [reverbEdit, setReverbEdit] = useState<{ messageId: string; text: string } | null>(
     null
+  )
+  const [imagePreview, setImagePreview] = useState<{ url: string; name?: string } | null>(
+    null
+  )
+  const [copiedMsgId, setCopiedMsgId] = useState<string | null>(null)
+
+  const openChatImage = useCallback(async (path: string, name?: string) => {
+    try {
+      const url = await window.api.chatImages.readDataUrl(path)
+      setImagePreview({ url, name })
+    } catch (err) {
+      console.error('Failed to open image', err)
+    }
+  }, [])
+
+  const copyUserMessage = useCallback(
+    async (id: string, text: string) => {
+      try {
+        await navigator.clipboard.writeText(text)
+        setCopiedMsgId(id)
+        window.setTimeout(() => {
+          setCopiedMsgId((cur) => (cur === id ? null : cur))
+        }, 1600)
+      } catch (err) {
+        console.error('clipboard write failed', err)
+      }
+    },
+    []
   )
   const followQueueRef = useRef(followQueue)
   followQueueRef.current = followQueue
@@ -193,6 +224,27 @@ export function ChatPanel({
     setReverbEdit(null)
     void window.api.chats.get().then(applySnapshot).catch(console.error)
   }, [applySnapshot, workspaceKey])
+
+  useEffect(() => {
+    void window.api.slots.status().then((s) => {
+      if (s.detail && (s.phase === 'switching' || s.slot === 'imageGen')) {
+        setSlotBanner(s.detail)
+      } else if (s.phase === 'error' && (s.error || s.detail)) {
+        setSlotBanner(s.error || s.detail)
+      } else {
+        setSlotBanner('')
+      }
+    })
+    return window.api.slots.onStatus((s) => {
+      if (s.detail && (s.phase === 'switching' || s.slot === 'imageGen')) {
+        setSlotBanner(s.detail)
+      } else if (s.phase === 'error' && (s.error || s.detail)) {
+        setSlotBanner(s.error || s.detail)
+      } else if (s.phase === 'ready' && s.slot !== 'imageGen') {
+        setSlotBanner('')
+      }
+    })
+  }, [])
 
   useEffect(() => {
     return window.api.chats.onChanged((snap) => {
@@ -475,14 +527,15 @@ export function ChatPanel({
     opts?: { fromQueue?: boolean; reverb?: { messageId: string } }
   ): Promise<void> => {
     const text = (textOverride ?? input).trim()
-    if (!text || !llmReady) return
+    if ((!text && images.length === 0) || !llmReady) return
+    const sendText = text || '(see attached image)'
     if (needsFolderToChat) {
       setInput('')
-      onRequestFolderForSend?.(text)
+      onRequestFolderForSend?.(sendText)
       return
     }
     if (busyRef.current && !opts?.fromQueue && !opts?.reverb) {
-      setFollowQueue((q) => [...q, { id: crypto.randomUUID(), text }])
+      setFollowQueue((q) => [...q, { id: crypto.randomUUID(), text: sendText }])
       setInput('')
       return
     }
@@ -550,10 +603,11 @@ export function ChatPanel({
       await runAgentTurn({
         queue,
         history,
-        userText: text,
+        userText: sendText,
         openFile,
         selection,
         attachments,
+        images,
         onUpdate: (msgs) => {
           messagesRef.current = msgs
           setMessages(msgs)
@@ -569,6 +623,7 @@ export function ChatPanel({
       })
       if (turnGenRef.current === turnId) {
         setAttachments([])
+        setImages([])
         if (usePlan) setPlanMode(false)
       }
     } finally {
@@ -818,6 +873,7 @@ export function ChatPanel({
   }
 
   return (
+    <>
     <aside
       className={
         fill
@@ -948,6 +1004,7 @@ export function ChatPanel({
                     summary={item.summary}
                     messages={kids}
                     onOpenPath={onOpenPath}
+                    onOpenImage={(path, name) => void openChatImage(path, name)}
                   />
                 </div>
               )
@@ -964,6 +1021,7 @@ export function ChatPanel({
               <ToolActivityRow
                 message={m}
                 onOpenPath={onOpenPath}
+                onOpenImage={(path, name) => void openChatImage(path, name)}
               />
             ) : null}
             {!m.toolName && m.id === AGENT_PLAN_MSG_ID && m.content?.trim() ? (
@@ -1026,25 +1084,50 @@ export function ChatPanel({
                       </div>
                     </div>
                   ) : (
-                    <button
-                      type="button"
-                      disabled={!(busy && m.id === activeUserMsgId)}
-                      title={
-                        busy && m.id === activeUserMsgId ? t('chat.reverb.edit') : undefined
-                      }
-                      onClick={() => {
-                        if (!(busy && m.id === activeUserMsgId)) return
-                        setReverbEdit({ messageId: m.id, text: m.content })
-                      }}
-                      className={
-                        'max-w-[85%] rounded-2xl border border-ink-line/70 bg-ink-900/90 px-3.5 py-2 text-left text-[13px] leading-relaxed text-ink-bright ' +
-                        (busy && m.id === activeUserMsgId
-                          ? 'cursor-pointer hover:border-signal/40'
-                          : 'cursor-default')
-                      }
-                    >
-                      <div className="whitespace-pre-wrap break-words">{m.content}</div>
-                    </button>
+                    <div className="group/user flex max-w-[85%] flex-col items-end gap-1">
+                      <button
+                        type="button"
+                        disabled={!(busy && m.id === activeUserMsgId)}
+                        title={
+                          busy && m.id === activeUserMsgId ? t('chat.reverb.edit') : undefined
+                        }
+                        onClick={() => {
+                          if (!(busy && m.id === activeUserMsgId)) return
+                          setReverbEdit({ messageId: m.id, text: m.content })
+                        }}
+                        className={
+                          'w-full rounded-2xl border border-ink-line/70 bg-ink-900/90 px-3.5 py-2 text-left text-[13px] leading-relaxed text-ink-bright ' +
+                          (busy && m.id === activeUserMsgId
+                            ? 'cursor-pointer hover:border-signal/40'
+                            : 'cursor-default')
+                        }
+                      >
+                        {m.images && m.images.length > 0 ? (
+                          <div className="mb-2 flex flex-wrap gap-1.5">
+                            {m.images.map((img) => (
+                              <ChatImageThumb
+                                key={img.id}
+                                path={img.path}
+                                name={img.name}
+                                onOpen={() => void openChatImage(img.path, img.name)}
+                              />
+                            ))}
+                          </div>
+                        ) : null}
+                        <div className="whitespace-pre-wrap break-words">{m.content}</div>
+                      </button>
+                      <button
+                        type="button"
+                        title={t('chat.copyMessage')}
+                        onClick={() => void copyUserMessage(m.id, m.content)}
+                        className={
+                          'rounded px-1.5 py-0.5 font-mono text-[10px] text-ink-mute opacity-0 transition ' +
+                          'hover:bg-ink-800 hover:text-ink-soft group-hover/user:opacity-100 focus:opacity-100'
+                        }
+                      >
+                        {copiedMsgId === m.id ? t('chat.copied') : t('chat.copyMessage')}
+                      </button>
+                    </div>
                   )}
                 </div>
               ) : (
@@ -1203,9 +1286,41 @@ export function ChatPanel({
           t={t}
         />
         <form onSubmit={onSubmit}>
+          {slotBanner ? (
+            <div className="mb-1.5 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-1.5 text-[11px] text-amber-200">
+              {slotBanner}
+            </div>
+          ) : null}
           <div className="rounded-2xl border border-ink-line/90 bg-ink-900/90 shadow-[0_0_0_1px_rgba(255,255,255,0.02)] focus-within:border-ink-mute/50">
-            {attachments.length > 0 && (
+            {(attachments.length > 0 || images.length > 0) && (
               <div className="flex flex-wrap gap-1.5 border-b border-ink-line/40 px-3 py-2">
+                {images.map((img) => (
+                  <span
+                    key={img.id}
+                    className="inline-flex max-w-full items-center gap-1.5 rounded-md bg-ink-800/90 px-1.5 py-0.5 text-[11px] text-ink-bright"
+                  >
+                    {img.previewUrl ? (
+                      <img
+                        src={img.previewUrl}
+                        alt=""
+                        className="h-8 w-8 rounded object-cover"
+                      />
+                    ) : (
+                      <span className="opacity-70">🖼</span>
+                    )}
+                    <span className="truncate max-w-[7rem]">
+                      {img.name || img.path.split(/[/\\]/).pop()}
+                    </span>
+                    <button
+                      type="button"
+                      title={t('chat.image.remove')}
+                      onClick={() => setImages((prev) => prev.filter((x) => x.id !== img.id))}
+                      className="text-ink-mute hover:text-rose-300"
+                    >
+                      ×
+                    </button>
+                  </span>
+                ))}
                 {attachments.map((a) => (
                   <span
                     key={a.path}
@@ -1230,6 +1345,40 @@ export function ChatPanel({
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={onKeyDown}
+              onPaste={(e) => {
+                const items = e.clipboardData?.items
+                if (!items) return
+                for (const item of Array.from(items)) {
+                  if (!item.type.startsWith('image/')) continue
+                  e.preventDefault()
+                  const file = item.getAsFile()
+                  if (!file) continue
+                  void (async () => {
+                    const buf = await file.arrayBuffer()
+                    const bytes = new Uint8Array(buf)
+                    let binary = ''
+                    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]!)
+                    const b64 = btoa(binary)
+                    try {
+                      const meta = await window.api.chatImages.import({
+                        sessionId: sessionId ?? 'draft',
+                        dataBase64: b64,
+                        mime: file.type || 'image/png',
+                        name: file.name || 'paste.png'
+                      })
+                      const previewUrl = await window.api.chatImages.readDataUrl(meta.path)
+                      setImages((prev) => {
+                        if (prev.length >= 4) return prev
+                        if (prev.some((x) => x.id === meta.id)) return prev
+                        return [...prev, { ...meta, previewUrl }]
+                      })
+                    } catch (err) {
+                      console.error(err)
+                    }
+                  })()
+                  break
+                }
+              }}
               disabled={!llmReady}
               rows={2}
               placeholder={
@@ -1273,6 +1422,55 @@ export function ChatPanel({
                   </svg>
                 </button>
               </div>
+              <button
+                type="button"
+                title={t('chat.image.attach')}
+                disabled={busy || !llmReady || images.length >= 4}
+                onClick={() => {
+                  void (async () => {
+                    const paths = await window.api.chatImages.pick()
+                    if (!paths?.length) return
+                    for (const sourcePath of paths) {
+                      if (images.length >= 4) break
+                      try {
+                        const meta = await window.api.chatImages.import({
+                          sessionId: sessionId ?? 'draft',
+                          sourcePath
+                        })
+                        const previewUrl = await window.api.chatImages.readDataUrl(meta.path)
+                        setImages((prev) => {
+                          if (prev.length >= 4) return prev
+                          if (prev.some((x) => x.id === meta.id)) return prev
+                          return [...prev, { ...meta, previewUrl }]
+                        })
+                      } catch (err) {
+                        console.error(err)
+                      }
+                    }
+                  })()
+                }}
+                className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-ink-mute hover:bg-ink-800 hover:text-ink-bright disabled:opacity-40"
+              >
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden>
+                  <rect
+                    x="3"
+                    y="5"
+                    width="18"
+                    height="14"
+                    rx="2"
+                    stroke="currentColor"
+                    strokeWidth="1.8"
+                  />
+                  <circle cx="8.5" cy="10" r="1.5" fill="currentColor" />
+                  <path
+                    d="M21 16l-5.5-5.5L9 17"
+                    stroke="currentColor"
+                    strokeWidth="1.8"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                </svg>
+              </button>
               <button
                 type="button"
                 title={
@@ -1388,6 +1586,33 @@ export function ChatPanel({
         </div>
       </div>
     </aside>
+    {imagePreview ? (
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-label={imagePreview.name || t('chat.image.open')}
+        className="fixed inset-0 z-[80] flex items-center justify-center bg-black/80 p-4"
+        onClick={() => setImagePreview(null)}
+        onKeyDown={(e) => {
+          if (e.key === 'Escape') setImagePreview(null)
+        }}
+      >
+        <button
+          type="button"
+          className="absolute right-4 top-4 rounded-md border border-white/20 bg-black/50 px-2.5 py-1 font-mono text-[11px] text-white hover:bg-black/70"
+          onClick={() => setImagePreview(null)}
+        >
+          {t('chat.image.close')}
+        </button>
+        <img
+          src={imagePreview.url}
+          alt={imagePreview.name || 'preview'}
+          className="max-h-[90vh] max-w-[min(96vw,1200px)] rounded-lg object-contain shadow-2xl"
+          onClick={(e) => e.stopPropagation()}
+        />
+      </div>
+    ) : null}
+    </>
   )
 }
 
@@ -1405,6 +1630,7 @@ function toPersisted(m: ChatMessage): PersistedChatMessage {
     content: m.content ?? '',
     ...(m.toolName ? { toolName: m.toolName } : {}),
     ...(m.filePath ? { filePath: m.filePath } : {}),
+    ...(m.images?.length ? { images: m.images } : {}),
     ...(m.stats ? { stats: m.stats } : {}),
     ...(m.activity ? { activity: m.activity } : {})
   }
@@ -1418,9 +1644,60 @@ function fromPersisted(m: PersistedChatMessage): ChatMessage {
     content: m.content,
     ...(m.toolName ? { toolName: m.toolName } : {}),
     ...(m.filePath ? { filePath: m.filePath } : {}),
+    ...(m.images?.length ? { images: m.images } : {}),
     ...(m.stats ? { stats: m.stats } : {}),
     ...(activity ? { activity } : {})
   }
+}
+
+function ChatImageThumb({
+  path,
+  name,
+  onOpen
+}: {
+  path: string
+  name?: string
+  onOpen?: () => void
+}): React.JSX.Element {
+  const { t } = useI18n()
+  const [url, setUrl] = useState<string>('')
+  useEffect(() => {
+    let cancelled = false
+    void window.api.chatImages.readDataUrl(path).then(
+      (u) => {
+        if (!cancelled) setUrl(u)
+      },
+      () => undefined
+    )
+    return () => {
+      cancelled = true
+    }
+  }, [path])
+  if (!url) {
+    return (
+      <span className="inline-flex h-14 w-14 items-center justify-center rounded bg-ink-800 text-[10px] text-ink-mute">
+        {name?.slice(0, 6) || 'img'}
+      </span>
+    )
+  }
+  return (
+    <button
+      type="button"
+      title={t('chat.image.open')}
+      onClick={(e) => {
+        e.stopPropagation()
+        e.preventDefault()
+        onOpen?.()
+      }}
+      className="block overflow-hidden rounded border border-ink-line/50 transition hover:border-signal/50 focus:outline-none focus:ring-1 focus:ring-signal/40"
+    >
+      <img
+        src={url}
+        alt={name || 'attachment'}
+        className="h-14 w-14 object-cover"
+      />
+    </button>
+  )
 }
 
 function formatRelativeTime(ts: number): string {
@@ -1537,10 +1814,12 @@ function resolveActivity(m: ChatMessage): ComposerActivity {
 function ToolActivityRow({
   message: m,
   onOpenPath,
+  onOpenImage,
   activity: activityProp
 }: {
   message: ChatMessage
   onOpenPath?: (path: string) => void
+  onOpenImage?: (path: string, name?: string) => void
   activity?: ComposerActivity
 }): React.JSX.Element {
   const { t } = useI18n()
@@ -1574,39 +1853,58 @@ function ToolActivityRow({
   }
 
   return (
-    <div className="flex flex-wrap items-baseline gap-x-1.5 gap-y-0 text-[12.5px] leading-snug text-ink-mute">
-      <span className="text-ink-mute/90">{parts.verb}</span>
-      {pathForOpen && (activity.kind === 'read' || activity.kind === 'edit' || activity.kind === 'delete' || activity.kind === 'mkdir') ? (
-        <>
-          <button
-            type="button"
-            title={`Open ${pathForOpen}`}
-            onClick={() => onOpenPath?.(pathForOpen)}
-            className={
-              'truncate text-ink-soft hover:text-signal ' +
-              (onOpenPath ? 'cursor-pointer' : 'cursor-default')
-            }
-          >
-            {parts.pathLabel || fileBasename(pathForOpen)}
-          </button>
-          {parts.lineRange ? (
-            <span className="font-mono text-[11px] text-ink-mute">{parts.lineRange}</span>
-          ) : null}
-        </>
-      ) : parts.target ? (
-        <span className="truncate text-ink-soft">{parts.target}</span>
+    <div className="space-y-1.5">
+      <div className="flex flex-wrap items-baseline gap-x-1.5 gap-y-0 text-[12.5px] leading-snug text-ink-mute">
+        <span className="text-ink-mute/90">{parts.verb}</span>
+        {pathForOpen &&
+        (activity.kind === 'read' ||
+          activity.kind === 'edit' ||
+          activity.kind === 'delete' ||
+          activity.kind === 'mkdir' ||
+          m.toolName === 'generate_image') ? (
+          <>
+            <button
+              type="button"
+              title={`Open ${pathForOpen}`}
+              onClick={() => onOpenPath?.(pathForOpen)}
+              className={
+                'truncate text-ink-soft hover:text-signal ' +
+                (onOpenPath ? 'cursor-pointer' : 'cursor-default')
+              }
+            >
+              {parts.pathLabel || fileBasename(pathForOpen)}
+            </button>
+            {parts.lineRange ? (
+              <span className="font-mono text-[11px] text-ink-mute">{parts.lineRange}</span>
+            ) : null}
+          </>
+        ) : parts.target ? (
+          <span className="truncate text-ink-soft">{parts.target}</span>
+        ) : null}
+        {parts.suffix ? (
+          <span className="text-ink-mute/70">({parts.suffix})</span>
+        ) : null}
+        {showStat && (
+          <span className="font-mono text-[11px]">
+            {add > 0 && <span className="text-emerald-400/90">+{add}</span>}
+            {add > 0 && rem > 0 && ' '}
+            {rem > 0 && <span className="text-rose-400/90">-{rem}</span>}
+          </span>
+        )}
+        {m.streaming && <span className="stream-caret" aria-hidden />}
+      </div>
+      {m.toolName === 'generate_image' && m.images && m.images.length > 0 ? (
+        <div className="flex flex-wrap gap-2 pl-0.5">
+          {m.images.map((img) => (
+            <ChatImageThumb
+              key={img.id}
+              path={img.path}
+              name={img.name}
+              onOpen={() => onOpenImage?.(img.path, img.name)}
+            />
+          ))}
+        </div>
       ) : null}
-      {parts.suffix ? (
-        <span className="text-ink-mute/70">({parts.suffix})</span>
-      ) : null}
-      {showStat && (
-        <span className="font-mono text-[11px]">
-          {add > 0 && <span className="text-emerald-400/90">+{add}</span>}
-          {add > 0 && rem > 0 && ' '}
-          {rem > 0 && <span className="text-rose-400/90">-{rem}</span>}
-        </span>
-      )}
-      {m.streaming && <span className="stream-caret" aria-hidden />}
     </div>
   )
 }
@@ -1614,11 +1912,13 @@ function ToolActivityRow({
 function ActivityGroupRow({
   summary,
   messages: rows,
-  onOpenPath
+  onOpenPath,
+  onOpenImage
 }: {
   summary: string
   messages: ChatMessage[]
   onOpenPath?: (path: string) => void
+  onOpenImage?: (path: string, name?: string) => void
 }): React.JSX.Element {
   return (
     <details className="group py-0.5">
@@ -1643,7 +1943,12 @@ function ActivityGroupRow({
       </summary>
       <div className="mt-1 space-y-0.5 border-l border-ink-line/40 pl-3">
         {rows.map((m) => (
-          <ToolActivityRow key={m.id} message={m} onOpenPath={onOpenPath} />
+          <ToolActivityRow
+            key={m.id}
+            message={m}
+            onOpenPath={onOpenPath}
+            onOpenImage={onOpenImage}
+          />
         ))}
       </div>
     </details>

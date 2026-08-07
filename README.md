@@ -84,6 +84,9 @@ AFKLLM is an agent-first desktop IDE: chat and tools on the left, editor / brows
 - First-run model wizard — `.gguf` files are **not** bundled
 - Per-model Performance / Memory / Generation profiles; Load / Unload from Settings or status bar
 - Optional OpenAI-compatible local API endpoint when enabled
+- **Vision attach** (separate VL GGUF + mmproj): cold-swaps chat↔vision in VRAM, describes the image, then restores the coding model
+- **`generate_image` tool** via [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) (`sd-cli`): unloads the LLM, generates a PNG into the project, reloads chat
+- Configure paths under **Settings → Model → Multimodal** (vision model, mmproj, SD weights, optional sd-cli path)
 
 4. **Git, updates & app chrome**
 
@@ -154,7 +157,8 @@ We're actively working on the following (community feedback welcome via [Issues]
 
 - Signed Windows releases as the default distribution path
 - Docs / i18n polish; more staff-pick GGUF recommendations
-- Evaluate Linux / macOS later (Windows remains the primary target)
+- **Android client** (Kotlin): agent workspace (chat, explorer, code, terminal, browser, git, console) + full settings + E2B/E4B GGUF — see [android/README.md](android/README.md)
+- Evaluate Linux / macOS later (Windows remains the primary desktop target)
 
 Want to influence the roadmap? Open a [Feature request](https://github.com/0xQ71/AFKLLM/issues/new/choose) or discussion on an existing issue.
 

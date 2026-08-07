@@ -189,7 +189,54 @@ export interface AppSettings {
 
   /** Last version that showed the changelog modal; empty skips until an upgrade */
   lastSeenVersion: string
+
+  /** Separate VL GGUF for image attach (cold-swapped with chat) */
+  visionModelPath: string
+  /** Projector for visionModelPath; empty = auto sibling *mmproj*.gguf */
+  visionMmprojPath: string
+  /** Diffusion weights for generate_image (safetensors / gguf) */
+  imageGenModelPath: string
+  /** FLUX / FLUX.2 VAE (ae.safetensors) */
+  imageGenVaePath: string
+  /** FLUX.1 / SD3 CLIP-L */
+  imageGenClipLPath: string
+  /** SD3 CLIP-G */
+  imageGenClipGPath: string
+  /** FLUX.1 / SD3 T5-XXL */
+  imageGenT5Path: string
+  /** FLUX.2 text LLM (Qwen3-4B / Mistral-Small GGUF) */
+  imageGenLlmPath: string
+  /** Empty = auto-downloaded sd-cli under userData/sd-runtime */
+  sdCppPath: string
+  imageGenSteps: number
+  imageGenWidth: number
+  imageGenHeight: number
+  imageGenCfg: number
+  /**
+   * Where sd-cli keeps weights while generating.
+   * - vram: diffusion resident on GPU; TE on CPU; VAE on CUDA (default, fastest)
+   * - ram: --offload-to-cpu staged upload (safer for hires / tight VRAM)
+   * - disk: --params-backend disk (lowest RAM; slower)
+   */
+  imageGenWeightStorage: ImageGenWeightStorage
+  /**
+   * Enable sd-cli highres fix (second denoise pass after upscale).
+   * Hires steps always equal imageGenSteps.
+   */
+  imageGenHires: boolean
+  /** Upscale factor for hires (e.g. 1.5). */
+  imageGenHiresScale: number
+  /** Denoising strength for hires pass (0–1). */
+  imageGenHiresDenoising: number
+  /**
+   * @deprecated Prefer imageGenWeightStorage. Kept for settings.json migration.
+   * true → ram, false ignored when weightStorage is set.
+   */
+  imageGenOffloadCpu?: boolean
 }
+
+/** sd-cli --params-backend strategy for generate_image */
+export type ImageGenWeightStorage = 'disk' | 'ram' | 'vram'
 
 export const CACHE_QUANT_OPTIONS: CacheQuant[] = [
   'f16',
@@ -269,7 +316,28 @@ export const DEFAULT_SETTINGS: AppSettings = {
 
   mcpServers: [],
 
-  lastSeenVersion: ''
+  lastSeenVersion: '',
+
+  visionModelPath: '',
+  visionMmprojPath: '',
+  imageGenModelPath: '',
+  imageGenVaePath: '',
+  imageGenClipLPath: '',
+  imageGenClipGPath: '',
+  imageGenT5Path: '',
+  imageGenLlmPath: '',
+  sdCppPath: '',
+  imageGenSteps: 20,
+  imageGenWidth: 1024,
+  imageGenHeight: 1024,
+  /** 0 = auto by stack (FLUX≈1, SD3≈4.5, SDXL≈7) */
+  imageGenCfg: 0,
+  /** disk = reload weights from file on demand — avoids RAM crash spikes */
+  imageGenWeightStorage: 'vram',
+  imageGenHires: true,
+  /** 1.25 keeps FLUX Q8 hires on 16 GB without shared-memory thrash */
+  imageGenHiresScale: 1.25,
+  imageGenHiresDenoising: 0.4
 }
 
 export interface DiscoveredModel {

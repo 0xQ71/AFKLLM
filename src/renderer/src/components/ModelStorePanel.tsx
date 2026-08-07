@@ -1,11 +1,22 @@
 import { useEffect, useMemo, useState } from 'react'
-import { HF_RECOMMENDED_MODELS } from '../../../shared/hfStore'
+import {
+  HF_IMAGE_GEN_CLIP_G_MODELS,
+  HF_IMAGE_GEN_CLIP_L_MODELS,
+  HF_IMAGE_GEN_LLM_MODELS,
+  HF_IMAGE_GEN_RECOMMENDED_MODELS,
+  HF_IMAGE_GEN_T5_MODELS,
+  HF_IMAGE_GEN_VAE_MODELS,
+  HF_RECOMMENDED_MODELS,
+  HF_VISION_RECOMMENDED_MODELS,
+  isImageGenStoreTarget
+} from '../../../shared/hfStore'
 import type {
   GpuInfo,
   HfDownloadProgress,
   HfModelDetail,
   HfModelListItem,
-  HfRecommendFit
+  HfRecommendFit,
+  StoreDownloadTarget
 } from '../../../shared/hfStore'
 import { useI18n } from '../i18n/I18nProvider'
 import type { MessageKey } from '../i18n/messages'
@@ -18,6 +29,8 @@ interface ModelStorePanelProps {
   onClose: () => void
   /** Called after a successful download with absolute path */
   onDownloaded: (localPath: string) => void
+  /** Which settings field this download fills */
+  target?: StoreDownloadTarget
 }
 
 function formatBytes(n: number): string {
@@ -51,16 +64,51 @@ function formatCount(n: number): string {
   return String(n)
 }
 
+function allStaffCatalogs() {
+  return [
+    ...HF_RECOMMENDED_MODELS,
+    ...HF_VISION_RECOMMENDED_MODELS,
+    ...HF_IMAGE_GEN_RECOMMENDED_MODELS,
+    ...HF_IMAGE_GEN_VAE_MODELS,
+    ...HF_IMAGE_GEN_CLIP_L_MODELS,
+    ...HF_IMAGE_GEN_CLIP_G_MODELS,
+    ...HF_IMAGE_GEN_T5_MODELS,
+    ...HF_IMAGE_GEN_LLM_MODELS
+  ]
+}
+
 function repoTitle(id: string, preferredFile?: string): string {
+  const catalogs = allStaffCatalogs()
   const rec =
     (preferredFile
-      ? HF_RECOMMENDED_MODELS.find(
-          (r) => r.repoId === id && r.preferredFile === preferredFile
-        )
-      : undefined) ?? HF_RECOMMENDED_MODELS.find((r) => r.repoId === id)
+      ? catalogs.find((r) => r.repoId === id && r.preferredFile === preferredFile)
+      : undefined) ?? catalogs.find((r) => r.repoId === id)
   if (rec) return rec.title
   const name = id.split('/').pop() ?? id
   return name.replace(/-GGUF$/i, '').replace(/_/g, ' ')
+}
+
+function storeSubtitleKey(target: StoreDownloadTarget): MessageKey {
+  switch (target) {
+    case 'vision':
+      return 'store.subtitleVision'
+    case 'mmproj':
+      return 'store.subtitleMmproj'
+    case 'imageGen':
+      return 'store.subtitleImageGen'
+    case 'imageGenVae':
+      return 'store.subtitleImageGenVae'
+    case 'imageGenClipL':
+      return 'store.subtitleImageGenClipL'
+    case 'imageGenClipG':
+      return 'store.subtitleImageGenClipG'
+    case 'imageGenT5':
+      return 'store.subtitleImageGenT5'
+    case 'imageGenLlm':
+      return 'store.subtitleImageGenLlm'
+    default:
+      return 'store.subtitle'
+  }
 }
 
 function fitBadgeClass(fit?: HfRecommendFit): string {
@@ -347,7 +395,8 @@ function FolderIcon(): React.JSX.Element {
 export function ModelStorePanel({
   open,
   onClose,
-  onDownloaded
+  onDownloaded,
+  target = 'chat'
 }: ModelStorePanelProps): React.JSX.Element | null {
   const { t, lang } = useI18n()
   const [query, setQuery] = useState('')
@@ -358,6 +407,8 @@ export function ModelStorePanel({
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [preferredHint, setPreferredHint] = useState<string | null>(null)
   const [detail, setDetail] = useState<HfModelDetail | null>(null)
+  const [detailError, setDetailError] = useState<string | null>(null)
+  const [selectionTick, setSelectionTick] = useState(0)
   const [loadingDetail, setLoadingDetail] = useState(false)
   const [readmeTranslating, setReadmeTranslating] = useState(false)
   const [filePath, setFilePath] = useState('')
@@ -373,6 +424,17 @@ export function ModelStorePanel({
 
   useEffect(() => {
     if (!open) return
+    setQuery('')
+    setDebounced('')
+    setSelectedId(null)
+    setPreferredHint(null)
+    setDetail(null)
+    setDetailError(null)
+    setFilePath('')
+  }, [open, target])
+
+  useEffect(() => {
+    if (!open) return
     const tmr = setTimeout(() => setDebounced(query.trim()), 280)
     return () => clearTimeout(tmr)
   }, [query, open])
@@ -385,7 +447,7 @@ export function ModelStorePanel({
     const load = async (): Promise<void> => {
       try {
         if (!debounced) {
-          const home = await window.api.hf.home()
+          const home = await window.api.hf.home(target)
           if (cancelled) return
           setGpu(home.gpu)
           setList(home.items)
@@ -396,7 +458,8 @@ export function ModelStorePanel({
         } else {
           const items = await window.api.hf.search({
             query: debounced,
-            limit: 30
+            limit: 30,
+            target
           })
           if (cancelled) return
           setList(items)
@@ -417,24 +480,26 @@ export function ModelStorePanel({
     return () => {
       cancelled = true
     }
-    // Re-fetch when language changes so RU blurbs apply
     // eslint-disable-next-line react-hooks/exhaustive-deps -- selectedId intentionally omitted
-  }, [debounced, open, lang])
+  }, [debounced, open, lang, target])
 
   useEffect(() => {
     if (!open || !selectedId) {
       setDetail(null)
+      setDetailError(null)
       setReadmeTranslating(false)
       return
     }
     let cancelled = false
     setLoadingDetail(true)
+    setDetailError(null)
     setReadmeTranslating(false)
     void window.api.hf
-      .model(selectedId, preferredHint ?? undefined)
+      .model(selectedId, preferredHint ?? undefined, target)
       .then((d) => {
         if (cancelled) return
         setDetail(d)
+        setDetailError(null)
         setReadmeTranslating(lang === 'ru' && Boolean(d.readmeMarkdown?.trim()))
         const preferred =
           preferredHint && d.ggufFiles.some((f) => f.path === preferredHint)
@@ -444,9 +509,11 @@ export function ModelStorePanel({
               : d.ggufFiles[0]?.path
         setFilePath(preferred ?? '')
       })
-      .catch(() => {
+      .catch((e) => {
         if (!cancelled) {
           setDetail(null)
+          setFilePath('')
+          setDetailError(e instanceof Error ? e.message : String(e))
           setReadmeTranslating(false)
         }
       })
@@ -456,7 +523,7 @@ export function ModelStorePanel({
     return () => {
       cancelled = true
     }
-  }, [selectedId, preferredHint, open, lang])
+  }, [selectedId, preferredHint, open, lang, target, selectionTick])
 
   useEffect(() => {
     if (!open || lang !== 'ru') return
@@ -574,7 +641,8 @@ export function ModelStorePanel({
 
   const listBlurb = (m: HfModelListItem): string | undefined => {
     if (m.description) return m.description
-    const rec = HF_RECOMMENDED_MODELS.find(
+    const catalogs = allStaffCatalogs()
+    const rec = catalogs.find(
       (r) =>
         r.repoId === m.id &&
         (!m.preferredFile || r.preferredFile === m.preferredFile)
@@ -596,7 +664,9 @@ export function ModelStorePanel({
             ←
           </button>
           <h2 className="text-sm font-semibold text-ink-bright">{t('store.title')}</h2>
-          <span className="text-[11px] text-ink-mute">{t('store.subtitle')}</span>
+          <span className="text-[11px] text-ink-mute">
+            {t(storeSubtitleKey(target))}
+          </span>
           <button
             type="button"
             onClick={() => {
@@ -676,11 +746,13 @@ export function ModelStorePanel({
                 const title = repoTitle(m.id, m.preferredFile)
                 return (
                   <button
-                    key={`${m.id}::${m.preferredFile ?? idx}`}
+                    key={`${target}::${m.id}::${m.preferredFile ?? ''}::${idx}`}
                     type="button"
                     onClick={() => {
                       setSelectedId(m.id)
                       setPreferredHint(m.preferredFile ?? null)
+                      setSelectionTick((n) => n + 1)
+                      setDetailError(null)
                     }}
                     className={
                       'flex w-full gap-2.5 border-b border-ink-line/30 px-3 py-2.5 text-left ' +
@@ -754,6 +826,11 @@ export function ModelStorePanel({
             {loadingDetail && !detail ? (
               <div className="flex flex-1 items-center justify-center text-[12px] text-ink-mute">
                 {t('store.loading')}
+              </div>
+            ) : detailError && !detail ? (
+              <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
+                <p className="text-[12px] text-danger">{detailError}</p>
+                <p className="text-[11px] text-ink-mute">{t('store.pickModelRetry')}</p>
               </div>
             ) : !detail ? (
               <div className="flex flex-1 items-center justify-center text-[12px] text-ink-mute">
@@ -829,7 +906,11 @@ export function ModelStorePanel({
 
                   <div className="space-y-2">
                     <label className="block text-[11px] text-ink-mute">
-                      {t('store.ggufFile')}
+                      {target === 'mmproj'
+                        ? t('store.mmprojFile')
+                        : isImageGenStoreTarget(target)
+                          ? t('store.weightFile')
+                          : t('store.ggufFile')}
                     </label>
                     <select
                       value={filePath}
@@ -838,7 +919,13 @@ export function ModelStorePanel({
                       className="input w-full font-mono text-[11px]"
                     >
                       {detail.ggufFiles.length === 0 ? (
-                        <option value="">{t('store.noGguf')}</option>
+                        <option value="">
+                          {target === 'mmproj'
+                            ? t('store.noMmproj')
+                            : isImageGenStoreTarget(target)
+                              ? t('store.noImageGenWeights')
+                              : t('store.noGguf')}
+                        </option>
                       ) : (
                         detail.ggufFiles.map((f) => (
                           <option key={f.path} value={f.path}>
@@ -851,6 +938,15 @@ export function ModelStorePanel({
                         ))
                       )}
                     </select>
+                    {detail.ggufFiles.length === 0 ? (
+                      <p className="text-[11px] leading-snug text-ink-mute">
+                        {target === 'mmproj'
+                          ? t('store.noMmprojHint')
+                          : isImageGenStoreTarget(target)
+                            ? t('store.noImageGenHint')
+                            : t('store.noGgufHint')}
+                      </p>
+                    ) : null}
                     <div className="flex flex-wrap items-center gap-2">
                       <button
                         type="button"

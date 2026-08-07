@@ -138,6 +138,9 @@ export default function App(): React.JSX.Element {
   const [gitStatus, setGitStatus] = useState<GitStatus | null>(null)
   const [gitRefreshKey, setGitRefreshKey] = useState(0)
   const [gitFocusCommit, setGitFocusCommit] = useState(0)
+  const [imagePreview, setImagePreview] = useState<{ url: string; name?: string } | null>(
+    null
+  )
   const [tabs, setTabs] = useState<EditorTab[]>([])
   const [activePath, setActivePath] = useState<string | null>(null)
   const [status, setStatus] = useState<LlmRuntimeStatus | null>(null)
@@ -819,7 +822,23 @@ export default function App(): React.JSX.Element {
   }, [pickFolderForSend, switchRoot])
 
   const openFile = useCallback(async (relativePath: string) => {
-    const res = await window.api.workspace.readFile(relativePath)
+    const rel = relativePath.replace(/\\/g, '/').replace(/^\/+/, '')
+    if (/\.(png|jpe?g|gif|webp|bmp|ico)$/i.test(rel)) {
+      try {
+        const root = await window.api.workspace.getRoot()
+        if (!root) {
+          console.error('No workspace root to open image')
+          return
+        }
+        const abs = `${root.replace(/[\\/]+$/, '')}/${rel}`
+        const url = await window.api.chatImages.readDataUrl(abs)
+        setImagePreview({ url, name: rel.split('/').pop() || rel })
+      } catch (err) {
+        console.error('Failed to open image from tree', err)
+      }
+      return
+    }
+    const res = await window.api.workspace.readFile(rel)
     if (!res.ok) {
       console.error(res.error)
       return
@@ -827,15 +846,15 @@ export default function App(): React.JSX.Element {
     setIdeOpen(true)
     setWorkspaceTab('code')
     setTabs((prev) => {
-      const existing = prev.find((t) => t.path === relativePath)
+      const existing = prev.find((t) => t.path === rel)
       if (existing) {
         return prev.map((t) =>
-          t.path === relativePath ? { ...t, content: res.content, dirty: false } : t
+          t.path === rel ? { ...t, content: res.content, dirty: false } : t
         )
       }
-      return [...prev, createTab(relativePath, res.content)]
+      return [...prev, createTab(rel, res.content)]
     })
-    setActivePath(relativePath)
+    setActivePath(rel)
   }, [])
 
   const openFileAt = useCallback(
@@ -2002,6 +2021,32 @@ export default function App(): React.JSX.Element {
           </div>
         </div>
       )}
+      {imagePreview ? (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label={imagePreview.name || t('chat.image.open')}
+          className="fixed inset-0 z-[110] flex items-center justify-center bg-black/80 p-4"
+          onClick={() => setImagePreview(null)}
+          onKeyDown={(e) => {
+            if (e.key === 'Escape') setImagePreview(null)
+          }}
+        >
+          <button
+            type="button"
+            className="absolute right-4 top-4 rounded-md border border-white/20 bg-black/50 px-2.5 py-1 font-mono text-[11px] text-white hover:bg-black/70"
+            onClick={() => setImagePreview(null)}
+          >
+            {t('chat.image.close')}
+          </button>
+          <img
+            src={imagePreview.url}
+            alt={imagePreview.name || 'preview'}
+            className="max-h-[90vh] max-w-[min(96vw,1200px)] rounded-lg object-contain shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          />
+        </div>
+      ) : null}
     </div>
   )
 }
