@@ -12,57 +12,53 @@ interface ContextUsageControlProps {
   estimateInput: EstimateContextUsageInput
 }
 
+/** Gauge fill: teal → amber → rose (never theme blue/signal). */
+function gaugeStroke(pct: number): string {
+  if (pct >= 90) return '#f87171'
+  if (pct >= 70) return '#fbbf24'
+  return '#2dd4bf'
+}
+
+/**
+ * Top semicircle speedometer. Uses pathLength + dasharray so fill always
+ * tracks left→right along the upper arc (no SVG large-arc / sweep traps).
+ */
 function SemicircleGauge({
   pct,
-  className
+  size = 'sm'
 }: {
   pct: number
-  className?: string
+  size?: 'sm' | 'lg'
 }): React.JSX.Element {
-  const p = Math.max(0, Math.min(100, pct)) / 100
-  const r = 9
-  const cx = 12
-  const cy = 13
-  const startX = cx - r
-  const startY = cy
-  const endX = cx + r
-  const endY = cy
-  const bg = `M ${startX} ${startY} A ${r} ${r} 0 0 1 ${endX} ${endY}`
-  const angle = Math.PI * (1 - p)
-  const fx = cx + r * Math.cos(angle)
-  const fy = cy - r * Math.sin(angle)
-  const large = p > 0.5 ? 1 : 0
-  const fg =
-    p <= 0.001
-      ? ''
-      : `M ${startX} ${startY} A ${r} ${r} 0 ${large} 1 ${fx} ${fy}`
-
-  const stroke =
-    p >= 0.9 ? 'var(--afk-danger, #f87171)' : p >= 0.7 ? '#fbbf24' : 'var(--afk-signal, #2dd4bf)'
+  const p = Math.max(0, Math.min(100, pct))
+  const stroke = gaugeStroke(p)
+  // Clockwise upper arc: left → top → right (y grows downward).
+  const d = size === 'lg' ? 'M 8 52 A 44 44 0 0 1 104 52' : 'M 3 16 A 13 13 0 0 1 29 16'
+  const vb = size === 'lg' ? '0 0 112 60' : '0 0 32 18'
+  const w = size === 'lg' ? 168 : 20
+  const h = size === 'lg' ? 90 : 12
+  const sw = size === 'lg' ? 8 : 2.6
 
   return (
-    <svg
-      width="18"
-      height="12"
-      viewBox="0 0 24 16"
-      className={className}
-      aria-hidden
-    >
+    <svg width={w} height={h} viewBox={vb} className="shrink-0 overflow-visible" aria-hidden>
       <path
-        d={bg}
+        d={d}
         fill="none"
         stroke="currentColor"
-        strokeWidth="2.4"
+        strokeWidth={sw}
         strokeLinecap="round"
+        pathLength={100}
         className="text-ink-line"
       />
-      {fg ? (
+      {p > 0.4 ? (
         <path
-          d={fg}
+          d={d}
           fill="none"
           stroke={stroke}
-          strokeWidth="2.4"
+          strokeWidth={sw}
           strokeLinecap="round"
+          pathLength={100}
+          strokeDasharray={`${p} ${100 - p}`}
         />
       ) : null}
     </svg>
@@ -99,8 +95,7 @@ export function ContextUsageControl({
     }
   }, [open])
 
-  const limitLabel =
-    usage.limit != null ? formatTokenCount(usage.limit) : '—'
+  const limitLabel = usage.limit != null ? formatTokenCount(usage.limit) : '—'
   const usedLabel = formatTokenCount(usage.used)
   const hasMeasure = usage.used > 0 || usage.measured
 
@@ -118,7 +113,7 @@ export function ContextUsageControl({
         aria-expanded={open}
         aria-haspopup="dialog"
       >
-        <SemicircleGauge pct={usage.pct} />
+        <SemicircleGauge pct={usage.pct} size="sm" />
         <span>{t('context.label')}</span>
       </button>
 
@@ -145,47 +140,20 @@ export function ContextUsageControl({
               <p className="text-[11px] text-ink-mute">{t('context.empty')}</p>
             ) : (
               <>
-                <div className="flex items-baseline justify-between gap-2 text-[12px]">
-                  <span className="font-medium text-ink-bright">
-                    {t('context.pctFull', { n: usage.pct })}
-                  </span>
-                  <span className="font-mono text-[11px] text-ink-mute">
-                    {usage.measured ? '~' : '≈'}
-                    {usedLabel} / {limitLabel} {t('context.tokens')}
-                  </span>
+                <div className="flex flex-col items-center gap-1 pt-1">
+                  <SemicircleGauge pct={usage.pct} size="lg" />
+                  <div className="-mt-3 flex flex-col items-center">
+                    <span className="text-[18px] font-semibold tabular-nums text-ink-bright">
+                      {t('context.pctFull', { n: usage.pct })}
+                    </span>
+                    <span className="font-mono text-[11px] text-ink-mute">
+                      {usage.measured ? '~' : '≈'}
+                      {usedLabel} / {limitLabel} {t('context.tokens')}
+                    </span>
+                  </div>
                 </div>
 
-                <div className="flex h-2 w-full overflow-hidden rounded-full bg-ink-950">
-                  {usage.limit != null && usage.limit > 0
-                    ? usage.categories.map((c) => {
-                        const width = (c.tokens / usage.limit!) * 100
-                        return (
-                          <div
-                            key={c.id}
-                            style={{
-                              width: `${Math.max(width > 0 ? 0.35 : 0, width)}%`,
-                              background: c.color
-                            }}
-                            title={`${t(c.labelKey as MessageKey)} · ${formatTokenCount(c.tokens)}`}
-                          />
-                        )
-                      })
-                    : usage.categories.map((c) => {
-                        const width =
-                          usage.used > 0 ? (c.tokens / usage.used) * 100 : 0
-                        return (
-                          <div
-                            key={c.id}
-                            style={{
-                              width: `${Math.max(width > 0 ? 0.35 : 0, width)}%`,
-                              background: c.color
-                            }}
-                          />
-                        )
-                      })}
-                </div>
-
-                <ul className="space-y-1.5">
+                <ul className="space-y-1.5 border-t border-ink-line/60 pt-2">
                   {usage.categories.map((c) => (
                     <li
                       key={c.id}

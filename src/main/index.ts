@@ -18,6 +18,11 @@ import {
   importChatImage,
   readChatImageDataUrl
 } from './chats/ChatImages'
+import {
+  CHAT_DOC_MAX_COUNT,
+  importChatDocument
+} from './chats/ChatDocuments'
+import { CHAT_FILE_MAX_COUNT, importChatFile } from './chats/ChatFiles'
 import type { LlamaRuntimeEnsureOptions } from '../shared/llamaRuntime'
 import { isLlamaRuntimeSelection } from '../shared/llamaRuntime'
 import type { ModelSlot } from '../shared/modelSlots'
@@ -970,6 +975,83 @@ function registerIpc(): void {
     return result.filePaths.slice(0, CHAT_IMAGE_MAX_COUNT)
   })
 
+  ipcMain.handle(
+    'chat-docs:import',
+    async (
+      _e,
+      payload: {
+        sessionId?: string
+        sourcePath?: string
+        dataBase64?: string
+        mime?: string
+        name?: string
+      }
+    ) => {
+      const sessionId = String(payload?.sessionId || 'draft')
+      return importChatDocument({
+        sessionId,
+        sourcePath: payload?.sourcePath,
+        dataBase64: payload?.dataBase64,
+        mime: payload?.mime,
+        name: payload?.name
+      })
+    }
+  )
+
+  ipcMain.handle(
+    'chat-files:import',
+    async (
+      _e,
+      payload: {
+        sessionId?: string
+        sourcePath?: string
+        dataBase64?: string
+        mime?: string
+        name?: string
+      }
+    ) => {
+      const sessionId = String(payload?.sessionId || 'draft')
+      return importChatFile({
+        sessionId,
+        sourcePath: payload?.sourcePath,
+        dataBase64: payload?.dataBase64,
+        mime: payload?.mime,
+        name: payload?.name
+      })
+    }
+  )
+
+  ipcMain.handle('chat-files:open', async (_e, absPath: string) => {
+    const p = String(absPath || '').trim()
+    if (!p || !existsSync(p)) throw new Error('File not found')
+    const err = await shell.openPath(p)
+    if (err) throw new Error(err)
+    return true
+  })
+
+  ipcMain.handle('chat-files:pick', async () => {
+    if (!mainWindow) return []
+    const result = await dialog.showOpenDialog(mainWindow, {
+      properties: ['openFile', 'multiSelections']
+    })
+    if (result.canceled || !result.filePaths.length) return []
+    return result.filePaths.slice(0, CHAT_FILE_MAX_COUNT)
+  })
+
+  ipcMain.handle('chat-docs:pick', async () => {
+    if (!mainWindow) return []
+    const result = await dialog.showOpenDialog(mainWindow, {
+      properties: ['openFile', 'multiSelections'],
+      filters: [
+        { name: 'Documents', extensions: ['pdf', 'docx', 'doc'] },
+        { name: 'PDF', extensions: ['pdf'] },
+        { name: 'Word', extensions: ['docx', 'doc'] }
+      ]
+    })
+    if (result.canceled || !result.filePaths.length) return []
+    return result.filePaths.slice(0, CHAT_DOC_MAX_COUNT)
+  })
+
   ipcMain.handle('llm:list-mmproj', async () => {
     const dir = settingsStore?.get().modelsDir
     if (!dir) return []
@@ -1519,6 +1601,16 @@ app.whenReady().then(async () => {
     },
     generateImage: async (args) => {
       let settings = settingsStore?.get()
+      if (!settings?.agentImageGenEnabled) {
+        return {
+          id: '',
+          name: 'generate_image',
+          ok: false,
+          content: '',
+          error:
+            'Image mode is off. Turn on Image in the composer to allow generate_image.'
+        }
+      }
       if (settingsStore && imageGenPathsNeedAutofill(settings ?? settingsStore.get())) {
         settings = await settingsStore.autofillImageGenIfNeeded()
         // Push updated paths to renderer so Settings UI stays in sync.
@@ -1624,7 +1716,7 @@ app.whenReady().then(async () => {
             name: 'generate_image',
             ok: true,
             content:
-              `OK: image saved to ${posix}. IMAGE_DONE: do not read_file or edit this file — the UI already shows it. Reply with one short confirmation only.`,
+              `OK: image saved to ${posix}. IMAGE_DONE: do not read_file or edit this file — the UI already shows it. Continue other requested work if any; if the request was image-only, one short confirmation is enough.`,
             filePath: posix
           }
         }

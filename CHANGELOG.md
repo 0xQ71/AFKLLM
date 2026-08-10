@@ -6,6 +6,16 @@ Canonical copy for each tag lives in [`docs/releases/`](docs/releases/).
 That text is what AFKLLM shows in the post-update “What's new” modal
 (and is mirrored in-app under Help → Version).
 
+## 0.2.0-20260810 — build 2026-08-10
+
+First-run onboarding (welcome → coding / image modes → models or later),
+optional vision with autofill and chat photo cold-swap, PDF/DOCX attach
+(hybrid text + scanned-page vision), Image generation gate in Settings +
+composer, FLUX/`generate_image` stack, Think-only answer promotion, chat
+image lightbox, and Context gauge fix.
+
+See [`docs/releases/v0.2.0-20260810.md`](docs/releases/v0.2.0-20260810.md).
+
 ## 0.1.0-20260807 — build 2026-08-07
 
 Agent reliability: keep chat mounted while Settings is open (block Settings /

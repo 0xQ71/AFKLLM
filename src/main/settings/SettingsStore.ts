@@ -25,6 +25,10 @@ import {
   clearMissingImageGenPaths,
   imageGenPathsNeedAutofill
 } from '../imagegen/ImageGenAutofill'
+import {
+  autofillVisionPaths,
+  visionPathsNeedAutofill
+} from '../llama/VisionAutofill'
 
 export class SettingsStore {
   private path: string
@@ -53,7 +57,11 @@ export class SettingsStore {
     }
     await this.repairMissingModel()
     await this.autofillImageGenIfNeeded()
+    await this.autofillVisionIfNeeded()
+    // Auto-complete first-run when a chat GGUF already exists.
+    // Skipped when AFKLLM_FORCE_ONBOARDING=1 so we can re-show the wizard.
     if (
+      process.env.AFKLLM_FORCE_ONBOARDING !== '1' &&
       this.cache.modelPath &&
       existsSync(this.cache.modelPath) &&
       !this.cache.setupComplete
@@ -77,6 +85,16 @@ export class SettingsStore {
       return this.get()
     }
     this.cache = sanitize({ ...base, ...filled })
+    await this.persist()
+    return this.get()
+  }
+
+  /** Fill empty vision paths from modelsDir when a VL GGUF (+ mmproj) exists. */
+  async autofillVisionIfNeeded(): Promise<AppSettings> {
+    if (!visionPathsNeedAutofill(this.cache)) return this.get()
+    const filled = await autofillVisionPaths(this.cache)
+    if (Object.keys(filled).length === 0) return this.get()
+    this.cache = sanitize({ ...this.cache, ...filled })
     await this.persist()
     return this.get()
   }
@@ -128,6 +146,7 @@ export class SettingsStore {
     await this.persist()
     // Fill any still-empty image-gen slots from modelsDir (e.g. after download / clear).
     await this.autofillImageGenIfNeeded()
+    await this.autofillVisionIfNeeded()
     return this.get()
   }
 
@@ -193,6 +212,7 @@ function sanitize(input: Record<string, unknown> | AppSettings): AppSettings {
 
   next.agentAutoApprove = next.agentAutoApprove === true
   next.agentThinkThrough = next.agentThinkThrough !== false
+  next.agentImageGenEnabled = next.agentImageGenEnabled === true
   next.setupComplete = next.setupComplete === true
   next.localApiEnabled = next.localApiEnabled === true
 

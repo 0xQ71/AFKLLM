@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer } from 'electron'
+import { contextBridge, ipcRenderer, webUtils } from 'electron'
 import type {
   AgentToolCall,
   AgentToolResult,
@@ -326,6 +326,59 @@ const api = {
     readDataUrl: (absPath: string): Promise<string> =>
       ipcRenderer.invoke('chat-images:read-data-url', absPath),
     pick: (): Promise<string[]> => ipcRenderer.invoke('chat-images:pick')
+  },
+
+  chatDocs: {
+    import: (payload: {
+      sessionId?: string
+      sourcePath?: string
+      dataBase64?: string
+      mime?: string
+      name?: string
+    }): Promise<{
+      id: string
+      path: string
+      mime: string
+      name: string
+      kind: 'pdf' | 'docx' | 'doc'
+      text: string
+      pageCount?: number
+      pageImages?: Array<{ id: string; path: string; mime: string; name?: string }>
+      note?: string
+    }> => ipcRenderer.invoke('chat-docs:import', payload),
+    pick: (): Promise<string[]> => ipcRenderer.invoke('chat-docs:pick')
+  },
+
+  chatFiles: {
+    import: (payload: {
+      sessionId?: string
+      sourcePath?: string
+      dataBase64?: string
+      mime?: string
+      name?: string
+    }): Promise<{
+      id: string
+      path: string
+      mime: string
+      name: string
+      extLabel: string
+      kind: 'image' | 'pdf' | 'docx' | 'text' | 'binary'
+      text?: string
+      pageImages?: Array<{ id: string; path: string; mime: string; name?: string }>
+      note?: string
+      image?: { id: string; path: string; mime: string; name?: string }
+    }> => ipcRenderer.invoke('chat-files:import', payload),
+    pick: (): Promise<string[]> => ipcRenderer.invoke('chat-files:pick'),
+    open: (absPath: string): Promise<boolean> => ipcRenderer.invoke('chat-files:open', absPath)
+  },
+
+  /** Electron 32+: File.path removed — use this for drag/drop & paste paths */
+  getPathForFile: (file: File): string => {
+    try {
+      return webUtils.getPathForFile(file) || ''
+    } catch {
+      return ''
+    }
   },
 
   sdRuntime: {

@@ -173,6 +173,12 @@ export interface AppSettings {
   /** Brief reasoning step before tools / final answer */
   agentThinkThrough: boolean
 
+  /**
+   * When true, expose generate_image to the agent.
+   * Default false — coding mode must not invent image gens.
+   */
+  agentImageGenEnabled: boolean
+
   /** First-run wizard done with a valid .gguf */
   setupComplete: boolean
 
@@ -305,6 +311,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   agentAutoApprove: false,
 
   agentThinkThrough: true,
+
+  agentImageGenEnabled: false,
 
   setupComplete: false,
 

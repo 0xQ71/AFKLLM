@@ -1,7 +1,20 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent, type MouseEvent } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type DragEvent,
+  type FormEvent,
+  type KeyboardEvent,
+  type MouseEvent
+} from 'react'
 import type {
+  ChatFileRef,
   ChatMessage,
   ChatMessageStats,
+  ComposerFileAttachment,
+  DocumentAttachment,
   EditorSelectionContext,
   FileAttachment,
   ImageAttachment
@@ -13,6 +26,7 @@ import {
   formatPlanExecutePrompt,
   getPlanStatus,
   parseThinkBlocks,
+  promoteThinkOnlyAnswer,
   runAgentTurn,
   setPlanStatus,
   stripPlanStatus,
@@ -69,6 +83,10 @@ interface ChatPanelProps {
   onRequestFolderForSend?: (text: string) => void
   pendingSendSignal?: { text: string; nonce: number; restoreOnly?: boolean } | null
   onOpenFolder?: () => void
+  /** Opens the app-level image lightbox (same as tree PNG click) */
+  onOpenImagePreview?: (url: string, name?: string) => void
+  /** Opens Settings → Agent when Image mode is off (master toggle lives there) */
+  onOpenImageGenSettings?: () => void
 }
 
 type SessionMeta = Omit<ChatSession, 'messages'>
@@ -95,7 +113,9 @@ export function ChatPanel({
   needsFolderToChat = false,
   onRequestFolderForSend,
   pendingSendSignal = null,
-  onOpenFolder
+  onOpenFolder,
+  onOpenImagePreview,
+  onOpenImageGenSettings
 }: ChatPanelProps): React.JSX.Element {
   const { t, lang } = useI18n()
   const [sessionId, setSessionId] = useState<string | null>(null)
@@ -109,8 +129,8 @@ export function ChatPanel({
     }
   ])
   const [input, setInput] = useState('')
-  const [attachments, setAttachments] = useState<FileAttachment[]>([])
-  const [images, setImages] = useState<ImageAttachment[]>([])
+  const [composerFiles, setComposerFiles] = useState<ComposerFileAttachment[]>([])
+  const [fileBusy, setFileBusy] = useState(false)
   const [slotBanner, setSlotBanner] = useState<string>('')
   const [busy, setBusy] = useState(false)
   /** Bumps on Stop so an in-flight turn's finally cannot re-lock the composer. */
@@ -121,19 +141,20 @@ export function ChatPanel({
   const [reverbEdit, setReverbEdit] = useState<{ messageId: string; text: string } | null>(
     null
   )
-  const [imagePreview, setImagePreview] = useState<{ url: string; name?: string } | null>(
-    null
-  )
   const [copiedMsgId, setCopiedMsgId] = useState<string | null>(null)
 
   const openChatImage = useCallback(async (path: string, name?: string) => {
     try {
       const url = await window.api.chatImages.readDataUrl(path)
-      setImagePreview({ url, name })
+      if (onOpenImagePreview) {
+        onOpenImagePreview(url, name)
+        return
+      }
+      console.error('onOpenImagePreview is not wired')
     } catch (err) {
       console.error('Failed to open image', err)
     }
-  }, [])
+  }, [onOpenImagePreview])
 
   const copyUserMessage = useCallback(
     async (id: string, text: string) => {
@@ -149,6 +170,136 @@ export function ChatPanel({
     },
     []
   )
+
+  const fileToBase64 = useCallback(async (file: File): Promise<string> => {
+    const buf = await file.arrayBuffer()
+    const bytes = new Uint8Array(buf)
+    let binary = ''
+    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]!)
+    return btoa(binary)
+  }, [])
+
+  const ingestDroppedFile = useCallback(
+    async (file: File) => {
+      setFileBusy(true)
+      try {
+        const diskPath =
+          window.api.getPathForFile?.(file)?.trim() ||
+          (file as File & { path?: string }).path?.trim() ||
+          ''
+        const imported = diskPath
+          ? await window.api.chatFiles.import({
+              sessionId: sessionId ?? 'draft',
+              sourcePath: diskPath
+            })
+          : await window.api.chatFiles.import({
+              sessionId: sessionId ?? 'draft',
+              dataBase64: await fileToBase64(file),
+              mime: file.type || undefined,
+              name: file.name || undefined
+            })
+
+        let previewUrl: string | undefined
+        if (imported.kind === 'image') {
+          try {
+            previewUrl = await window.api.chatImages.readDataUrl(imported.path)
+          } catch {
+            /* ignore */
+          }
+        }
+
+        const next: ComposerFileAttachment = {
+          id: imported.id,
+          path: imported.path,
+          name: imported.name,
+          mime: imported.mime,
+          extLabel: imported.extLabel || 'FILE',
+          kind: imported.kind,
+          ...(previewUrl ? { previewUrl } : {}),
+          ...(imported.text ? { text: imported.text } : {}),
+          ...(imported.pageImages?.length
+            ? {
+                pageImages: imported.pageImages.map((p) => ({
+                  id: p.id,
+                  path: p.path,
+                  mime: p.mime,
+                  ...(p.name ? { name: p.name } : {})
+                }))
+              }
+            : {}),
+          ...(imported.note ? { note: imported.note } : {})
+        }
+
+        setComposerFiles((prev) => {
+          if (prev.length >= 8) return prev
+          if (prev.some((x) => x.id === next.id)) return prev
+          const imageCount = prev.filter((x) => x.kind === 'image').length
+          if (next.kind === 'image' && imageCount >= 4) return prev
+          return [...prev, next]
+        })
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        window.alert(msg)
+      } finally {
+        setFileBusy(false)
+      }
+    },
+    [fileToBase64, sessionId]
+  )
+
+  const ingestFiles = useCallback(
+    async (list: FileList | File[]) => {
+      for (const file of Array.from(list)) {
+        await ingestDroppedFile(file)
+      }
+    },
+    [ingestDroppedFile]
+  )
+
+  const splitComposerFiles = useCallback((files: ComposerFileAttachment[]) => {
+    const images: ImageAttachment[] = []
+    const documents: DocumentAttachment[] = []
+    const attachments: FileAttachment[] = []
+    const fileRefs: ChatFileRef[] = []
+    for (const f of files) {
+      fileRefs.push({
+        id: f.id,
+        path: f.path,
+        name: f.name,
+        mime: f.mime,
+        extLabel: f.extLabel,
+        kind: f.kind
+      })
+      if (f.kind === 'image') {
+        images.push({
+          id: f.id,
+          path: f.path,
+          mime: f.mime,
+          name: f.name,
+          ...(f.previewUrl ? { previewUrl: f.previewUrl } : {})
+        })
+      } else if (f.kind === 'pdf' || f.kind === 'docx') {
+        documents.push({
+          id: f.id,
+          path: f.path,
+          name: f.name,
+          kind: f.kind,
+          text: f.text || '',
+          ...(f.pageImages?.length ? { pageImages: f.pageImages } : {}),
+          ...(f.note ? { note: f.note } : {})
+        })
+      } else {
+        const body = (f.text || f.note || '').trim()
+        if (body) {
+          attachments.push({
+            path: `file/${f.name}`,
+            content: body
+          })
+        }
+      }
+    }
+    return { images, documents, attachments, fileRefs }
+  }, [])
   const followQueueRef = useRef(followQueue)
   followQueueRef.current = followQueue
   const prioritySendRef = useRef<string | null>(null)
@@ -162,6 +313,7 @@ export function ChatPanel({
   const [autoApprove, setAutoApprove] = useState(false)
   const [planMode, setPlanMode] = useState(false)
   const [thinkThrough, setThinkThrough] = useState(true)
+  const [imageMode, setImageMode] = useState(false)
   const [projectRulesText, setProjectRulesText] = useState('')
   const [mcpToolsJson, setMcpToolsJson] = useState('')
   const [systemPromptExtra, setSystemPromptExtra] = useState('')
@@ -262,11 +414,13 @@ export function ChatPanel({
     void window.api.settings.get().then((s) => {
       setAutoApprove(Boolean(s.agentAutoApprove))
       setThinkThrough(s.agentThinkThrough !== false)
+      setImageMode(s.agentImageGenEnabled === true)
       setSystemPromptExtra(s.systemPrompt?.trim() ?? '')
     })
     return window.api.settings.onChanged((s) => {
       setAutoApprove(Boolean(s.agentAutoApprove))
       setThinkThrough(s.agentThinkThrough !== false)
+      setImageMode(s.agentImageGenEnabled === true)
       setSystemPromptExtra(s.systemPrompt?.trim() ?? '')
     })
   }, [])
@@ -358,6 +512,15 @@ export function ChatPanel({
     const next = !thinkThrough
     setThinkThrough(next)
     await window.api.settings.save({ agentThinkThrough: next })
+  }
+
+  const toggleImageMode = async (): Promise<void> => {
+    if (!imageMode) {
+      onOpenImageGenSettings?.()
+      return
+    }
+    setImageMode(false)
+    await window.api.settings.save({ agentImageGenEnabled: false })
   }
 
   const stop = (opts?: { drain?: boolean }): void => {
@@ -527,8 +690,19 @@ export function ChatPanel({
     opts?: { fromQueue?: boolean; reverb?: { messageId: string } }
   ): Promise<void> => {
     const text = (textOverride ?? input).trim()
-    if ((!text && images.length === 0) || !llmReady) return
-    const sendText = text || '(see attached image)'
+    if ((!text && composerFiles.length === 0) || !llmReady) return
+    const sendText =
+      text ||
+      (composerFiles.some((f) => f.kind === 'image')
+        ? lang === 'ru'
+          ? 'Что на этом изображении?'
+          : 'What is in this image?'
+        : composerFiles.length
+          ? lang === 'ru'
+            ? 'Что это за документ? Кратко по сути: для чего он и о чём (не пересказывай оглавление).'
+            : 'What is this document? Briefly: what it is for and what it covers (do not recite the table of contents).'
+          : '')
+    if (!sendText) return
     if (needsFolderToChat) {
       setInput('')
       onRequestFolderForSend?.(sendText)
@@ -599,6 +773,10 @@ export function ChatPanel({
     busyRef.current = true
     const ac = new AbortController()
     abortRef.current = ac
+    const split = splitComposerFiles(composerFiles)
+    if (!opts?.fromQueue && !opts?.reverb) {
+      setComposerFiles([])
+    }
     try {
       await runAgentTurn({
         queue,
@@ -606,8 +784,10 @@ export function ChatPanel({
         userText: sendText,
         openFile,
         selection,
-        attachments,
-        images,
+        attachments: split.attachments,
+        images: split.images,
+        documents: split.documents,
+        files: split.fileRefs,
         onUpdate: (msgs) => {
           messagesRef.current = msgs
           setMessages(msgs)
@@ -622,8 +802,6 @@ export function ChatPanel({
         uiLanguage: lang
       })
       if (turnGenRef.current === turnId) {
-        setAttachments([])
-        setImages([])
         if (usePlan) setPlanMode(false)
       }
     } finally {
@@ -832,6 +1010,7 @@ export function ChatPanel({
       promptTokens: measuredPromptTokens,
       agentAutoApprove: autoApprove,
       agentThinkThrough: thinkThrough,
+      agentImageGenEnabled: imageMode,
       planMode,
       systemPromptExtra,
       projectRules: projectRulesText,
@@ -843,21 +1022,13 @@ export function ChatPanel({
       measuredPromptTokens,
       autoApprove,
       thinkThrough,
+      imageMode,
       planMode,
       systemPromptExtra,
       projectRulesText,
       mcpToolsJson
     ]
   )
-
-  const insertMention = (token: '@codebase' | '@file' | '@selection'): void => {
-    const re = new RegExp(`${token}\\b`, 'i')
-    if (re.test(input)) return
-    setInput((prev) => {
-      const t = prev.trimEnd()
-      return t ? `${t} ${token} ` : `${token} `
-    })
-  }
 
   const visibleMessages = messages.filter((m) => isVisibleChatMessage(m))
   const threadTitle =
@@ -867,7 +1038,10 @@ export function ChatPanel({
 
   const displayContent = (m: ChatMessage): string => {
     if (m.id === 'welcome') {
-      return llmReady ? t('chat.welcome.online') : t('chat.welcome.loadModel')
+      if (llmReady) {
+        return imageMode ? t('chat.welcome.online') : t('chat.welcome.onlineNoImage')
+      }
+      return imageMode ? t('chat.welcome.loadModel') : t('chat.welcome.loadModelNoImage')
     }
     return m.content
   }
@@ -1041,7 +1215,7 @@ export function ChatPanel({
                   <MessageStatsInfo stats={m.stats!} />
                 ) : null}
               </div>
-            ) : !m.toolName && m.content?.trim() ? (
+            ) : !m.toolName && (m.content?.trim() || (m.files && m.files.length > 0) || (m.images && m.images.length > 0)) ? (
               m.role === 'user' ? (
                 <div className="flex w-full flex-col items-end">
                   {reverbEdit?.messageId === m.id ? (
@@ -1085,15 +1259,34 @@ export function ChatPanel({
                     </div>
                   ) : (
                     <div className="group/user flex max-w-[85%] flex-col items-end gap-1">
-                      <button
-                        type="button"
-                        disabled={!(busy && m.id === activeUserMsgId)}
+                      {m.images && m.images.length > 0 ? (
+                        <div className="mb-0.5 flex flex-wrap justify-end gap-1.5">
+                          {m.images.map((img) => (
+                            <ChatImageThumb
+                              key={img.id}
+                              path={img.path}
+                              name={img.name}
+                              onOpen={() => void openChatImage(img.path, img.name)}
+                            />
+                          ))}
+                        </div>
+                      ) : null}
+                      <div
+                        role={busy && m.id === activeUserMsgId ? 'button' : undefined}
+                        tabIndex={busy && m.id === activeUserMsgId ? 0 : undefined}
                         title={
                           busy && m.id === activeUserMsgId ? t('chat.reverb.edit') : undefined
                         }
                         onClick={() => {
                           if (!(busy && m.id === activeUserMsgId)) return
                           setReverbEdit({ messageId: m.id, text: m.content })
+                        }}
+                        onKeyDown={(e) => {
+                          if (!(busy && m.id === activeUserMsgId)) return
+                          if (e.key === 'Enter' || e.key === ' ') {
+                            e.preventDefault()
+                            setReverbEdit({ messageId: m.id, text: m.content })
+                          }
                         }}
                         className={
                           'w-full rounded-2xl border border-ink-line/70 bg-ink-900/90 px-3.5 py-2 text-left text-[13px] leading-relaxed text-ink-bright ' +
@@ -1102,20 +1295,28 @@ export function ChatPanel({
                             : 'cursor-default')
                         }
                       >
-                        {m.images && m.images.length > 0 ? (
-                          <div className="mb-2 flex flex-wrap gap-1.5">
-                            {m.images.map((img) => (
-                              <ChatImageThumb
-                                key={img.id}
-                                path={img.path}
-                                name={img.name}
-                                onOpen={() => void openChatImage(img.path, img.name)}
-                              />
-                            ))}
-                          </div>
-                        ) : null}
-                        <div className="whitespace-pre-wrap break-words">{m.content}</div>
-                      </button>
+                        <div className="break-words">
+                          {m.content ? (
+                            <span className="whitespace-pre-wrap">{m.content}</span>
+                          ) : null}
+                          {m.files && m.files.some((f) => f.kind !== 'image') ? (
+                            <span className="inline">
+                              {m.content?.trim() ? ' ' : null}
+                              {m.files
+                                .filter((f) => f.kind !== 'image')
+                                .map((f) => (
+                                  <FilePill
+                                    key={f.id}
+                                    file={f}
+                                    onOpen={() => {
+                                      void window.api.chatFiles.open(f.path).catch(() => undefined)
+                                    }}
+                                  />
+                                ))}
+                            </span>
+                          ) : null}
+                        </div>
+                      </div>
                       <button
                         type="button"
                         title={t('chat.copyMessage')}
@@ -1291,54 +1492,65 @@ export function ChatPanel({
               {slotBanner}
             </div>
           ) : null}
-          <div className="rounded-2xl border border-ink-line/90 bg-ink-900/90 shadow-[0_0_0_1px_rgba(255,255,255,0.02)] focus-within:border-ink-mute/50">
-            {(attachments.length > 0 || images.length > 0) && (
-              <div className="flex flex-wrap gap-1.5 border-b border-ink-line/40 px-3 py-2">
-                {images.map((img) => (
-                  <span
-                    key={img.id}
-                    className="inline-flex max-w-full items-center gap-1.5 rounded-md bg-ink-800/90 px-1.5 py-0.5 text-[11px] text-ink-bright"
-                  >
-                    {img.previewUrl ? (
-                      <img
-                        src={img.previewUrl}
-                        alt=""
-                        className="h-8 w-8 rounded object-cover"
-                      />
-                    ) : (
-                      <span className="opacity-70">🖼</span>
-                    )}
-                    <span className="truncate max-w-[7rem]">
-                      {img.name || img.path.split(/[/\\]/).pop()}
+          <div
+            className="rounded-2xl border border-ink-line/90 bg-ink-900/90 shadow-[0_0_0_1px_rgba(255,255,255,0.02)] focus-within:border-ink-mute/50"
+            onDragOver={(e: DragEvent) => {
+              if (!llmReady || busy) return
+              const types = Array.from(e.dataTransfer?.types || [])
+              if (!types.includes('Files')) return
+              e.preventDefault()
+              e.dataTransfer.dropEffect = 'copy'
+            }}
+            onDrop={(e: DragEvent) => {
+              if (!llmReady || busy) return
+              const files = e.dataTransfer?.files
+              if (!files?.length) return
+              e.preventDefault()
+              void ingestFiles(files)
+            }}
+          >
+            {composerFiles.length > 0 && (
+              <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5 border-b border-ink-line/40 px-3 py-2">
+                {composerFiles.map((f) =>
+                  f.kind === 'image' ? (
+                    <span
+                      key={f.id}
+                      className="inline-flex max-w-full items-center gap-1.5 rounded-md bg-ink-800/90 px-1.5 py-0.5 text-[11px] text-ink-bright"
+                    >
+                      {f.previewUrl ? (
+                        <img
+                          src={f.previewUrl}
+                          alt=""
+                          className="h-8 w-8 rounded object-cover"
+                        />
+                      ) : (
+                        <span className="opacity-70">🖼</span>
+                      )}
+                      <span className="truncate max-w-[7rem]">{f.name}</span>
+                      <button
+                        type="button"
+                        title={t('chat.image.remove')}
+                        onClick={() =>
+                          setComposerFiles((prev) => prev.filter((x) => x.id !== f.id))
+                        }
+                        className="text-ink-mute hover:text-rose-300"
+                      >
+                        ×
+                      </button>
                     </span>
-                    <button
-                      type="button"
-                      title={t('chat.image.remove')}
-                      onClick={() => setImages((prev) => prev.filter((x) => x.id !== img.id))}
-                      className="text-ink-mute hover:text-rose-300"
-                    >
-                      ×
-                    </button>
-                  </span>
-                ))}
-                {attachments.map((a) => (
-                  <span
-                    key={a.path}
-                    className="inline-flex max-w-full items-center gap-1 rounded-md bg-ink-800/90 px-2 py-0.5 text-[11px] text-ink-bright"
-                  >
-                    <span className="truncate">{a.path.split(/[/\\]/).pop()}</span>
-                    <button
-                      type="button"
-                      title="Remove attachment"
-                      onClick={() =>
-                        setAttachments((prev) => prev.filter((x) => x.path !== a.path))
+                  ) : (
+                    <FilePill
+                      key={f.id}
+                      file={f}
+                      onRemove={() =>
+                        setComposerFiles((prev) => prev.filter((x) => x.id !== f.id))
                       }
-                      className="text-ink-mute hover:text-rose-300"
-                    >
-                      ×
-                    </button>
-                  </span>
-                ))}
+                      onOpen={() => {
+                        void window.api.chatFiles.open(f.path).catch(() => undefined)
+                      }}
+                    />
+                  )
+                )}
               </div>
             )}
             <textarea
@@ -1346,38 +1558,23 @@ export function ChatPanel({
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={onKeyDown}
               onPaste={(e) => {
-                const items = e.clipboardData?.items
-                if (!items) return
-                for (const item of Array.from(items)) {
-                  if (!item.type.startsWith('image/')) continue
-                  e.preventDefault()
-                  const file = item.getAsFile()
-                  if (!file) continue
-                  void (async () => {
-                    const buf = await file.arrayBuffer()
-                    const bytes = new Uint8Array(buf)
-                    let binary = ''
-                    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]!)
-                    const b64 = btoa(binary)
-                    try {
-                      const meta = await window.api.chatImages.import({
-                        sessionId: sessionId ?? 'draft',
-                        dataBase64: b64,
-                        mime: file.type || 'image/png',
-                        name: file.name || 'paste.png'
-                      })
-                      const previewUrl = await window.api.chatImages.readDataUrl(meta.path)
-                      setImages((prev) => {
-                        if (prev.length >= 4) return prev
-                        if (prev.some((x) => x.id === meta.id)) return prev
-                        return [...prev, { ...meta, previewUrl }]
-                      })
-                    } catch (err) {
-                      console.error(err)
-                    }
-                  })()
-                  break
+                if (!llmReady || busy) return
+                const cd = e.clipboardData
+                if (!cd) return
+                const collected: File[] = []
+                if (cd.files?.length) {
+                  for (const f of Array.from(cd.files)) collected.push(f)
                 }
+                if (!collected.length && cd.items) {
+                  for (const item of Array.from(cd.items)) {
+                    if (item.kind !== 'file') continue
+                    const f = item.getAsFile()
+                    if (f) collected.push(f)
+                  }
+                }
+                if (!collected.length) return
+                e.preventDefault()
+                void ingestFiles(collected)
               }}
               disabled={!llmReady}
               rows={2}
@@ -1395,79 +1592,84 @@ export function ChatPanel({
               className="w-full resize-none bg-transparent px-3.5 py-3 text-[13px] leading-relaxed text-ink-bright outline-none placeholder:text-ink-mute/80 disabled:opacity-50"
             />
             <div className="flex items-center gap-1 px-2 pb-2">
-              <div className="relative">
-                <button
-                  type="button"
-                  title="Add context"
-                  onClick={() => {
-                    if (!openFile?.path || openFile.path === 'untitled.ts') {
-                      insertMention('@codebase')
-                      return
-                    }
-                    setAttachments((prev) => {
-                      if (prev.some((a) => a.path === openFile.path)) return prev
-                      return [...prev, { path: openFile.path, content: openFile.content }]
-                    })
-                  }}
-                  disabled={busy || !llmReady}
-                  className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-ink-mute hover:bg-ink-800 hover:text-ink-bright disabled:opacity-40"
-                >
-                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden>
-                    <path
-                      d="M12 5v14M5 12h14"
-                      stroke="currentColor"
-                      strokeWidth="1.8"
-                      strokeLinecap="round"
-                    />
-                  </svg>
-                </button>
-              </div>
               <button
                 type="button"
-                title={t('chat.image.attach')}
-                disabled={busy || !llmReady || images.length >= 4}
+                title={fileBusy ? t('chat.doc.working') : t('chat.file.attach')}
+                disabled={busy || !llmReady || fileBusy || composerFiles.length >= 8}
                 onClick={() => {
                   void (async () => {
-                    const paths = await window.api.chatImages.pick()
+                    const paths = await window.api.chatFiles.pick()
                     if (!paths?.length) return
-                    for (const sourcePath of paths) {
-                      if (images.length >= 4) break
-                      try {
-                        const meta = await window.api.chatImages.import({
-                          sessionId: sessionId ?? 'draft',
-                          sourcePath
-                        })
-                        const previewUrl = await window.api.chatImages.readDataUrl(meta.path)
-                        setImages((prev) => {
-                          if (prev.length >= 4) return prev
-                          if (prev.some((x) => x.id === meta.id)) return prev
-                          return [...prev, { ...meta, previewUrl }]
-                        })
-                      } catch (err) {
-                        console.error(err)
+                    setFileBusy(true)
+                    try {
+                      for (const sourcePath of paths) {
+                        try {
+                          const imported = await window.api.chatFiles.import({
+                            sessionId: sessionId ?? 'draft',
+                            sourcePath
+                          })
+                          let previewUrl: string | undefined
+                          if (imported.kind === 'image') {
+                            try {
+                              previewUrl = await window.api.chatImages.readDataUrl(
+                                imported.path
+                              )
+                            } catch {
+                              /* ignore */
+                            }
+                          }
+                          setComposerFiles((prev) => {
+                            if (prev.length >= 8) return prev
+                            if (prev.some((x) => x.id === imported.id)) return prev
+                            if (
+                              imported.kind === 'image' &&
+                              prev.filter((x) => x.kind === 'image').length >= 4
+                            ) {
+                              return prev
+                            }
+                            return [
+                              ...prev,
+                              {
+                                id: imported.id,
+                                path: imported.path,
+                                name: imported.name,
+                                mime: imported.mime,
+                                extLabel: imported.extLabel,
+                                kind: imported.kind,
+                                ...(previewUrl ? { previewUrl } : {}),
+                                ...(imported.text ? { text: imported.text } : {}),
+                                ...(imported.pageImages?.length
+                                  ? {
+                                      pageImages: imported.pageImages.map((p) => ({
+                                        id: p.id,
+                                        path: p.path,
+                                        mime: p.mime,
+                                        ...(p.name ? { name: p.name } : {})
+                                      }))
+                                    }
+                                  : {}),
+                                ...(imported.note ? { note: imported.note } : {})
+                              }
+                            ]
+                          })
+                        } catch (err) {
+                          const msg = err instanceof Error ? err.message : String(err)
+                          window.alert(msg)
+                        }
                       }
+                    } finally {
+                      setFileBusy(false)
                     }
                   })()
                 }}
                 className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-ink-mute hover:bg-ink-800 hover:text-ink-bright disabled:opacity-40"
               >
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden>
-                  <rect
-                    x="3"
-                    y="5"
-                    width="18"
-                    height="14"
-                    rx="2"
-                    stroke="currentColor"
-                    strokeWidth="1.8"
-                  />
-                  <circle cx="8.5" cy="10" r="1.5" fill="currentColor" />
                   <path
-                    d="M21 16l-5.5-5.5L9 17"
+                    d="M12 5v14M5 12h14"
                     stroke="currentColor"
                     strokeWidth="1.8"
                     strokeLinecap="round"
-                    strokeLinejoin="round"
                   />
                 </svg>
               </button>
@@ -1513,6 +1715,22 @@ export function ChatPanel({
                 }
               >
                 {t('chat.think')}
+              </button>
+              <button
+                type="button"
+                title={
+                  imageMode ? t('chat.imageModeOn') : t('chat.imageModeDisabled')
+                }
+                aria-disabled={!imageMode}
+                onClick={() => void toggleImageMode()}
+                className={
+                  'rounded-full px-2 py-1 text-[11px] ' +
+                  (imageMode
+                    ? 'text-signal'
+                    : 'cursor-default text-ink-mute/50')
+                }
+              >
+                {t('chat.imageMode')}
               </button>
               <span className="ml-auto" />
               {busy ? (
@@ -1586,32 +1804,6 @@ export function ChatPanel({
         </div>
       </div>
     </aside>
-    {imagePreview ? (
-      <div
-        role="dialog"
-        aria-modal="true"
-        aria-label={imagePreview.name || t('chat.image.open')}
-        className="fixed inset-0 z-[80] flex items-center justify-center bg-black/80 p-4"
-        onClick={() => setImagePreview(null)}
-        onKeyDown={(e) => {
-          if (e.key === 'Escape') setImagePreview(null)
-        }}
-      >
-        <button
-          type="button"
-          className="absolute right-4 top-4 rounded-md border border-white/20 bg-black/50 px-2.5 py-1 font-mono text-[11px] text-white hover:bg-black/70"
-          onClick={() => setImagePreview(null)}
-        >
-          {t('chat.image.close')}
-        </button>
-        <img
-          src={imagePreview.url}
-          alt={imagePreview.name || 'preview'}
-          className="max-h-[90vh] max-w-[min(96vw,1200px)] rounded-lg object-contain shadow-2xl"
-          onClick={(e) => e.stopPropagation()}
-        />
-      </div>
-    ) : null}
     </>
   )
 }
@@ -1631,6 +1823,7 @@ function toPersisted(m: ChatMessage): PersistedChatMessage {
     ...(m.toolName ? { toolName: m.toolName } : {}),
     ...(m.filePath ? { filePath: m.filePath } : {}),
     ...(m.images?.length ? { images: m.images } : {}),
+    ...(m.files?.length ? { files: m.files } : {}),
     ...(m.stats ? { stats: m.stats } : {}),
     ...(m.activity ? { activity: m.activity } : {})
   }
@@ -1645,9 +1838,73 @@ function fromPersisted(m: PersistedChatMessage): ChatMessage {
     ...(m.toolName ? { toolName: m.toolName } : {}),
     ...(m.filePath ? { filePath: m.filePath } : {}),
     ...(m.images?.length ? { images: m.images } : {}),
+    ...(m.files?.length ? { files: m.files } : {}),
     ...(m.stats ? { stats: m.stats } : {}),
     ...(activity ? { activity } : {})
   }
+}
+
+function fileBadgeClass(extLabel: string, kind: ChatFileRef['kind']): string {
+  const e = extLabel.toUpperCase()
+  if (kind === 'pdf' || e === 'PDF') return 'bg-[#e25545]'
+  if (kind === 'docx' || e === 'DOCX' || e === 'DOC') return 'bg-[#2b579a]'
+  if (e === 'TS' || e === 'TSX') return 'bg-[#3178c6]'
+  if (e === 'JS' || e === 'JSX') return 'bg-[#c4a000]'
+  if (e === 'PY') return 'bg-[#3572A5]'
+  if (e === 'MD' || e === 'TXT') return 'bg-[#6b7280]'
+  if (e === 'JSON') return 'bg-[#cb8b00]'
+  if (e === 'ZIP' || e === '7Z' || e === 'RAR') return 'bg-[#8b5cf6]'
+  if (kind === 'image') return 'bg-[#0d9488]'
+  if (kind === 'text') return 'bg-[#64748b]'
+  return 'bg-[#52525b]'
+}
+
+function FilePill({
+  file,
+  onRemove,
+  onOpen
+}: {
+  file: ChatFileRef
+  onRemove?: () => void
+  onOpen?: () => void
+}): React.JSX.Element {
+  return (
+    <span className="mx-0.5 inline-flex max-w-[min(100%,18rem)] items-center gap-1 align-middle">
+      <span
+        className={
+          'inline-flex h-[15px] min-w-[26px] shrink-0 items-center justify-center rounded-[3px] px-1 text-[9px] font-bold leading-none tracking-wide text-white ' +
+          fileBadgeClass(file.extLabel, file.kind)
+        }
+      >
+        {file.extLabel}
+      </span>
+      <button
+        type="button"
+        title={file.path}
+        onClick={(e) => {
+          e.stopPropagation()
+          e.preventDefault()
+          onOpen?.()
+        }}
+        className="truncate text-[13px] font-medium text-[#4da3ff] hover:underline"
+      >
+        {file.name}
+      </button>
+      {onRemove ? (
+        <button
+          type="button"
+          title="Remove"
+          onClick={(e) => {
+            e.stopPropagation()
+            onRemove()
+          }}
+          className="shrink-0 text-[12px] text-ink-mute hover:text-rose-300"
+        >
+          ×
+        </button>
+      ) : null}
+    </span>
+  )
 }
 
 function ChatImageThumb({
@@ -1720,11 +1977,11 @@ function ThinkThroughBody({
   streaming?: boolean
   durationLabel?: string
 }): React.JSX.Element {
-  const parts = parseThinkBlocks(content)
+  const parts = parseThinkBlocks(promoteThinkOnlyAnswer(content))
   const hasThink = parts.some((p) => p.kind === 'think')
   if (!hasThink) {
     return (
-      <MarkdownBody content={content} streaming={streaming} />
+      <MarkdownBody content={promoteThinkOnlyAnswer(content)} streaming={streaming} />
     )
   }
   const thoughtLabel =
@@ -1761,16 +2018,8 @@ function ThinkThroughBody({
               </svg>
               {thoughtLabel}
             </summary>
-            <div className="mt-1.5 space-y-1 border-l border-ink-line/50 pl-3 text-[12px] leading-relaxed text-ink-mute">
-              {p.text
-                .split(/\n+/)
-                .map((l) => l.trim())
-                .filter(Boolean)
-                .map((line, j) => (
-                  <p key={j} className="m-0">
-                    {line}
-                  </p>
-                ))}
+            <div className="mt-1.5 border-l border-ink-line/50 pl-3 text-[12px] leading-relaxed text-ink-mute [&_.text-ink-soft]:text-ink-mute [&_.text-ink-bright]:text-ink-soft">
+              <MarkdownBody content={p.text} />
             </div>
           </details>
         ) : (
@@ -2125,10 +2374,11 @@ function isVisibleChatMessage(m: ChatMessage): boolean {
   if (m.id === 'welcome') return true
   const hasText = Boolean(m.content?.trim())
   const hasCode = Boolean(m.codePreview && m.codePreview.length > 0)
+  const hasFiles = Boolean(m.files?.length || m.images?.length)
   if (m.toolName === FILES_CHANGED_TOOL) return hasText
   if (m.toolName) return hasText || hasCode || Boolean(m.streaming && (m.filePath || hasCode))
   if (m.streaming) return hasText || hasCode
-  return hasText || hasCode
+  return hasText || hasCode || hasFiles
 }
 
 function formatDuration(ms: number): string {

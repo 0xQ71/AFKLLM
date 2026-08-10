@@ -10,6 +10,17 @@ export interface PersistedChatImage {
   name?: string
 }
 
+/** Cursor-style file chip on a user message (any dropped/attached file). */
+export interface PersistedChatFile {
+  id: string
+  path: string
+  name: string
+  mime: string
+  /** Badge label, e.g. PDF / TS / ZIP */
+  extLabel: string
+  kind: 'image' | 'pdf' | 'docx' | 'text' | 'binary'
+}
+
 export interface PersistedChatMessageStats {
   tps?: number
   promptTps?: number
@@ -28,6 +39,7 @@ export interface PersistedChatMessage {
   toolName?: string
   filePath?: string
   images?: PersistedChatImage[]
+  files?: PersistedChatFile[]
   stats?: PersistedChatMessageStats
   activity?: {
     kind: string
@@ -106,6 +118,31 @@ export function sanitizePersistedMessages(
           ...(typeof img.name === 'string' ? { name: img.name } : {})
         }))
       if (!cleaned.images.length) delete cleaned.images
+    }
+    if (Array.isArray(m.files) && m.files.length > 0) {
+      const kinds = new Set(['image', 'pdf', 'docx', 'text', 'binary'])
+      cleaned.files = m.files
+        .filter(
+          (f) =>
+            f &&
+            typeof f === 'object' &&
+            typeof f.id === 'string' &&
+            typeof f.path === 'string' &&
+            typeof f.name === 'string' &&
+            typeof f.mime === 'string' &&
+            typeof f.extLabel === 'string' &&
+            kinds.has(String(f.kind))
+        )
+        .slice(0, 8)
+        .map((f) => ({
+          id: String(f.id),
+          path: String(f.path),
+          name: String(f.name),
+          mime: String(f.mime),
+          extLabel: String(f.extLabel).slice(0, 8).toUpperCase(),
+          kind: f.kind as PersistedChatFile['kind']
+        }))
+      if (!cleaned.files.length) delete cleaned.files
     }
     const stats = sanitizeStats(m.stats)
     if (stats) cleaned.stats = stats

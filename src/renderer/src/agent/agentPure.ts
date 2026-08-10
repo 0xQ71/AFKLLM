@@ -404,6 +404,24 @@ export function parseThinkBlocks(content: string): ThinkBlockPart[] {
   return parts
 }
 
+/**
+ * If the model put the entire reply inside `<think>` with no visible text,
+ * unwrap it so the user still gets an answer.
+ */
+export function promoteThinkOnlyAnswer(content: string): string {
+  const raw = content ?? ''
+  if (!raw.trim()) return raw
+  const parts = parseThinkBlocks(raw)
+  const hasText = parts.some((p) => p.kind === 'text' && p.text.trim())
+  if (hasText) return raw
+  const thinks = parts
+    .filter((p): p is { kind: 'think'; text: string } => p.kind === 'think')
+    .map((p) => p.text.trim())
+    .filter(Boolean)
+  if (thinks.length === 0) return raw
+  return thinks.join('\n\n')
+}
+
 /** Local clock for system prompt (recomputed each turn). */
 export function formatNowForAgent(now: Date = new Date()): string {
   const weekday = now.toLocaleDateString('en-US', { weekday: 'long' })

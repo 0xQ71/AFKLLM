@@ -1,5 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
-import { existsSync, mkdirSync } from 'node:fs'
+import { existsSync, mkdirSync, statSync } from 'node:fs'
 import { dirname } from 'node:path'
 
 /** Active one-shot sd-cli — Stop / cancelAll can kill it. */
@@ -89,6 +89,54 @@ export interface SdGenerateResult {
 function present(p?: string): string | undefined {
   const t = p?.trim()
   return t && existsSync(t) ? t : undefined
+}
+
+/**
+ * Detect blank / near-solid outputs that sd-cli still saves as "success"
+ * (typical CUDA VAE OOM / hires decode failure → pure white).
+ */
+export function isNearlyBlankImage(filePath: string): boolean {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { nativeImage } = require('electron') as typeof import('electron')
+    const img = nativeImage.createFromPath(filePath)
+    if (!img || img.isEmpty()) return true
+    const { width, height } = img.getSize()
+    if (width < 8 || height < 8) return true
+    const buf = img.toBitmap()
+    const pixels = width * height
+    const step = Math.max(1, Math.floor(pixels / 5000))
+    let n = 0
+    let sum = 0
+    let sum2 = 0
+    let nearWhite = 0
+    let nearBlack = 0
+    for (let i = 0; i < pixels; i += step) {
+      const o = i * 4
+      const b = buf[o] ?? 0
+      const g = buf[o + 1] ?? 0
+      const r = buf[o + 2] ?? 0
+      const lum = (r + g + b) / 3
+      sum += lum
+      sum2 += lum * lum
+      n++
+      if (r > 250 && g > 250 && b > 250) nearWhite++
+      if (r < 5 && g < 5 && b < 5) nearBlack++
+    }
+    if (n < 10) return true
+    const mean = sum / n
+    const variance = sum2 / n - mean * mean
+    const solidFrac = Math.max(nearWhite, nearBlack) / n
+    return variance < 8 || solidFrac > 0.985
+  } catch {
+    try {
+      const st = statSync(filePath)
+      // 1280² photo is usually >200KB; blank white PNG ~50KB
+      return st.size > 0 && st.size < 90_000
+    } catch {
+      return true
+    }
+  }
 }
 
 /** Infer sd.cpp invocation style from which sidecar paths exist. */
@@ -260,20 +308,19 @@ export function buildSdCliArgs(params: SdGenerateParams): {
     params.samplingMethod?.trim() ||
     (stack === 'single' ? '' : 'euler')
   /**
-   * Memory strategy (16 GB VRAM / 32 GB RAM), from local bench:
-   * - TE on CPU (official flux.md): ~same encode time, keeps ~9 GB T5 out of VRAM
-   * - VAE on CUDA: decode ~0.5s vs ~13s on CPU
-   * - Diffusion weights in VRAM when possible (faster steps)
-   * - --offload-to-cpu + stream only for hires / ram / disk — avoids Shared-Memory thrash
-   *   and avoids parking Q8+T5 together in RAM (~22 GB peak in full-offload bench)
+   * Memory strategy (16 GB VRAM / 32 GB RAM):
+   * - TE on CPU (official flux.md)
+   * - VAE on CPU by default for FLUX/SD3 — CUDA VAE + hires has produced blank white PNGs
+   *   (sd.cpp silent decode failure); CPU decode is slower but reliable
+   * - Diffusion in VRAM when possible; --offload-to-cpu for hires / ram / disk
    */
   const weightStorage: 'disk' | 'ram' | 'vram' =
     params.weightStorage ??
     (params.offloadToCpu === true ? 'ram' : 'vram')
   const heavyStack = stack === 'flux1' || stack === 'flux2' || stack === 'sd3'
-  // Default TE on CPU for FLUX/SD3; VAE on GPU unless caller forces CPU.
   const clipOnCpu = params.clipOnCpu ?? heavyStack
-  const vaeOnCpu = params.vaeOnCpu ?? false
+  // Prefer CPU VAE for reliability (blank white = known CUDA/hires decode failure mode).
+  const vaeOnCpu = params.vaeOnCpu ?? heavyStack
   const isSchnell = /schnell/i.test(model)
   const guidance =
     params.guidance != null && params.guidance >= 0
@@ -571,6 +618,24 @@ export function runSdCli(params: SdGenerateParams): Promise<SdGenerateResult> {
     proc.on('close', (code) => {
       clearTimeout(timer)
       if (code === 0 && existsSync(out)) {
+        if (isNearlyBlankImage(out)) {
+          const detail =
+            'Image gen produced a blank image (likely VAE/hires CUDA decode failure). Try VAE on CPU / disable hires / lower resolution.'
+          notify({
+            step: 0,
+            total: built.steps,
+            remaining: built.steps,
+            phase: 'error',
+            detail
+          })
+          finish({
+            ok: false,
+            outputPath: out,
+            error: detail,
+            logs
+          })
+          return
+        }
         notify({
           step: built.steps,
           total: built.steps,

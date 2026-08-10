@@ -16,6 +16,7 @@ import {
   normalizeApiMessages,
   parseComposerMentions,
   parseThinkBlocks,
+  promoteThinkOnlyAnswer,
   formatNowForAgent,
   stripChecklistBlock,
   stripCompactBlocks,
@@ -100,7 +101,8 @@ export {
   formatChecklist,
   normalizeApiMessages,
   parseComposerMentions,
-  parseThinkBlocks
+  parseThinkBlocks,
+  promoteThinkOnlyAnswer
 }
 
 export const AGENT_PLAN_MSG_ID = 'agent-plan'
@@ -158,9 +160,20 @@ export interface ChatMessage {
   codePreview?: string
   filePath?: string
   images?: Array<{ id: string; path: string; mime: string; name?: string }>
+  /** Cursor-style file pills on the user bubble (any attached file). */
+  files?: ChatFileRef[]
   stats?: ChatMessageStats
   editReview?: { path: string; status: 'pending' | 'accepted' | 'rejected' }
   activity?: ComposerActivity
+}
+
+export interface ChatFileRef {
+  id: string
+  path: string
+  name: string
+  mime: string
+  extLabel: string
+  kind: 'image' | 'pdf' | 'docx' | 'text' | 'binary'
 }
 
 export interface EditorSelectionContext {
@@ -184,6 +197,25 @@ export interface ImageAttachment {
   previewUrl?: string
 }
 
+/** Composer-attached PDF/DOCX (text extract + optional vision page images). */
+export interface DocumentAttachment {
+  id: string
+  path: string
+  name: string
+  kind: 'pdf' | 'docx'
+  text: string
+  pageImages?: ImageAttachment[]
+  note?: string
+}
+
+/** Unified composer drop target (any file). */
+export interface ComposerFileAttachment extends ChatFileRef {
+  previewUrl?: string
+  text?: string
+  pageImages?: ImageAttachment[]
+  note?: string
+}
+
 /** Cold-swap to vision, describe images, restore chat. Returns text for chat agent. */
 async function describeImagesWithVision(params: {
   queue: QueueManager
@@ -204,7 +236,7 @@ async function describeImagesWithVision(params: {
     {
       type: 'text',
       text:
-        'Describe the attached image(s) in detail for a coding agent. Focus on UI layout, text, errors, diagrams, and anything relevant to this user request. Be concrete and concise (max ~400 words).\n\nUser request:\n' +
+        'Describe the attached image(s) / document page scan(s) in detail for a coding agent. Focus on UI layout, text, tables, diagrams, errors, and anything relevant to this user request. Be concrete and concise (max ~400 words).\n\nUser request:\n' +
         params.userText.slice(0, 2000)
     }
   ]
@@ -263,6 +295,13 @@ Rules for multi-file work (critical):
 - When the user includes @codebase, relevant repo snippets are already attached — use them; still call tools if you need more.
 - Prefer @codebase for “where is X / which file?” before spamming search_codebase.
 - When the user includes @file or @selection, that file/snippet is already attached — use it before re-reading unless you suspect it is stale.
+- Attached chat files / PDFs / DOCX (critical):
+  1) Blocks labeled [Document: …] or [File: …] ARE the document the user shared — treat them as the real content, not a "preview for analysis".
+  2) Answer the user's question directly. FORBIDDEN openers: "The user attached…", "Given the context…", "The task is to…", "Документ представляет собой…", or restating the prompt.
+  3) Reply in the SAME language as the user's message. If they only attached a file with no question, reply in the document's language (prefer Russian if the document is Russian).
+  4) When asked what a document is / to summarize: lead with what the product/system is and what the doc is for (1–3 sentences), then a short useful overview. Do NOT dump the table of contents or rename every section heading unless the user asked for the outline.
+  5) Be concise. Prefer substance over bureaucratic section lists. Do NOT dump bilingual EN↔RU glossaries unless asked.
+  6) If the extract ends with a truncation marker, answer from what is present; mention incompleteness only when it matters.
 - Web / docs (critical):
   1) If the user asks you to search the web, cite docs, add a Refs/link from search, or names a query for web_search — you MUST call the web_search tool at least once before finishing. Do NOT invent URLs from memory.
   2) Otherwise call web_search for up-to-date docs, package APIs, stack-overflow-style fixes, or facts not in the repo. Prefer search_codebase for local code. Use a precise query (library + error text + language).
@@ -279,24 +318,36 @@ Rules for multi-file work (critical):
   2) If the user gave an exact acceptance format, follow it; cite a web_ref URL that came from a web_search tool result, not a guessed link.
 - Local web preview: when you start a landing/dev server (vite, npm run dev, python -m http.server, etc.), AFKLLM auto-opens the in-app Browser on the Local/localhost URL from the terminal — do not ask the user to open an external browser.
 - Images / photos (critical):
-  1) To CREATE an image: call generate_image with a clear prompt (+ optional relative_path). Do not claim success without the tool.
-  2) After generate_image succeeds: STOP. Confirm the saved path in one short sentence. Do NOT read_file the PNG, do NOT write_file/edit it, do NOT describe pixels from disk.
-  3) To UNDERSTAND a user-attached photo: only the built-in vision attach path (images on the user message). Never read_file images (.png/.jpg/.webp/.gif/…).
-  4) Image generation is independent of coding context — do not dump file contents or long plans into the image prompt unless the user asked.
+  1) To UNDERSTAND a user-attached photo: only the built-in vision attach path (images on the user message). Never read_file images (.png/.jpg/.webp/.gif/…).
 - Do NOT ask for permission in chat — call tools.`
 
+const IMAGE_GEN_RULES_ON = `
+- Image generation (Image mode ON):
+  1) To CREATE an image: call generate_image with a clear prompt (+ optional relative_path). Do not claim success without the tool.
+  2) After generate_image succeeds: do NOT read_file the PNG, do NOT write_file/edit it, do NOT describe pixels from disk. Note the saved path briefly.
+     If the user ALSO asked for code, HTML/CSS, other files, or further steps — CONTINUE those tools. Do not end the whole turn only because an image was saved.
+     Stop after the image ONLY when image creation was the sole request.
+  3) Keep image prompts focused — do not dump file contents or long plans into the prompt unless the user asked.
+`
+
+const IMAGE_GEN_RULES_OFF = `
+- Image generation is OFF. Do not call generate_image or create images until the user enables Image mode in the composer.
+`
+
 /** Exported for Context Usage estimates (without embedding in SYSTEM twice). */
-export { AGENT_RULES }
+export { AGENT_RULES, IMAGE_GEN_RULES_ON, IMAGE_GEN_RULES_OFF }
 
 const SYSTEM_CORE = `You are AFKLLM, a local coding agent inside a desktop IDE.
 You can read/write/delete files, create directories, search code, search the web (web_search: DuckDuckGo + Bing + Brave + Wikipedia + SO + HN), run shell commands, and call connected MCP tools (names starting with mcp__). Prefer built-in filesystem/shell tools over MCP equivalents.
 Prefer apply_patch for edits (apply_diff for one small replace). Be concise. When done, summarize what changed.
+Match the user's language in replies (Russian ↔ Russian, English ↔ English).
 IMPORTANT: Do NOT ask the user for permission to use tools. Call tools immediately when needed.`
 
 const SYSTEM_CONFIRM_CORE = `You are AFKLLM, a local coding agent inside a desktop IDE.
 You can read/write/delete files, create folders, search code, search the web (web_search: DuckDuckGo + Bing + Brave + Wikipedia + SO + HN), run shell commands, and call connected MCP tools (names starting with mcp__). Prefer built-in filesystem/shell tools over MCP equivalents.
 Shell commands open the IDE Terminal panel (visible). They may need a one-click confirm unless auto-approve is ON.
 Prefer apply_patch for edits (apply_diff for one small replace). Be concise. When done, summarize what changed.
+Match the user's language in replies (Russian ↔ Russian, English ↔ English).
 Do not ask in chat for permission to read or edit files — use tools directly.`
 
 const SYSTEM = `${SYSTEM_CORE}
@@ -327,8 +378,11 @@ Think-through protocol (mandatory while enabled):
    </think>
 2) Keep each <think> under ~120 words. Prefer concrete paths and commands.
 3) Then call tools or give the final user-facing answer (outside <think>).
+   CRITICAL: Never put the only answer inside <think>. Q&A, image descriptions, and summaries
+   must appear as normal text after </think>. If no tools are needed, a short <think> then the answer.
 4) Do not ask the user for permission inside <think> — decide and act.
 5) Intermediate conclusions are good: "build failed because X → try Y".
+6) Numbered lists: use real sequential numbers (1. 2. 3. …). Never restart every item at "1.".
 `
 
 export {
@@ -455,11 +509,97 @@ export function parseCodebaseMention(text: string): {
 }
 
 const FILE_ATTACH_MAX = 7_000
+/** Ceiling only — real size is ctx-aware via attachCharBudget(). */
+const DOC_ATTACH_MAX = 24_000
 const SELECTION_ATTACH_MAX = 4_000
+/** Cyrillic/technical text denser than Latin; be conservative for attach packing. */
+const ATTACH_CHARS_PER_TOKEN = 2.4
+
+function attachCharBudget(ctxSize: number, attachmentCount: number): number {
+  const ctx = ctxSize > 0 ? ctxSize : 8192
+  // system + tools schema + completion reserve leave a thin user-payload slice on 8k
+  const tokenBudget = Math.max(700, ctx - CTX_RESERVE_TOKENS - 3_400)
+  const total = Math.floor(tokenBudget * ATTACH_CHARS_PER_TOKEN)
+  const per = Math.floor(total / Math.max(1, attachmentCount))
+  return Math.min(DOC_ATTACH_MAX, Math.max(1_200, per))
+}
+
+/**
+ * Fit a document extract into maxChars without keeping only the TOC head.
+ * Skips dotted leaders / short numbered outline lines, then packs head+mid+tail.
+ */
+function packDocumentExtract(raw: string, maxChars: number): string {
+  const text = raw.replace(/\r\n/g, '\n').trim()
+  if (text.length <= maxChars) return text
+
+  const lines = text.split('\n')
+  const kept: string[] = []
+  let skippedToc = 0
+  for (const line of lines) {
+    const t = line.trim()
+    const looksToc =
+      (/\.{2,}\s*\d+\s*$/.test(t) && t.length < 120) ||
+      (/^(\d+[\d.]*)\s+\S/.test(t) && t.length < 70 && !/[.!?…]$/.test(t)) ||
+      (/^(Глава|Раздел|Section|Chapter)\s+[\d.]+/i.test(t) && t.length < 60)
+    if (looksToc && kept.length > 12) {
+      skippedToc++
+      if (skippedToc < 80) continue
+    } else {
+      skippedToc = 0
+    }
+    kept.push(line)
+  }
+  let body = kept.join('\n').trim()
+  if (body.length < Math.min(800, text.length * 0.2)) body = text
+  if (body.length <= maxChars) {
+    return skippedToc > 0 ? `${body}\n\n…(оглавление сжато)` : body
+  }
+
+  const head = Math.floor(maxChars * 0.34)
+  const mid = Math.floor(maxChars * 0.38)
+  const tail = Math.max(400, maxChars - head - mid - 24)
+  const midStart = Math.max(head, Math.floor((body.length - mid) / 2))
+  return (
+    body.slice(0, head).trimEnd() +
+    '\n\n…\n\n' +
+    body.slice(midStart, midStart + mid).trim() +
+    '\n\n…\n\n' +
+    body.slice(-tail).trimStart()
+  )
+}
 
 function truncateAttach(s: string, max: number): string {
   if (s.length <= max) return s
-  return s.slice(0, max) + '\n…(truncated)'
+  return s.slice(0, max) + '\n…'
+}
+
+async function llmCompressDocument(
+  queue: QueueManager,
+  name: string,
+  text: string
+): Promise<string> {
+  const sample = packDocumentExtract(text, 9_000)
+  try {
+    const res = await queue.compact({
+      messages: [
+        {
+          role: 'system',
+          content:
+            'Compress this document for Q&A continuity. Keep: product/system name, purpose, scope, key procedures, safety/limits, important numbers. Drop table-of-contents lists and repeated headings. Same language as the document. Max 320 words. Plain text only.'
+        },
+        {
+          role: 'user',
+          content: `Document: ${name}\n\n${sample}`
+        }
+      ],
+      maxTokens: 560
+    })
+    const out = (res.text ?? '').trim()
+    if (out.length > 80) return out
+  } catch {
+    /* fall through */
+  }
+  return packDocumentExtract(text, 3_500)
 }
 
 async function fetchCodebaseContext(query: string): Promise<string> {
@@ -846,6 +986,9 @@ function slimMessage(m: ApiMessage): ApiMessage {
   }
   if (apiContentText(m.content).length > 1_500 && (m.role === 'user' || m.role === 'assistant')) {
     const c = apiContentText(m.content)
+    if (m.role === 'user' && (/\[Document:/i.test(c) || /\[File:/i.test(c))) {
+      return { ...m, content: packDocumentExtract(c, 3_600) }
+    }
     return { ...m, content: c.slice(0, 900) + '\n…\n' + c.slice(-300) }
   }
   return m
@@ -861,8 +1004,18 @@ function nuclearFitMessages(msgs: ApiMessage[], ctxSize: number): ApiMessage[] {
     sysText = sysText.slice(0, COMPACT_SYSTEM_MAX_CHARS) + '\n…[system truncated]'
   }
   const lastUser = [...msgs].reverse().find((m) => m.role === 'user')
-  const userText = apiContentText(lastUser?.content ?? '').slice(0, 1_500) ||
-    'Continue the unfinished task. Prefer short tool calls. Do not read binary/image files as text.'
+  let userText = apiContentText(lastUser?.content ?? '')
+  if (/\[Document:/i.test(userText) || /\[File:/i.test(userText)) {
+    userText = packDocumentExtract(userText, 2_800)
+  } else {
+    userText =
+      userText.slice(0, 1_500) ||
+      'Continue the unfinished task. Prefer short tool calls. Do not read binary/image files as text.'
+  }
+  if (!userText.trim()) {
+    userText =
+      'Continue the unfinished task. Prefer short tool calls. Do not read binary/image files as text.'
+  }
   const out = normalizeApiMessages([
     { role: 'system', content: sysText },
     { role: 'user', content: userText }
@@ -1088,11 +1241,13 @@ async function buildApiMessages(
     reasoningBudgetMessage?: string
     agentAutoApprove?: boolean
     agentThinkThrough?: boolean
+    agentImageGenEnabled?: boolean
   },
   checklist?: AgentChecklist,
   selection?: EditorSelectionContext | null,
   attachments?: FileAttachment[],
-  mode: AgentTurnMode = 'agent'
+  mode: AgentTurnMode = 'agent',
+  ctxSize = 8192
 ): Promise<ApiMessage[]> {
   let system =
     mode === 'plan'
@@ -1110,6 +1265,9 @@ async function buildApiMessages(
   }
   if (mode !== 'plan' && settings?.agentThinkThrough !== false) {
     system += THINK_THROUGH
+  }
+  if (mode !== 'plan') {
+    system += settings?.agentImageGenEnabled ? IMAGE_GEN_RULES_ON : IMAGE_GEN_RULES_OFF
   }
   if (mode !== 'plan' && settings?.agentAutoApprove) {
     system +=
@@ -1204,16 +1362,30 @@ async function buildApiMessages(
 
   let attachBlock = ''
   if (attachments?.length) {
-    const parts: string[] = ['\n[Manually attached files]']
-    let budget = 14_000
+    const parts: string[] = [
+      '\n[User-attached files — primary source for this turn. Answer the user directly; do not narrate that a file was attached.]'
+    ]
+    const perDoc = attachCharBudget(ctxSize, attachments.length)
+    let budget = perDoc * Math.max(1, attachments.length)
     for (const a of attachments) {
       if (budget <= 0) {
         parts.push(`…(+${attachments.length - parts.length + 1} more truncated)`)
         break
       }
-      const body = truncateAttach(a.content ?? '', Math.min(FILE_ATTACH_MAX, budget))
+      const isDoc =
+        a.path.startsWith('document/') || a.path.startsWith('file/')
+      const label = a.path.startsWith('document/')
+        ? `Document: ${a.path.slice('document/'.length)}`
+        : a.path.startsWith('file/')
+          ? `File: ${a.path.slice('file/'.length)}`
+          : `File: ${a.path}`
+      const cap = isDoc ? Math.min(DOC_ATTACH_MAX, perDoc) : Math.min(FILE_ATTACH_MAX, perDoc)
+      const raw = a.content ?? ''
+      const body = isDoc
+        ? packDocumentExtract(raw, Math.min(cap, budget))
+        : truncateAttach(raw, Math.min(cap, budget))
       budget -= body.length
-      parts.push(`\n[Attached: ${a.path}]\n\`\`\`\n${body}\n\`\`\``)
+      parts.push(`\n[${label}]\n\`\`\`\n${body}\n\`\`\``)
     }
     attachBlock = parts.join('\n') + '\n'
   }
@@ -1445,6 +1617,9 @@ export async function runAgentTurn(params: {
   selection?: EditorSelectionContext | null
   attachments?: FileAttachment[]
   images?: ImageAttachment[]
+  documents?: DocumentAttachment[]
+  /** Cursor-style file pills on the user bubble */
+  files?: ChatFileRef[]
   onUpdate: (messages: ChatMessage[]) => void
   onStats?: (stats: ChatMessageStats) => void
   onOpenPath?: (relativePath: string) => void
@@ -1470,11 +1645,31 @@ export async function runAgentTurn(params: {
   const tAgent = (key: 'chat.agent.pausedRounds' | 'chat.agent.genTimeout', vars?: Record<string, string | number>) =>
     translate(uiLang, key, vars)
   const userMessageId = params.reverbContinue?.messageId ?? uid()
-  const imageRefs = (params.images ?? []).slice(0, 4).map((img) => ({
-    id: img.id,
-    path: img.path,
-    mime: img.mime,
-    ...(img.name ? { name: img.name } : {})
+  const docAttachments = (params.documents ?? []).slice(0, 4)
+  const docPageImages = docAttachments.flatMap((d) => d.pageImages ?? [])
+  const imageRefs = [...(params.images ?? []), ...docPageImages]
+    .slice(0, 4)
+    .map((img) => ({
+      id: img.id,
+      path: img.path,
+      mime: img.mime,
+      ...(img.name ? { name: img.name } : {})
+    }))
+  const docFileAttachments: FileAttachment[] = docAttachments
+    .filter((d) => d.text.trim())
+    .map((d) => ({
+      path: `document/${d.name}`,
+      content:
+        (d.note ? `(${d.note})\n` : '') + d.text
+    }))
+  const mergedAttachments = [...(params.attachments ?? []), ...docFileAttachments]
+  const fileRefs = (params.files ?? []).slice(0, 8).map((f) => ({
+    id: f.id,
+    path: f.path,
+    name: f.name,
+    mime: f.mime,
+    extLabel: f.extLabel,
+    kind: f.kind
   }))
   const messages: ChatMessage[] = [
     ...params.history.filter((m) => !m.pending && !m.streaming),
@@ -1482,7 +1677,8 @@ export async function runAgentTurn(params: {
       id: userMessageId,
       role: 'user',
       content: params.userText,
-      ...(imageRefs.length ? { images: imageRefs } : {})
+      ...(imageRefs.length ? { images: imageRefs } : {}),
+      ...(fileRefs.length ? { files: fileRefs } : {})
     }
   ]
   params.onUserMessageCreated?.(userMessageId)
@@ -1536,6 +1732,7 @@ export async function runAgentTurn(params: {
 
   const appSettings = await window.api.settings.get()
   params.queue.applySettings(appSettings)
+  const ctxSize = appSettings.ctxSize > 0 ? appSettings.ctxSize : 8192
 
   let checklist = buildChecklistFromHistory(params.history)
   removeChecklistBubbles(messages)
@@ -1553,7 +1750,7 @@ export async function runAgentTurn(params: {
         id: uid(),
         role: 'assistant',
         content:
-          'Images are attached, but no vision model is configured. Set Vision model (+ mmproj) in Settings → Multimodal, then retry.'
+          'Images or scanned document pages are attached, but no vision model is configured. Set Vision model (+ mmproj) in Settings → Multimodal, then retry.'
       })
       return finishWithTiming(messages)
     }
@@ -1566,8 +1763,12 @@ export async function runAgentTurn(params: {
       })
       if (params.signal?.aborted) return finishStopped()
       if (description.trim()) {
+        const label = docPageImages.length
+          ? '[Document page notes]'
+          : '[Image notes]'
         effectiveUserText =
-          `${effectiveUserText}\n\n[Attached image analysis]\n${description.trim()}`.trim()
+          `${effectiveUserText}\n\n${label}\n${description.trim()}\n\n` +
+          `(Reply to the user in their language, outside any <think> block. Do not narrate that an attachment exists.)`.trim()
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
@@ -1580,6 +1781,37 @@ export async function runAgentTurn(params: {
     }
   }
 
+  // LLM-compress oversized docs before packing into the prompt (keeps meaning on small ctx).
+  let preparedAttachments = mergedAttachments
+  if (mergedAttachments.length > 0) {
+    const per = attachCharBudget(ctxSize, mergedAttachments.length)
+    const next: FileAttachment[] = []
+    for (const a of mergedAttachments) {
+      const isDoc = a.path.startsWith('document/') || a.path.startsWith('file/')
+      const raw = a.content ?? ''
+      if (isDoc && raw.length > per * 1.35) {
+        const name = a.path.replace(/^(document|file)\//, '')
+        messages.push({
+          id: uid(),
+          role: 'assistant',
+          content:
+            '↻ Compressing attached document to fit context…'
+        })
+        params.onUpdate([...messages])
+        const compressed = await llmCompressDocument(params.queue, name, raw)
+        next.push({ path: a.path, content: compressed })
+      } else if (isDoc) {
+        next.push({ path: a.path, content: packDocumentExtract(raw, per) })
+      } else {
+        next.push({
+          path: a.path,
+          content: truncateAttach(raw, Math.min(FILE_ATTACH_MAX, per))
+        })
+      }
+    }
+    preparedAttachments = next
+  }
+
   let apiMessages: ApiMessage[] = await buildApiMessages(
     params.history,
     effectiveUserText,
@@ -1587,9 +1819,31 @@ export async function runAgentTurn(params: {
     appSettings,
     checklist,
     params.selection,
-    params.attachments,
-    isPlan ? 'plan' : 'agent'
+    preparedAttachments,
+    isPlan ? 'plan' : 'agent',
+    ctxSize
   )
+
+  // Fit before the first llama call — avoid burn a 400 then "Compacting…".
+  if (shouldCompactForOverflow(apiMessages, ctxSize)) {
+    messages.push({
+      id: uid(),
+      role: 'assistant',
+      content: `↻ Context near limit (${estimateTokens(apiMessages)}/${ctxSize} tok est.) — compacting before reply…`
+    })
+    params.onUpdate([...messages])
+    const compacted = await compactApiMessages(
+      apiMessages,
+      checklist,
+      params.queue,
+      ctxSize
+    )
+    apiMessages = compacted.messages
+    if (compacted.summary) upsertThreadSummary(messages, compacted.summary)
+    if (shouldCompactForOverflow(apiMessages, ctxSize)) {
+      apiMessages = nuclearFitMessages(apiMessages, ctxSize)
+    }
+  }
 
   let completedTools = 0
   let earlyDoneNudges = 0
@@ -1605,7 +1859,6 @@ export async function runAgentTurn(params: {
   let ranCliSmoke = false
   const incompleteAppendsByPath = new Map<string, number>()
   const identicalToolCounts = new Map<string, number>()
-  const ctxSize = appSettings.ctxSize > 0 ? appSettings.ctxSize : 8192
   const thinkThrough = !isPlan && appSettings.agentThinkThrough !== false
   const autoApprove = appSettings.agentAutoApprove === true
   const userWantsWebSearch =
@@ -1625,6 +1878,22 @@ export async function runAgentTurn(params: {
     } catch {
       /* keep builtins */
     }
+  }
+  if (!appSettings.agentImageGenEnabled) {
+    agentTools = agentTools.filter((tool) => {
+      const name =
+        tool &&
+        typeof tool === 'object' &&
+        'function' in tool &&
+        tool.function &&
+        typeof tool.function === 'object' &&
+        'name' in tool.function
+          ? String((tool.function as { name?: unknown }).name ?? '')
+          : tool && typeof tool === 'object' && 'name' in tool
+            ? String((tool as { name?: unknown }).name ?? '')
+            : ''
+      return name !== 'generate_image'
+    })
   }
 
   for (let round = 0; round < maxRounds; round++) {
@@ -1853,7 +2122,9 @@ export async function runAgentTurn(params: {
           : prevStats
         messages[sIdx] = {
           ...messages[sIdx],
-          content: result.text || messages[sIdx].content || '(empty)',
+          content: promoteThinkOnlyAnswer(
+            result.text || messages[sIdx].content || '(empty)'
+          ),
           streaming: false,
           stats: mergedStats
         }
@@ -1966,7 +2237,7 @@ export async function runAgentTurn(params: {
       const repairHint = isJsonToolError
         ? 'Previous tool JSON was invalid. Prefer apply_diff with a short unique search_block, or write_file with ≤800 chars. Do not resend a huge apply_patch.'
         : isOverflow
-          ? 'Context was compacted. Continue with short tool calls only. Never read .png/.jpg/.webp as text; never paste image bytes into write_file.'
+          ? 'Context was compacted to fit. Answer from the compressed document/notes still in this prompt. Do not dump a table of contents. Never read .png/.jpg/.webp as text.'
           : `Previous model response failed: ${errText.slice(0, 240)}\n` +
             'Continue the unfinished task. Prefer smaller write_file chunks and relative paths only. Never overwrite existing files — append=true or apply_diff.'
       if (last?.role === 'tool') {
@@ -2051,11 +2322,6 @@ export async function runAgentTurn(params: {
         content: result.text?.trim() ? result.text : null,
         tool_calls: toolCalls
       })
-
-      const imageGenOkPaths: string[] = []
-      let imageGenOnlyRound = toolCalls.every(
-        (c) => c.function.name === 'generate_image'
-      )
 
       for (const [index, call] of toolCalls.entries()) {
         const name = call.function.name as AgentToolName
@@ -2208,6 +2474,14 @@ export async function runAgentTurn(params: {
             error:
               parsedArgs.parseError +
               ' REQUIRED: rewrite with a smaller write_file chunk (or append=true on the same path).'
+          }
+        } else if (name === 'generate_image' && !appSettings.agentImageGenEnabled) {
+          toolResult = {
+            id: call.id,
+            name,
+            ok: false,
+            content: '',
+            error: 'Image mode is off. Turn on Image in the composer to allow generate_image.'
           }
         } else if (
           name === 'write_file' &&
@@ -2432,8 +2706,7 @@ export async function runAgentTurn(params: {
             toolResult.filePath ||
             (typeof args.relative_path === 'string' ? args.relative_path : 'generated/image.png')
           if (toolResult.ok) {
-            imageGenOkPaths.push(out.replace(/\\/g, '/'))
-            content = `OK: saved ${out.replace(/\\/g, '/')}. IMAGE_DONE — do not read_file or edit.`
+            content = `OK: saved ${out.replace(/\\/g, '/')}. IMAGE_DONE — do not read_file or edit the PNG. Continue other requested work if any.`
           } else {
             content = `ERROR: ${(toolResult.error || 'image gen failed').slice(0, 400)}`
           }
@@ -2655,24 +2928,9 @@ export async function runAgentTurn(params: {
         // Users open paths from chat file chips / explorer when they want a tab.
       }
 
-      // Image-only turns: do not call the LLM again (avoids context compact storms).
-      if (
-        imageGenOnlyRound &&
-        imageGenOkPaths.length > 0 &&
-        imageGenOkPaths.length === toolCalls.length
-      ) {
-        const paths = imageGenOkPaths.join(', ')
-        messages.push({
-          id: uid(),
-          role: 'assistant',
-          content:
-            imageGenOkPaths.length === 1
-              ? `Saved \`${paths}\`.`
-              : `Saved images: ${paths}.`
-        })
-        params.onUpdate([...messages])
-        return finishWithTiming(messages)
-      }
+      // After generate_image-only rounds, still let the model continue when the
+      // user asked for more than images (landing page + hero, etc.).
+      // (Former early-return stopped mixed tasks after the first PNG.)
 
       // Hints on tool result — inserting `user` after `tool` breaks Devstral Jinja
       const lastTool = apiMessages[apiMessages.length - 1]
@@ -2681,7 +2939,7 @@ export async function runAgentTurn(params: {
         if (/IMAGE_DONE/i.test(tc)) {
           appendToolHint(
             apiMessages,
-            'IMAGE_DONE: do not read_file the PNG. One short confirmation only, then stop.'
+            'IMAGE_DONE: do not read_file/edit the PNG. If the user also asked for code or other files, continue those tools now. If the request was image-only, one short confirmation is enough.'
           )
         } else if (/INCOMPLETE_WRITE_LIMIT/i.test(tc)) {
           appendToolHint(
@@ -2756,7 +3014,7 @@ export async function runAgentTurn(params: {
     }
 
     // Final assistant text must enter apiMessages before any follow-up user nudge
-    const finalText = (result.text ?? '').trim()
+    const finalText = promoteThinkOnlyAnswer((result.text ?? '').trim())
     if (finalText) {
       const lastApi = apiMessages[apiMessages.length - 1]
       if (lastApi?.role === 'assistant' && !lastApi.tool_calls?.length) {

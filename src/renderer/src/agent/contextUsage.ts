@@ -3,6 +3,8 @@ import { THREAD_SUMMARY_MSG_ID } from '../../../shared/chats'
 import type { ChatMessage } from './runAgentTurn'
 import {
   AGENT_RULES,
+  IMAGE_GEN_RULES_OFF,
+  IMAGE_GEN_RULES_ON,
   SYSTEM_CONFIRM_CORE,
   SYSTEM_CORE,
   SYSTEM_PLAN,
@@ -58,6 +60,7 @@ export interface EstimateContextUsageInput {
   promptTokens?: number | null
   agentAutoApprove?: boolean
   agentThinkThrough?: boolean
+  agentImageGenEnabled?: boolean
   planMode?: boolean
   systemPromptExtra?: string
   projectRules?: string
@@ -98,8 +101,15 @@ export function estimateContextUsage(input: EstimateContextUsageInput): ContextU
   if (!input.planMode && input.agentThinkThrough !== false) {
     rulesText += THINK_THROUGH
   }
+  if (!input.planMode) {
+    rulesText += input.agentImageGenEnabled ? IMAGE_GEN_RULES_ON : IMAGE_GEN_RULES_OFF
+  }
 
-  const toolsText = TOOLS_JSON
+  const toolsText = input.agentImageGenEnabled
+    ? TOOLS_JSON
+    : JSON.stringify(
+        AGENT_TOOL_SCHEMAS.filter((t) => t.function?.name !== 'generate_image')
+      )
   const mcpText = input.mcpToolsJson?.trim() ?? ''
 
   let summaryText = ''

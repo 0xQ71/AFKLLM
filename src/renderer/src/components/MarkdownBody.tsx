@@ -22,7 +22,7 @@ export function MarkdownBody({
 type MdBlock =
   | { type: 'code'; lang?: string; code: string }
   | { type: 'ul'; items: string[] }
-  | { type: 'ol'; items: string[] }
+  | { type: 'ol'; items: Array<{ n: number; text: string }> }
   | { type: 'h'; level: 1 | 2 | 3; text: string }
   | { type: 'p'; text: string }
 
@@ -68,10 +68,18 @@ function splitBlocks(src: string): MdBlock[] {
     }
 
     if (/^\s*\d+\.\s+/.test(line)) {
-      const items: string[] = []
-      while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i]!)) {
-        items.push(lines[i]!.replace(/^\s*\d+\.\s+/, ''))
-        i++
+      const items: Array<{ n: number; text: string }> = []
+      while (i < lines.length) {
+        const cur = lines[i]!
+        if (/^\s*\d+\.\s+/.test(cur)) {
+          const m = cur.match(/^\s*(\d+)\.\s+(.*)$/)!
+          items.push({ n: Number(m[1]), text: m[2]! })
+          i++
+          // Loose list: blank lines (and short continuations) between items
+          while (i < lines.length && !lines[i]!.trim()) i++
+          continue
+        }
+        break
       }
       out.push({ type: 'ol', items })
       continue
@@ -127,12 +135,19 @@ function Block({ block }: { block: MdBlock }): React.JSX.Element {
     )
   }
   if (block.type === 'ol') {
+    // Preserve source numbers (1. 2. 3.) — CSS list-decimal restarts at 1 for each
+    // separate <ol>, which breaks when the model puts blank lines between items.
     return (
-      <ol className="list-decimal space-y-0.5 pl-5">
+      <div className="space-y-1">
         {block.items.map((it, i) => (
-          <li key={i}>{inlineMd(it)}</li>
+          <div key={i} className="flex gap-2 pl-0.5">
+            <span className="w-5 shrink-0 text-right font-mono text-[12px] tabular-nums text-ink-mute">
+              {it.n}.
+            </span>
+            <div className="min-w-0 flex-1">{inlineMd(it.text)}</div>
+          </div>
         ))}
-      </ol>
+      </div>
     )
   }
   return (

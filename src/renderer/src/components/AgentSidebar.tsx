@@ -23,6 +23,8 @@ interface AgentSidebarProps {
   onRequestFolderForSend?: (text: string) => void
   pendingSendSignal?: { text: string; nonce: number; restoreOnly?: boolean } | null
   onOpenFolder?: () => void
+  onOpenImagePreview?: (url: string, name?: string) => void
+  onOpenImageGenSettings?: () => void
 }
 
 export function AgentSidebar(props: AgentSidebarProps): React.JSX.Element {

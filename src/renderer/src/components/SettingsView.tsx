@@ -671,6 +671,15 @@ function AgentPage({
           checked={settings.agentThinkThrough !== false}
           onChange={(v) => patch('agentThinkThrough', v)}
         />
+        <Toggle
+          title={t('settings.agent.imageGen')}
+          checked={settings.agentImageGenEnabled === true}
+          onChange={(v) => {
+            patch('agentImageGenEnabled', v)
+            void window.api.settings.save({ agentImageGenEnabled: v })
+          }}
+        />
+        <p className="px-1 text-[11px] text-ink-mute">{t('settings.agent.imageGenHint')}</p>
       </Well>
     </>
   )
@@ -850,6 +859,7 @@ function ModelPage({
         </SettingRow>
       </Well>
       <PageIntro>{t('settings.multimodal.intro')}</PageIntro>
+      <p className="mb-2 text-[11px] text-ink-mute">{t('settings.multimodal.agentGateHint')}</p>
       <Well>
         <Field label={t('settings.multimodal.visionModel')}>
           <div className="flex gap-2">

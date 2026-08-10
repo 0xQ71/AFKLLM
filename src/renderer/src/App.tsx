@@ -14,7 +14,8 @@ import {
 import { InlineEditModal } from './editor/InlineEditModal'
 import { createTab, type EditorTab } from './editor/tabs'
 import { SettingsView } from './components/SettingsView'
-import { ModelWizard } from './components/ModelWizard'
+import { OnboardingWizard } from './components/OnboardingWizard'
+import type { SettingsPageId } from './components/settings/nav'
 import { RuntimeProgressOverlay } from './components/RuntimeProgressOverlay'
 import {
   ChangelogModal,
@@ -80,7 +81,7 @@ export default function App(): React.JSX.Element {
   const lspDisposable = useRef<Monaco.IDisposable | null>(null)
   const bpDisposable = useRef<Monaco.IDisposable | null>(null)
   const saveRef = useRef<() => void>(() => undefined)
-  const openSettingsRef = useRef<() => void>(() => undefined)
+  const openSettingsRef = useRef<(page?: SettingsPageId) => void>(() => undefined)
   const breakpointsRef = useRef<Map<string, Set<number>>>(new Map())
   const currentLineDecoRef = useRef<string[]>([])
   const [inlineOpen, setInlineOpen] = useState(false)
@@ -94,6 +95,7 @@ export default function App(): React.JSX.Element {
   const [appVersion, setAppVersion] = useState('')
   const [statusBarVisible, setStatusBarVisible] = useState(true)
   const [wizardOpen, setWizardOpen] = useState(false)
+  const [settingsInitialPage, setSettingsInitialPage] = useState<SettingsPageId>('general')
   const [terminalOpen, setTerminalOpen] = useState(false)
   const [ideOpen, setIdeOpen] = useState(false)
   const [browserOpen, setBrowserOpen] = useState(false)
@@ -266,13 +268,17 @@ export default function App(): React.JSX.Element {
     []
   )
 
-  const openSettings = useCallback((): void => {
-    if (isAgentGenerationBusy()) {
-      showBusyBlockHint(t('confirm.busyBlockSettings'))
-      return
-    }
-    setSettingsOpen(true)
-  }, [showBusyBlockHint, t])
+  const openSettings = useCallback(
+    (page?: SettingsPageId): void => {
+      if (isAgentGenerationBusy()) {
+        showBusyBlockHint(t('confirm.busyBlockSettings'))
+        return
+      }
+      setSettingsInitialPage(page ?? 'general')
+      setSettingsOpen(true)
+    },
+    [showBusyBlockHint, t]
+  )
   openSettingsRef.current = openSettings
 
   const unloadModel = async (): Promise<void> => {
@@ -1444,6 +1450,8 @@ export default function App(): React.JSX.Element {
                 onRequestFolderForSend={requestFolderForSend}
                 pendingSendSignal={pendingSendSignal}
                 onOpenFolder={() => void openFolder()}
+                onOpenImagePreview={(url, name) => setImagePreview({ url, name })}
+                onOpenImageGenSettings={() => openSettings('agent')}
               />
             </div>
 
@@ -1873,10 +1881,14 @@ export default function App(): React.JSX.Element {
         <div className="absolute inset-0 z-[85] flex flex-col bg-ink-950">
           <SettingsView
             open
-            onClose={() => setSettingsOpen(false)}
+            onClose={() => {
+              setSettingsOpen(false)
+              setSettingsInitialPage('general')
+            }}
             llmStatus={status}
             onLoadModel={reloadModel}
             onUnloadModel={unloadModel}
+            initialPage={settingsInitialPage}
           />
         </div>
       ) : null}
@@ -1894,7 +1906,11 @@ export default function App(): React.JSX.Element {
         onOpenFile={(p) => void openFile(p)}
         commands={paletteCommands}
       />
-      <ModelWizard open={wizardOpen} onComplete={() => setWizardOpen(false)} />
+      <OnboardingWizard
+        open={wizardOpen}
+        onComplete={() => setWizardOpen(false)}
+        onOpenSettings={(page) => openSettings(page ?? 'model')}
+      />
       <ChangelogModal
         open={changelog.open}
         version={changelog.version}
