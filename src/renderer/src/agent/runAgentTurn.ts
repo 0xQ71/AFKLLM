@@ -274,14 +274,16 @@ const AGENT_RULES = `
 Rules for multi-file work (critical):
 - Paths MUST be relative to the project root (e.g. engineering_calc/main.py). Never use absolute paths like D:\\...
 - Finish ONE file completely before starting another. If a write returns INCOMPLETE_WRITE or FILE_EXISTS, fix THAT path first (append=true) — never invent a sibling filename.
-- write_file on an existing non-empty file is REJECTED unless append=true (or rare overwrite=true). Prefer apply_patch for edits (multi-hunk / multi-file); apply_diff for a single unique replace.
+- Small files (< ~150 lines / ~6KB, e.g. index.html, styles.css, short scripts): prefer write_file with overwrite=true for edits — full rewrite is cheaper and more reliable than patch.
+- Large files: write_file on an existing non-empty file is REJECTED unless append=true (or rare overwrite=true). Prefer apply_patch for edits (multi-hunk / multi-file); apply_diff for a single unique replace.
 - Corrections / bugfixes / "это не так" / pointing out mistakes (critical):
   1) read_file (or search_codebase) the existing file first — do NOT guess from memory.
-  2) Change ONLY the broken part with apply_patch (Codex *** Begin Patch hunks) or apply_diff (small unique search_block → replace_block).
-  3) Or append missing pieces with write_file append=true.
-  FORBIDDEN on corrections: recreating the whole file/page/app from scratch, write_file overwrite=true, new duplicate filenames, "let me rewrite the landing".
-  Full overwrite is allowed ONLY if the user explicitly asks to rewrite/regenerate the entire file.
-- If apply_patch / apply_diff fails: read_file again, use a tighter unique hunk / shorter search_block, retry. Do NOT fall back to rewriting the whole file unless the user asked for a full rewrite.
+  2) Small files → write_file overwrite=true with the full corrected content.
+  3) Large files → Change ONLY the broken part with apply_patch (Codex *** Begin Patch hunks) or apply_diff (small unique search_block → replace_block).
+  4) Or append missing pieces with write_file append=true.
+  FORBIDDEN on corrections for LARGE files: recreating the whole file/page/app from scratch, inventing duplicate filenames.
+  Full overwrite of large files is allowed ONLY if the user explicitly asks to rewrite/regenerate the entire file, OR after two failed apply_patch/apply_diff attempts on that path.
+- If apply_patch / apply_diff fails twice on the same path: switch to write_file overwrite=true (especially for small HTML/CSS). Do NOT keep retrying the same broken hunk.
 - Unclear repo layout or “where is X?”: call explore_subagent with a clear goal before large edits (read-only research report).
 - NEVER invent duplicate modules (thermodynamic.py vs thermodynamics.py). list_directory / read_file first.
 - Keep each write_file chunk modest (~1200–1500 chars of code). Large files = stub + several append=true calls until the file is syntactically complete.
@@ -323,11 +325,13 @@ Rules for multi-file work (critical):
 
 const IMAGE_GEN_RULES_ON = `
 - Image generation (Image mode ON):
-  1) To CREATE an image: call generate_image with a clear prompt (+ optional relative_path). Do not claim success without the tool.
+  1) To CREATE an image: call generate_image ONCE with a clear prompt (+ optional relative_path). Use Settings size (often 1024²); do not invent huge resolutions.
   2) After generate_image succeeds: do NOT read_file the PNG, do NOT write_file/edit it, do NOT describe pixels from disk. Note the saved path briefly.
      If the user ALSO asked for code, HTML/CSS, other files, or further steps — CONTINUE those tools. Do not end the whole turn only because an image was saved.
      Stop after the image ONLY when image creation was the sole request.
-  3) Keep image prompts focused — do not dump file contents or long plans into the prompt unless the user asked.
+  3) If generate_image FAILS, times out, or returns a blank/white image: do NOT call generate_image again this turn. Finish HTML/CSS with a CSS gradient / placeholder and say the image step failed.
+  4) NEVER generate_image or write_file for favicon.ico / favicon.png — skip favicon or use a tiny inline SVG in HTML.
+  5) Keep image prompts focused — do not dump file contents or long plans into the prompt unless the user asked.
 `
 
 const IMAGE_GEN_RULES_OFF = `
@@ -339,14 +343,17 @@ export { AGENT_RULES, IMAGE_GEN_RULES_ON, IMAGE_GEN_RULES_OFF }
 
 const SYSTEM_CORE = `You are AFKLLM, a local coding agent inside a desktop IDE.
 You can read/write/delete files, create directories, search code, search the web (web_search: DuckDuckGo + Bing + Brave + Wikipedia + SO + HN), run shell commands, and call connected MCP tools (names starting with mcp__). Prefer built-in filesystem/shell tools over MCP equivalents.
-Prefer apply_patch for edits (apply_diff for one small replace). Be concise. When done, summarize what changed.
-Match the user's language in replies (Russian ↔ Russian, English ↔ English).
+- Small files (< ~150 lines / HTML, CSS, short scripts): prefer write_file overwrite=true for edits. apply_patch / apply_diff only for large files.
+- Prefer apply_patch for large-file edits (apply_diff for one small replace). Be concise. When done, summarize what changed.
+- Existing files (critical): if index.html / styles.css / the requested page already exists and roughly matches the task, FIX it (small file → overwrite; large → apply_patch) — do NOT invent extra pages (pricing.html, contact.html) unless the user asked.
+- Match the user's language in replies (Russian ↔ Russian, English ↔ English).
 IMPORTANT: Do NOT ask the user for permission to use tools. Call tools immediately when needed.`
 
 const SYSTEM_CONFIRM_CORE = `You are AFKLLM, a local coding agent inside a desktop IDE.
 You can read/write/delete files, create folders, search code, search the web (web_search: DuckDuckGo + Bing + Brave + Wikipedia + SO + HN), run shell commands, and call connected MCP tools (names starting with mcp__). Prefer built-in filesystem/shell tools over MCP equivalents.
 Shell commands open the IDE Terminal panel (visible). They may need a one-click confirm unless auto-approve is ON.
-Prefer apply_patch for edits (apply_diff for one small replace). Be concise. When done, summarize what changed.
+Small files (< ~150 lines): prefer write_file overwrite=true. Large files: prefer apply_patch (apply_diff for one small replace). Be concise. When done, summarize what changed.
+- Existing files (critical): if the target files already exist, patch or overwrite them — do not add unrequested pages.
 Match the user's language in replies (Russian ↔ Russian, English ↔ English).
 Do not ask in chat for permission to read or edit files — use tools directly.`
 
@@ -412,9 +419,10 @@ const SURGICAL_EDIT_HINT = `
 [SURGICAL_EDIT — mandatory]
 The user is correcting existing work, not requesting a new project.
 1) read_file / search_codebase the relevant existing file(s) first.
-2) Fix ONLY the inaccurate part with apply_diff (small exact search_block).
-3) Missing pieces → write_file append=true on the SAME path.
-FORBIDDEN: write_file overwrite=true, regenerating the whole page/app, new duplicate filenames.
+2) Small files (< ~150 lines / HTML, CSS): write_file overwrite=true with the full corrected content.
+3) Large files: Fix ONLY the inaccurate part with apply_diff (small exact search_block) or apply_patch.
+4) Missing pieces → write_file append=true on the SAME path.
+FORBIDDEN: inventing duplicate filenames; regenerating an entire multi-file project from scratch.
 `
 
 const DEFAULT_MAX_ROUNDS = 64
@@ -423,8 +431,12 @@ const TOOL_RESULT_CHARS = 6_000
 const AGENT_MAX_TOKENS = 8192
 /** Cyrillic/code runs denser than English. */
 const CHARS_PER_TOKEN = 3.2
-/** Headroom for tools schema + next completion. */
-const CTX_RESERVE_TOKENS = 2_800
+/**
+ * Compact only when prompt is actually near the model ctx — NOT after every file write.
+ * Reserve a thin completion slice; old 2800 reserve fired compact around ~30–40% fill.
+ */
+const CTX_COMPACT_RATIO = 0.9
+const CTX_RESERVE_TOKENS = 900
 /** Cap forced append loops on the same path when stream was truncated. */
 const MAX_INCOMPLETE_APPENDS_PER_PATH = 6
 /** Identical tool+args repeats before TOOL_LOOP. */
@@ -436,6 +448,12 @@ const MAX_TOOL_ARG_CHARS = 48_000
 const MAX_MISSING_PATH_HITS = 3
 /** Stop overflow compact/retry loops that inflate context. */
 const MAX_OVERFLOW_REPAIRS = 2
+/** Transient llama disconnects (fetch failed) before giving up the turn. */
+const MAX_FETCH_REPAIRS = 3
+/** Small-file overwrite is allowed even on correction turns. */
+const SMALL_FILE_OVERWRITE_CHARS = 6000
+/** Failed apply_patch/apply_diff on one path before suggesting overwrite. */
+const MAX_PATCH_FAILS_BEFORE_OVERWRITE = 2
 /** Hard cap for system prompt after compact. */
 const COMPACT_SYSTEM_MAX_CHARS = 6_000
 const COMPACT_TAIL_MAX_MSGS = 6
@@ -518,7 +536,7 @@ const ATTACH_CHARS_PER_TOKEN = 2.4
 function attachCharBudget(ctxSize: number, attachmentCount: number): number {
   const ctx = ctxSize > 0 ? ctxSize : 8192
   // system + tools schema + completion reserve leave a thin user-payload slice on 8k
-  const tokenBudget = Math.max(700, ctx - CTX_RESERVE_TOKENS - 3_400)
+  const tokenBudget = Math.max(700, Math.floor(ctx * 0.45))
   const total = Math.floor(tokenBudget * ATTACH_CHARS_PER_TOKEN)
   const per = Math.floor(total / Math.max(1, attachmentCount))
   return Math.min(DOC_ATTACH_MAX, Math.max(1_200, per))
@@ -936,8 +954,48 @@ function estimateTokens(msgs: ApiMessage[]): number {
 
 function shouldCompactForOverflow(msgs: ApiMessage[], ctxSize: number): boolean {
   const ctx = ctxSize > 0 ? ctxSize : 8192
-  const budget = Math.max(2048, ctx - CTX_RESERVE_TOKENS)
+  const budget = Math.max(
+    4096,
+    Math.floor(ctx * CTX_COMPACT_RATIO) - CTX_RESERVE_TOKENS
+  )
   return estimateTokens(msgs) >= budget
+}
+
+/** Drop bulky write/patch payloads from history so we don't compact after every file. */
+function slimCompletedWriteToolCalls(msgs: ApiMessage[]): void {
+  for (let i = 0; i < msgs.length; i++) {
+    const m = msgs[i]
+    if (m?.role !== 'assistant' || !m.tool_calls?.length) continue
+    let changed = false
+    const nextCalls = m.tool_calls.map((t) => {
+      const name = t.function.name
+      if (
+        name !== 'write_file' &&
+        name !== 'apply_patch' &&
+        name !== 'apply_diff' &&
+        name !== 'generate_image'
+      ) {
+        return t
+      }
+      const argsJson = t.function.arguments || ''
+      if (argsJson.length < 500) return t
+      const path = extractJsonStringField(argsJson, 'relative_path')
+      changed = true
+      return {
+        ...t,
+        function: {
+          ...t.function,
+          arguments: JSON.stringify({
+            ...(path ? { relative_path: path } : {}),
+            note: '[body omitted — file is on disk]'
+          })
+        }
+      }
+    })
+    if (changed) {
+      msgs[i] = { ...m, tool_calls: nextCalls }
+    }
+  }
 }
 
 function slimToolArgs(name: string, argsJson: string): string {
@@ -1824,12 +1882,14 @@ export async function runAgentTurn(params: {
     ctxSize
   )
 
-  // Fit before the first llama call — avoid burn a 400 then "Compacting…".
+  // Only compact before the first call if we are already near the hard ceiling.
+  slimCompletedWriteToolCalls(apiMessages)
   if (shouldCompactForOverflow(apiMessages, ctxSize)) {
+    const beforeTok = estimateTokens(apiMessages)
     messages.push({
       id: uid(),
       role: 'assistant',
-      content: `↻ Context near limit (${estimateTokens(apiMessages)}/${ctxSize} tok est.) — compacting before reply…`
+      content: `↻ Context near limit (${beforeTok}/${ctxSize} tok est.) — compacting before reply…`
     })
     params.onUpdate([...messages])
     const compacted = await compactApiMessages(
@@ -1850,6 +1910,7 @@ export async function runAgentTurn(params: {
   let roleRepairAttempts = 0
   let jsonRepairAttempts = 0
   let overflowRepairs = 0
+  let fetchRepairs = 0
   let markupRepairAttempts = 0
   let toolLoopHits = 0
   let missingPathHits = 0
@@ -1859,6 +1920,10 @@ export async function runAgentTurn(params: {
   let ranCliSmoke = false
   const incompleteAppendsByPath = new Map<string, number>()
   const identicalToolCounts = new Map<string, number>()
+  /** Failed apply_patch / apply_diff counts per path — unlock overwrite after 2. */
+  const patchFailsByPath = new Map<string, number>()
+  /** Hard cap — model must not restart image gen mid-turn (even with a tweaked prompt). */
+  let generateImageCalls = 0
   const thinkThrough = !isPlan && appSettings.agentThinkThrough !== false
   const autoApprove = appSettings.agentAutoApprove === true
   const userWantsWebSearch =
@@ -1900,8 +1965,10 @@ export async function runAgentTurn(params: {
     if (params.signal?.aborted) return finishStopped()
     clearPlanningRows(messages)
 
-    // Compact only on context overflow — never on a timer / per-file
+    // Compact ONLY when truly near ctx — never after every successful file write.
+    slimCompletedWriteToolCalls(apiMessages)
     if (round > 0 && shouldCompactForOverflow(apiMessages, ctxSize)) {
+      const beforeTok = estimateTokens(apiMessages)
       const compacted = await compactApiMessages(
         apiMessages,
         checklist,
@@ -1916,7 +1983,7 @@ export async function runAgentTurn(params: {
       messages.push({
         id: uid(),
         role: 'assistant',
-        content: `↻ Context near limit (${estimateTokens(apiMessages)}/${ctxSize} tok est.) — compacted to continue…`
+        content: `↻ Context near limit (${beforeTok}/${ctxSize} tok est.) — compacted to continue…`
       })
       params.onUpdate([...messages])
     }
@@ -2184,23 +2251,31 @@ export async function runAgentTurn(params: {
       )
       const isOverflow =
         /context|overflow|oom|too many tokens|n_keep|exceed|413/i.test(errText)
+      const isFetchGlitch =
+        /fetch failed|ECONNREFUSED|ECONNRESET|socket hang up|other side closed|UND_ERR/i.test(
+          errText
+        )
 
       if (isRoleError) roleRepairAttempts++
       else roleRepairAttempts = 0
       if (isJsonToolError) jsonRepairAttempts++
       else if (!isRoleError) jsonRepairAttempts = 0
       if (isOverflow) overflowRepairs++
+      if (isFetchGlitch) fetchRepairs++
 
       const overflowBudgetOk = !isOverflow || overflowRepairs <= MAX_OVERFLOW_REPAIRS
+      const fetchBudgetOk = !isFetchGlitch || fetchRepairs <= MAX_FETCH_REPAIRS
       const repairBudgetOk =
         (!isRoleError || roleRepairAttempts <= 2) &&
         (!isJsonToolError || jsonRepairAttempts <= 2) &&
-        overflowBudgetOk
+        overflowBudgetOk &&
+        fetchBudgetOk
       const recoverable =
         repairBudgetOk &&
         (isRoleError ||
           isOverflow ||
           isJsonToolError ||
+          isFetchGlitch ||
           /timed?\s*out/i.test(errText)) &&
         round < maxRounds - 1
 
@@ -2208,7 +2283,15 @@ export async function runAgentTurn(params: {
         id: uid(),
         role: 'assistant',
         content: recoverable
-          ? `⚠ ${errText.slice(0, 500)}\n${isOverflow ? 'Compacting…' : isJsonToolError ? 'Retry with smaller tool args…' : 'Repairing message roles…'} retrying`
+          ? `⚠ ${errText.slice(0, 500)}\n${
+              isFetchGlitch
+                ? 'Chat server hiccup — retrying…'
+                : isOverflow
+                  ? 'Compacting…'
+                  : isJsonToolError
+                    ? 'Retry with smaller tool args…'
+                    : 'Repairing message roles…'
+            } retrying`
           : isOverflow && !overflowBudgetOk
             ? `Error: context still exceeds ${ctxSize} tokens after ${MAX_OVERFLOW_REPAIRS} compact attempts. Start a new chat or raise ctx size. Do not read image/binary files as text.`
             : `Error: ${errText.slice(0, 800)}`
@@ -2216,6 +2299,11 @@ export async function runAgentTurn(params: {
       params.onUpdate([...messages])
 
       if (!recoverable) return finishWithTiming(messages)
+
+      if (isFetchGlitch) {
+        await new Promise((r) => setTimeout(r, 600 * fetchRepairs))
+        continue
+      }
 
       if (isOverflow || shouldCompactForOverflow(apiMessages, ctxSize)) {
         const compacted = await compactApiMessages(
@@ -2403,9 +2491,14 @@ export async function runAgentTurn(params: {
         const fp = fingerprintToolCall(name, args)
         const identicalCount = (identicalToolCounts.get(fp) ?? 0) + 1
         identicalToolCounts.set(fp, identicalCount)
+        if (name === 'generate_image') generateImageCalls++
         const identicalLimit =
-          name === 'create_directory' ? MAX_IDENTICAL_TOOL_CALLS : MAX_IDENTICAL_TOOL_CALLS + 1
-        if (identicalCount > identicalLimit) {
+          name === 'generate_image'
+            ? 1
+            : name === 'create_directory'
+              ? MAX_IDENTICAL_TOOL_CALLS
+              : MAX_IDENTICAL_TOOL_CALLS + 1
+        if (name === 'generate_image' && generateImageCalls > 1) {
           toolLoopHits++
           toolResult = {
             id: call.id,
@@ -2413,9 +2506,21 @@ export async function runAgentTurn(params: {
             ok: false,
             content: '',
             error:
-              `TOOL_LOOP: identical ${name} repeated ${identicalCount} times` +
-              (filePath ? ` on "${filePath}"` : '') +
-              '. Stop repeating. Continue with a different file/step or finish the task.'
+              'TOOL_LOOP: generate_image already ran this turn (including any internal retry). Do NOT call it again — finish HTML/CSS with a CSS/placeholder visual.'
+          }
+        } else if (identicalCount > identicalLimit) {
+          toolLoopHits++
+          toolResult = {
+            id: call.id,
+            name,
+            ok: false,
+            content: '',
+            error:
+              name === 'generate_image'
+                ? 'TOOL_LOOP: generate_image already attempted. Do NOT retry image gen — finish HTML/CSS with a placeholder and move on.'
+                : `TOOL_LOOP: identical ${name} repeated ${identicalCount} times` +
+                  (filePath ? ` on "${filePath}"` : '') +
+                  '. Stop repeating. Continue with a different file/step or finish the task.'
           }
         } else if (name === 'explore_subagent') {
           const explore = await runExploreSubagent({
@@ -2547,7 +2652,9 @@ export async function runAgentTurn(params: {
           args.overwrite === true &&
           !args.append &&
           looksLikeCorrection(params.userText) &&
-          !looksLikeExplicitRewrite(params.userText)
+          !looksLikeExplicitRewrite(params.userText) &&
+          contentStr.length >= SMALL_FILE_OVERWRITE_CHARS &&
+          (patchFailsByPath.get(pathKey) ?? 0) < MAX_PATCH_FAILS_BEFORE_OVERWRITE
         ) {
           toolResult = {
             id: call.id,
@@ -2555,8 +2662,8 @@ export async function runAgentTurn(params: {
             ok: false,
             content: '',
             error:
-              'OVERWRITE_BLOCKED: this turn is a correction. Call read_file, then apply_patch (or apply_diff) on the existing file. ' +
-              'overwrite=true is only allowed if the user explicitly asks to rewrite the whole file.'
+              'OVERWRITE_BLOCKED: this turn is a correction on a large file. Call read_file, then apply_patch (or apply_diff). ' +
+              'For small files (<6KB) overwrite=true is allowed; after two failed patches on this path, overwrite is also allowed.'
           }
         } else if (name === 'write_file' && codeIncomplete && pathStr && contentStr) {
           const appendN = (incompleteAppendsByPath.get(pathKey) ?? 0) + 1
@@ -2692,6 +2799,37 @@ export async function runAgentTurn(params: {
           }
         }
 
+        // Track apply_patch / apply_diff failures → unlock overwrite after 2 fails.
+        if (
+          (name === 'apply_patch' || name === 'apply_diff') &&
+          !toolResult.ok
+        ) {
+          const failPath = (
+            toolResult.editReview?.path ||
+            (typeof args.relative_path === 'string' ? args.relative_path : '') ||
+            filePath ||
+            ''
+          )
+            .replace(/\\/g, '/')
+            .trim()
+          if (failPath) {
+            const n = (patchFailsByPath.get(failPath) ?? 0) + 1
+            patchFailsByPath.set(failPath, n)
+            if (n >= MAX_PATCH_FAILS_BEFORE_OVERWRITE) {
+              const hint =
+                `PATCH_FAIL_LIMIT: apply_patch/apply_diff failed ${n} times on "${failPath}". ` +
+                `NOW use write_file with overwrite=true and the full corrected file content. Do not retry the same hunk.`
+              toolResult = {
+                ...toolResult,
+                content: `${toolResult.content || ''}\n${hint}`.trim(),
+                error: toolResult.error
+                  ? `${toolResult.error}\n${hint}`
+                  : hint
+              }
+            }
+          }
+        }
+
         applyToolToChecklist(checklist, name, args, toolResult)
 
         let content = toolResult.ok
@@ -2708,8 +2846,19 @@ export async function runAgentTurn(params: {
           if (toolResult.ok) {
             content = `OK: saved ${out.replace(/\\/g, '/')}. IMAGE_DONE — do not read_file or edit the PNG. Continue other requested work if any.`
           } else {
-            content = `ERROR: ${(toolResult.error || 'image gen failed').slice(0, 400)}`
+            content =
+              `ERROR: ${(toolResult.error || 'image gen failed').slice(0, 400)}\n` +
+              'IMAGE_GEN_FAILED: do NOT call generate_image again this turn. Continue coding with a CSS/placeholder visual instead.'
           }
+        } else if (
+          toolResult.ok &&
+          (name === 'write_file' || name === 'apply_patch' || name === 'apply_diff')
+        ) {
+          // Don't keep multi-KB file bodies in the tool transcript — that forced compact after every write.
+          const p =
+            toolResult.filePath ||
+            (typeof args.relative_path === 'string' ? args.relative_path : '')
+          content = (toolResult.content || `OK: wrote ${p}`).slice(0, 400)
         }
 
         if (
@@ -2923,6 +3072,7 @@ export async function runAgentTurn(params: {
           tool_call_id: call.id,
           content
         })
+        slimCompletedWriteToolCalls(apiMessages)
         params.onUpdate([...messages])
         // Do not auto-open every edited/created file — agents can touch hundreds of paths.
         // Users open paths from chat file chips / explorer when they want a tab.
@@ -2969,7 +3119,12 @@ export async function runAgentTurn(params: {
         } else if (/OVERWRITE_BLOCKED/i.test(tc)) {
           appendToolHint(
             apiMessages,
-            'OVERWRITE_BLOCKED: read_file the existing path, then apply_patch (or apply_diff) for a minimal fix. Do not regenerate the whole file.'
+            'OVERWRITE_BLOCKED: for small files (<6KB / HTML/CSS) use write_file overwrite=true. For large files use apply_patch/apply_diff; after two failed patches, overwrite is allowed.'
+          )
+        } else if (/PATCH_FAIL_LIMIT/i.test(tc)) {
+          appendToolHint(
+            apiMessages,
+            'PATCH_FAIL_LIMIT: stop retrying apply_patch/apply_diff. Call write_file with overwrite=true and the full corrected content for that path.'
           )
         } else if (/PROCESS_ENDED/i.test(tc)) {
           appendToolHint(

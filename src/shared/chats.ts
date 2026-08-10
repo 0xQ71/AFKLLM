@@ -226,3 +226,94 @@ export function createEmptySession(): ChatSession {
     messages: [{ ...DEFAULT_WELCOME_MESSAGE }]
   }
 }
+
+/** Default / unset chat titles that may still be auto-named. */
+export function isDefaultChatTitle(title: string | undefined | null): boolean {
+  const t = (title ?? '').trim()
+  if (!t) return true
+  return /^(new agent|новый агент|new chat|новый чат)$/i.test(t)
+}
+
+const TITLE_STOP =
+  /^(сделай|сделать|создай|создать|напиши|написать|добавь|добавить|исправь|исправить|простой|простую|простое|пожалуйста|please|make|create|build|write|add|fix|update|implement|a|an|the|для|на|по|и|или|с|от|из|в|к|о|об|with|from|this|that|into|about|одностраничный|одностраничную|page|сайт|сайта|файл|файлы|code|код|русском|english|продукта|product)$/iu
+
+function capitalizeWord(w: string): string {
+  if (!w) return w
+  return w.charAt(0).toUpperCase() + w.slice(1)
+}
+
+/** JS \\b is ASCII-only — use Unicode-aware boundaries for RU/EN tokens. */
+function matchTaskNoun(text: string): string | null {
+  const m = text.match(
+    /(?:^|[^\p{L}\p{N}_])(лендинг|landing|dashboard|дашборд|refactor|рефактор|баг|bug)(?=$|[^\p{L}\p{N}_])/iu
+  )
+  return m?.[1] ?? null
+}
+
+/**
+ * Short stable chat name from the first user prompt (keyword-ish, not the full sentence).
+ */
+export function deriveChatTitle(raw: string): string {
+  const text = raw.replace(/\r\n/g, '\n').trim()
+  if (!text) return ''
+
+  const firstLine = (text.split(/\n/).find((l) => l.trim()) ?? '').trim()
+  const cleaned = firstLine
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/`[^`]+`/g, ' ')
+    .replace(/https?:\/\/\S+/gi, ' ')
+    .replace(/[*_#>[\](){}|\\/]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+
+  const quoted = text.match(/[«"\u201C]([^\n»"\u201D]{2,64})[»"\u201D]/)?.[1]?.trim()
+
+  // 1) Task noun first — "Лендинг", not a genitive fragment from the product name.
+  const task = matchTaskNoun(cleaned)
+  if (task) {
+    const titled = capitalizeWord(task.toLowerCase())
+    if (quoted && quoted.length <= 20) {
+      return clipTitle(`${titled} · ${quoted}`)
+    }
+    return titled
+  }
+
+  // 2) Short quoted product / topic
+  if (quoted) {
+    if (quoted.length <= 22) return quoted
+    const parts = quoted
+      .split(/\s+/)
+      .filter((w) => w.length > 1 && !/^(и|или|для|the|a|an|of)$/iu.test(w))
+    // Prefer the START of the name, not the awkward genitive tail.
+    if (parts.length >= 2) return clipTitle(parts.slice(0, 2).join(' '))
+    return clipTitle(parts[0] || quoted)
+  }
+
+  // 3) First few content words
+  const words = cleaned
+    .split(/\s+/)
+    .map((w) => w.replace(/^[,.:;!?—–-]+|[,.:;!?—–-]+$/g, ''))
+    .filter((w) => w.length > 1 && !TITLE_STOP.test(w))
+
+  if (words.length === 0) {
+    return clipTitle(cleaned || firstLine)
+  }
+  return clipTitle(words.slice(0, 3).join(' '))
+}
+
+function clipTitle(s: string): string {
+  const t = s.replace(/\s+/g, ' ').trim()
+  if (!t) return ''
+  if (t.length <= 28) return t
+  return `${t.slice(0, 27).trimEnd()}…`
+}
+
+/** Title from the first user message in a thread; empty if none yet. */
+export function deriveChatTitleFromMessages(
+  messages: Array<{ role?: string; content?: string }>
+): string {
+  const firstUser = messages.find(
+    (m) => m.role === 'user' && typeof m.content === 'string' && m.content.trim()
+  )
+  return firstUser ? deriveChatTitle(firstUser.content!) : ''
+}

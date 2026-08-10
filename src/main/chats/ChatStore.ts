@@ -4,6 +4,8 @@ import { app } from 'electron'
 import {
   createEmptySession,
   DEFAULT_WELCOME_MESSAGE,
+  deriveChatTitleFromMessages,
+  isDefaultChatTitle,
   sanitizePersistedMessages,
   type ChatSession,
   type ChatStoreSnapshot,
@@ -172,11 +174,14 @@ export class ChatStore {
     if (idx === -1) return this.get()
     const prev = this.cache.sessions[idx]!
     const cleaned = sanitizePersistedMessages(messages)
-    const nextTitle =
-      title?.trim() ||
-      deriveTitle(cleaned) ||
-      prev.title ||
-      'New agent'
+    // Auto-name once from the first prompt; never overwrite a set title.
+    let nextTitle = prev.title
+    if (title?.trim()) {
+      nextTitle = title.trim()
+    } else if (isDefaultChatTitle(prev.title)) {
+      nextTitle =
+        deriveChatTitleFromMessages(cleaned) || prev.title || 'New agent'
+    }
     this.cache.sessions[idx] = {
       ...prev,
       title: nextTitle,
@@ -306,11 +311,4 @@ function sanitizeSession(raw: unknown): ChatSession | null {
     updatedAt: typeof o.updatedAt === 'number' ? o.updatedAt : Date.now(),
     messages
   }
-}
-
-function deriveTitle(messages: PersistedChatMessage[]): string {
-  const firstUser = messages.find((m) => m.role === 'user' && m.content.trim())
-  if (!firstUser) return ''
-  const line = firstUser.content.trim().split(/\n/)[0] ?? ''
-  return line.length > 48 ? `${line.slice(0, 48)}…` : line
 }

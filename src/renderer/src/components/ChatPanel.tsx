@@ -34,7 +34,11 @@ import {
 } from '../agent/runAgentTurn'
 import type { QueueManager } from '../llm/queueManager'
 import type { ChatSession, PersistedChatMessage } from '../../../shared/chats'
-import { DEFAULT_WELCOME_MESSAGE } from '../../../shared/chats'
+import {
+  DEFAULT_WELCOME_MESSAGE,
+  deriveChatTitle,
+  isDefaultChatTitle
+} from '../../../shared/chats'
 import { ComposerQueue, type QueuedFollowUp } from './ComposerQueue'
 import { EditReviewDiff } from './EditReviewDiff'
 import { MarkdownBody } from './MarkdownBody'
@@ -777,6 +781,41 @@ export function ChatPanel({
     if (!opts?.fromQueue && !opts?.reverb) {
       setComposerFiles([])
     }
+
+    // Name the chat once from the first real prompt (short keyword).
+    const prevTitle =
+      sessionList.find((s) => s.id === activeSession)?.title ?? 'New agent'
+    if (isDefaultChatTitle(prevTitle)) {
+      const autoTitle = deriveChatTitle(sendText)
+      if (autoTitle && activeSession) {
+        const renamedList = sessionList.map((s) =>
+          s.id === activeSession ? { ...s, title: autoTitle } : s
+        )
+        setSessionList(renamedList)
+        onSessionsChange?.(renamedList, activeSession)
+        void window.api.chats
+          .updateMessages(
+            activeSession,
+            history.map(toPersisted),
+            autoTitle
+          )
+          .then((snap) => {
+            if (!snap?.sessions) return
+            const list = snap.sessions
+              .map(({ id, title, createdAt, updatedAt }) => ({
+                id,
+                title,
+                createdAt,
+                updatedAt
+              }))
+              .sort((a, b) => b.updatedAt - a.updatedAt)
+            setSessionList(list)
+            onSessionsChange?.(list, activeSession)
+          })
+          .catch(console.error)
+      }
+    }
+
     try {
       await runAgentTurn({
         queue,
@@ -1811,8 +1850,7 @@ export function ChatPanel({
 function deriveThreadTitle(messages: ChatMessage[]): string {
   const firstUser = messages.find((m) => m.role === 'user' && m.content?.trim())
   if (!firstUser?.content) return 'New agent'
-  const line = firstUser.content.trim().split(/\n/)[0] ?? ''
-  return line.length > 48 ? `${line.slice(0, 48)}…` : line
+  return deriveChatTitle(firstUser.content) || 'New agent'
 }
 
 function toPersisted(m: ChatMessage): PersistedChatMessage {

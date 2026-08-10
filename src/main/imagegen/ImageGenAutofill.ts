@@ -80,15 +80,19 @@ function scoreClipG(path: string): number {
   return -1
 }
 
-/** Prefer FP8 (recommended) over FP16 to save RAM. */
+/**
+ * Prefer non-scaled FP8 (sd-cli + FLUX). Scaled FP8 often yields blank white images.
+ * FP16 is safer but heavier — still better than scaled for FLUX.
+ */
 function scoreT5(path: string): number {
   const n = baseName(path)
   if (!/t5xxl/.test(n)) return -1
   if (!/\.(safetensors|gguf)$/.test(n)) return -1
-  if (/fp8_e4m3fn\.safetensors$/.test(n) && !/scaled/.test(n)) return 100
-  if (/fp8.*scaled/.test(n)) return 85
+  // Hard demote *_scaled* — known blank-white failure with FLUX in sd-cli.
+  if (/scaled/.test(n)) return 10
+  if (/fp8_e4m3fn\.safetensors$/.test(n)) return 100
   if (/fp8/.test(n)) return 80
-  if (/fp16/.test(n)) return 60
+  if (/fp16/.test(n)) return 70
   return 40
 }
 

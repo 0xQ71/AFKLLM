@@ -276,8 +276,15 @@ function sanitize(input: Record<string, unknown> | AppSettings): AppSettings {
     typeof next.imageGenLlmPath === 'string' ? next.imageGenLlmPath : ''
   next.sdCppPath = typeof next.sdCppPath === 'string' ? next.sdCppPath : ''
   next.imageGenSteps = Math.max(1, Math.min(150, Number(next.imageGenSteps) || DEFAULT_SETTINGS.imageGenSteps))
-  next.imageGenWidth = Math.max(64, Math.min(2048, Number(next.imageGenWidth) || DEFAULT_SETTINGS.imageGenWidth))
-  next.imageGenHeight = Math.max(64, Math.min(2048, Number(next.imageGenHeight) || DEFAULT_SETTINGS.imageGenHeight))
+  // Hard ceiling: never allow >1536 on either side (VRAM / freeze safety).
+  next.imageGenWidth = Math.max(
+    64,
+    Math.min(1536, Number(next.imageGenWidth) || DEFAULT_SETTINGS.imageGenWidth)
+  )
+  next.imageGenHeight = Math.max(
+    64,
+    Math.min(1536, Number(next.imageGenHeight) || DEFAULT_SETTINGS.imageGenHeight)
+  )
   next.imageGenCfg = Math.max(
     0,
     Math.min(30, Number.isFinite(Number(next.imageGenCfg)) ? Number(next.imageGenCfg) : 0)

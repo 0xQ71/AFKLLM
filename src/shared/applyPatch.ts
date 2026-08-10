@@ -208,24 +208,42 @@ export function applyHunksToText(original: string, hunks: PatchHunk[]): ApplyHun
     const after = afterLines.join('\n')
 
     const idx = indexOfUnique(content, before)
-    if (idx < 0) {
-      const beforeTrim = before.replace(/\n$/, '')
-      const idx2 = beforeTrim && beforeTrim !== before ? indexOfUnique(content, beforeTrim) : -1
-      if (idx2 < 0) {
-        return {
-          ok: false,
-          error:
-            `hunk mismatch (#${hi + 1}): could not find unique context in file.\n` +
-            `Expected excerpt:\n<<<\n${before.slice(0, 400)}\n>>>`
-        }
-      }
+    if (idx >= 0) {
+      content = content.slice(0, idx) + after + content.slice(idx + before.length)
+      continue
+    }
+
+    const beforeTrim = before.replace(/\n$/, '')
+    const idx2 = beforeTrim && beforeTrim !== before ? indexOfUnique(content, beforeTrim) : -1
+    if (idx2 >= 0) {
       content =
         content.slice(0, idx2) +
         after.replace(/\n$/, '') +
         content.slice(idx2 + beforeTrim.length)
       continue
     }
-    content = content.slice(0, idx) + after + content.slice(idx + before.length)
+
+    // Fuzzy: match ignoring leading/trailing whitespace per line (weak models drift on indent).
+    const fuzzy = findFuzzyLineRange(content, beforeLines)
+    if (!fuzzy.ok) {
+      return {
+        ok: false,
+        error:
+          `hunk mismatch (#${hi + 1}): could not find unique context in file.\n` +
+          `Expected excerpt:\n<<<\n${before.slice(0, 400)}\n>>>`
+      }
+    }
+    const fileLines = content.split('\n')
+    const mappedAfter = mapFuzzyAfterLines(
+      fileLines.slice(fuzzy.start, fuzzy.end),
+      beforeLines,
+      afterLines
+    )
+    content = [
+      ...fileLines.slice(0, fuzzy.start),
+      ...mappedAfter,
+      ...fileLines.slice(fuzzy.end)
+    ].join('\n')
   }
 
   if (eol === '\r\n') content = content.replace(/\n/g, '\r\n')
@@ -239,6 +257,140 @@ function indexOfUnique(haystack: string, needle: string): number {
   const second = haystack.indexOf(needle, first + 1)
   if (second >= 0) return -2 // ambiguous
   return first
+}
+
+/** Collapse indent/trailing space for fuzzy compare. */
+export function normalizeLineForFuzzy(line: string): string {
+  return line.replace(/\t/g, '  ').replace(/[ \t]+$/g, '').trimStart()
+}
+
+/**
+ * Find a unique contiguous range in `content` whose lines match `needleLines`
+ * after whitespace normalization. Returns [start, end) line indices.
+ */
+export function findFuzzyLineRange(
+  content: string,
+  needleLines: string[]
+): { ok: true; start: number; end: number } | { ok: false } {
+  const needles = needleLines.map(normalizeLineForFuzzy)
+  // Drop empty trailing fuzzy lines that models often invent
+  while (needles.length > 0 && needles[needles.length - 1] === '') needles.pop()
+  if (needles.length === 0) return { ok: false }
+
+  const hay = content.split('\n').map(normalizeLineForFuzzy)
+  const matches: Array<{ start: number; end: number }> = []
+  for (let i = 0; i <= hay.length - needles.length; i++) {
+    let ok = true
+    for (let j = 0; j < needles.length; j++) {
+      if (hay[i + j] !== needles[j]) {
+        ok = false
+        break
+      }
+    }
+    if (ok) matches.push({ start: i, end: i + needles.length })
+  }
+  if (matches.length !== 1) return { ok: false }
+  return { ok: true, start: matches[0]!.start, end: matches[0]!.end }
+}
+
+/**
+ * Build replacement lines: keep original indent from matched file lines where
+ * a "before" line maps to an "after" line with the same fuzzy body.
+ */
+function mapFuzzyAfterLines(
+  matchedFileLines: string[],
+  beforeLines: string[],
+  afterLines: string[]
+): string[] {
+  // Prefer preserving the file's own indentation style for context lines.
+  const beforeNorm = beforeLines.map(normalizeLineForFuzzy)
+  const indentOf = (line: string): string => {
+    const m = line.match(/^[ \t]*/)
+    return m ? m[0]! : ''
+  }
+  const indentByNorm = new Map<string, string>()
+  for (let i = 0; i < matchedFileLines.length; i++) {
+    const key = beforeNorm[i] ?? normalizeLineForFuzzy(matchedFileLines[i] ?? '')
+    if (key && !indentByNorm.has(key)) {
+      indentByNorm.set(key, indentOf(matchedFileLines[i] ?? ''))
+    }
+  }
+  const fallbackIndent =
+    matchedFileLines.length > 0 ? indentOf(matchedFileLines[0]!) : ''
+
+  return afterLines.map((line) => {
+    const norm = normalizeLineForFuzzy(line)
+    if (!norm) return ''
+    const prefer = indentByNorm.get(norm)
+    if (prefer != null) return prefer + norm
+    // New/changed line: keep model indent if present, else file fallback
+    const modelIndent = indentOf(line)
+    return (modelIndent || fallbackIndent) + norm
+  })
+}
+
+/**
+ * Exact → newline-normalized → whitespace-fuzzy search/replace.
+ * Shared by apply_diff (AgentToolRegistry).
+ */
+export function applySearchReplaceFuzzy(
+  original: string,
+  searchBlock: string,
+  replaceBlock: string
+): { ok: true; content: string; normalized?: boolean } | { ok: false; error: string } {
+  const tryOnce = (
+    hay: string,
+    needle: string,
+    rep: string
+  ): { ok: true; content: string } | { ok: false; error: string } => {
+    if (!needle) return { ok: false, error: 'not found' }
+    const n = hay.split(needle).length - 1
+    if (n === 0) return { ok: false, error: 'not found' }
+    if (n > 1) return { ok: false, error: `matched ${n} times — must be unique` }
+    return { ok: true, content: hay.replace(needle, rep) }
+  }
+
+  const exact = tryOnce(original, searchBlock, replaceBlock)
+  if (exact.ok) return exact
+
+  const normOrig = original.replace(/\r\n/g, '\n')
+  const normSearch = searchBlock.replace(/\r\n/g, '\n')
+  const normReplace = replaceBlock.replace(/\r\n/g, '\n')
+  const soft = tryOnce(normOrig, normSearch, normReplace)
+  if (soft.ok) {
+    return { ok: true, content: soft.content, normalized: true }
+  }
+
+  if (exact.error?.includes('times') || soft.error?.includes('times')) {
+    return {
+      ok: false,
+      error: `search_block matched multiple times — must be unique`
+    }
+  }
+
+  const searchLines = normSearch.split('\n')
+  const replaceLines = normReplace.split('\n')
+  const fuzzy = findFuzzyLineRange(normOrig, searchLines)
+  if (!fuzzy.ok) {
+    return { ok: false, error: `search_block not found` }
+  }
+  const fileLines = normOrig.split('\n')
+  const mapped = mapFuzzyAfterLines(
+    fileLines.slice(fuzzy.start, fuzzy.end),
+    searchLines,
+    replaceLines
+  )
+  const next = [
+    ...fileLines.slice(0, fuzzy.start),
+    ...mapped,
+    ...fileLines.slice(fuzzy.end)
+  ].join('\n')
+  const eol = original.includes('\r\n') ? '\r\n' : '\n'
+  return {
+    ok: true,
+    content: eol === '\r\n' ? next.replace(/\n/g, '\r\n') : next,
+    normalized: true
+  }
 }
 
 export function formatApplyPatchResult(

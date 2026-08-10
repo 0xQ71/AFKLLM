@@ -11,6 +11,7 @@ import {
 } from './WebSearch'
 import {
   applyHunksToText,
+  applySearchReplaceFuzzy,
   formatApplyPatchResult,
   parseApplyPatch
 } from '../../shared/applyPatch'
@@ -478,14 +479,17 @@ export class AgentToolRegistry {
       }
     }
     if (/\.(png|jpe?g|gif|webp|bmp|ico|gguf|safetensors)$/i.test(relativePath)) {
+      const isFavicon = /favicon\.(ico|png)$/i.test(relativePath)
       return {
         id: '',
         name: 'write_file',
         ok: false,
         content: '',
-        error:
-          `BINARY_FILE: do not write/edit image or model binaries via write_file ("${relativePath}"). ` +
-          'Use generate_image to create PNGs.'
+        error: isFavicon
+          ? `FAVICON: do not write favicon.ico/png via write_file or generate_image. ` +
+            `Skip the favicon, or add a tiny inline SVG favicon in HTML (<link> + data-URI / .svg text file).`
+          : `BINARY_FILE: do not write/edit image or model binaries via write_file ("${relativePath}"). ` +
+            'Use generate_image only for real PNGs the user asked for (not favicons).'
       }
     }
     const abs = this.safeResolve(relativePath)
@@ -637,7 +641,7 @@ export class AgentToolRegistry {
 
     const abs = this.safeResolve(relativePath)
     const original = await fs.readFile(abs, 'utf8')
-    const applied = applySearchReplace(original, searchBlock, replaceBlock)
+    const applied = applySearchReplaceFuzzy(original, searchBlock, replaceBlock)
 
     if (!applied.ok) {
       const preview = original.replace(/\r\n/g, '\n').slice(0, 1200)
@@ -1280,43 +1284,6 @@ function extractErrorFocus(text: string): string | null {
   if (markers.length === 0) return null
   const start = markers[Math.max(0, markers.length - 3)]!
   return lines.slice(start).join('\n').trim().slice(-4000)
-}
-
-/** Exact + newline-normalized search/replace for apply_diff. */
-function applySearchReplace(
-  original: string,
-  searchBlock: string,
-  replaceBlock: string
-): { ok: true; content: string; normalized?: boolean } | { ok: false; error: string } {
-  const tryOnce = (
-    hay: string,
-    needle: string,
-    rep: string
-  ): { ok: true; content: string } | { ok: false; error: string } => {
-    const n = hay.split(needle).length - 1
-    if (n === 0) return { ok: false, error: 'not found' }
-    if (n > 1) return { ok: false, error: `matched ${n} times — must be unique` }
-    return { ok: true, content: hay.replace(needle, rep) }
-  }
-
-  const exact = tryOnce(original, searchBlock, replaceBlock)
-  if (exact.ok) return exact
-
-  const normOrig = original.replace(/\r\n/g, '\n')
-  const normSearch = searchBlock.replace(/\r\n/g, '\n')
-  const normReplace = replaceBlock.replace(/\r\n/g, '\n')
-  const soft = tryOnce(normOrig, normSearch, normReplace)
-  if (soft.ok) {
-    return { ok: true, content: soft.content, normalized: true }
-  }
-
-  if (exact.error?.includes('times') || soft.error?.includes('times')) {
-    return {
-      ok: false,
-      error: `search_block matched multiple times — must be unique`
-    }
-  }
-  return { ok: false, error: `search_block not found` }
 }
 
 function isTextLike(filename: string): boolean {

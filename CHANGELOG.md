@@ -6,6 +6,14 @@ Canonical copy for each tag lives in [`docs/releases/`](docs/releases/).
 That text is what AFKLLM shows in the post-update “What's new” modal
 (and is mirrored in-app under Help → Version).
 
+## 0.2.0-20260811 — build 2026-08-11
+
+Image-gen reliability (VAE-on-CPU for FLUX, blank-frame handling, prefer
+non-scaled T5), chat auto-title in the sidebar, softer edit loops for small
+files (overwrite + fuzzy patch), and less aggressive context compaction.
+
+See [`docs/releases/v0.2.0-20260811.md`](docs/releases/v0.2.0-20260811.md).
+
 ## 0.2.0-20260810 — build 2026-08-10
 
 First-run onboarding (welcome → coding / image modes → models or later),

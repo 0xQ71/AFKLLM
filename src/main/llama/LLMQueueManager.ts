@@ -181,6 +181,13 @@ export class LLMQueueManager {
         ? setTimeout(() => controller.abort('timeout'), timeoutMs)
         : null
 
+    const isTransientNet = (err: unknown): boolean => {
+      const msg = err instanceof Error ? err.message : String(err)
+      return /fetch failed|ECONNREFUSED|ECONNRESET|ETIMEDOUT|socket hang up|other side closed|UND_ERR/i.test(
+        msg
+      )
+    }
+
     try {
       const useStream = Boolean(stream && onChunk)
       const body = {
@@ -191,44 +198,76 @@ export class LLMQueueManager {
           : {})
       }
 
-      const response = await fetch(`${this.baseUrl}${request.endpoint}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-        signal: controller.signal
-      })
+      const maxAttempts = 3
+      let lastErr: unknown
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        if (controller.signal.aborted) {
+          throw new DOMException('aborted', 'AbortError')
+        }
+        try {
+          const response = await fetch(`${this.baseUrl}${request.endpoint}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+            signal: controller.signal
+          })
 
-      if (!response.ok) {
-        const errBody = await response.text().catch(() => '')
-        throw new Error(`llama-server ${response.status}: ${errBody.slice(0, 400)}`)
-      }
-
-      if (useStream && response.body) {
-        return await this.consumeSse(request.id, response.body, controller.signal, onChunk!)
-      }
-
-      const data = (await response.json()) as {
-        choices?: Array<{
-          text?: string
-          message?: {
-            content?: string | null
-            tool_calls?: LLMCompletionResult['toolCalls']
+          if (!response.ok) {
+            const errBody = await response.text().catch(() => '')
+            throw new Error(
+              `llama-server ${response.status}: ${errBody.slice(0, 400)}`
+            )
           }
-          finish_reason?: string
-        }>
-        usage?: LLMCompletionResult['usage']
-        timings?: LLMCompletionResult['timings']
-      }
 
-      const choice = data.choices?.[0]
-      return {
-        id: request.id,
-        text: choice?.text ?? choice?.message?.content ?? '',
-        usage: data.usage ?? usageFromTimings(data.timings),
-        timings: data.timings,
-        toolCalls: choice?.message?.tool_calls,
-        finishReason: choice?.finish_reason
+          if (useStream && response.body) {
+            return await this.consumeSse(
+              request.id,
+              response.body,
+              controller.signal,
+              onChunk!
+            )
+          }
+
+          const data = (await response.json()) as {
+            choices?: Array<{
+              text?: string
+              message?: {
+                content?: string | null
+                tool_calls?: LLMCompletionResult['toolCalls']
+              }
+              finish_reason?: string
+            }>
+            usage?: LLMCompletionResult['usage']
+            timings?: LLMCompletionResult['timings']
+          }
+
+          const choice = data.choices?.[0]
+          return {
+            id: request.id,
+            text: choice?.text ?? choice?.message?.content ?? '',
+            usage: data.usage ?? usageFromTimings(data.timings),
+            timings: data.timings,
+            toolCalls: choice?.message?.tool_calls,
+            finishReason: choice?.finish_reason
+          }
+        } catch (err) {
+          lastErr = err
+          if (
+            attempt < maxAttempts &&
+            !controller.signal.aborted &&
+            isTransientNet(err)
+          ) {
+            console.warn(
+              `[LLMQueue] transient fetch (attempt ${attempt}/${maxAttempts}):`,
+              err instanceof Error ? err.message : err
+            )
+            await new Promise((r) => setTimeout(r, 400 * attempt))
+            continue
+          }
+          throw err
+        }
       }
+      throw lastErr instanceof Error ? lastErr : new Error(String(lastErr))
     } finally {
       if (timeout) clearTimeout(timeout)
     }

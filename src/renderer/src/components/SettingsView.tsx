@@ -1024,6 +1024,12 @@ function ModelPage({
                 {t('settings.model.browse')}
               </button>
             </div>
+            {key === 'imageGenT5Path' &&
+            /scaled/i.test(settings.imageGenT5Path) ? (
+              <p className="mt-1 text-[11px] leading-snug text-amber-400/90">
+                {t('settings.multimodal.t5ScaledWarn')}
+              </p>
+            ) : null}
           </Field>
         ))}
         <Field label={t('settings.multimodal.sdCppPath')}>
@@ -1078,8 +1084,22 @@ function ModelPage({
             <Field key={key} label={t(labelKey)}>
               <input
                 type="number"
+                min={key === 'imageGenCfg' ? 0 : key === 'imageGenSteps' ? 1 : 64}
+                max={
+                  key === 'imageGenWidth' || key === 'imageGenHeight'
+                    ? 1536
+                    : key === 'imageGenSteps'
+                      ? 150
+                      : 30
+                }
                 value={settings[key]}
-                onChange={(e) => patch(key, Number(e.target.value))}
+                onChange={(e) => {
+                  let n = Number(e.target.value)
+                  if (key === 'imageGenWidth' || key === 'imageGenHeight') {
+                    n = Math.max(64, Math.min(1536, n || 64))
+                  }
+                  patch(key, n)
+                }}
                 className={settingsInputClass}
               />
             </Field>

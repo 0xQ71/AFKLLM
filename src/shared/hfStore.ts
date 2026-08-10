@@ -347,8 +347,10 @@ export const HF_IMAGE_GEN_T5_MODELS: HfRecommendedModel[] = [
   {
     repoId: 'comfyanonymous/flux_text_encoders',
     title: 'FLUX T5-XXL FP8',
-    description: 'T5-XXL FP8 for FLUX.1 — smaller VRAM than FP16.',
-    descriptionRu: 'T5-XXL FP8 для FLUX.1 — меньше VRAM, чем FP16.',
+    description:
+      'T5-XXL FP8 for FLUX.1 (non-scaled). Avoid *_scaled* FP8 — blank white images with sd-cli.',
+    descriptionRu:
+      'T5-XXL FP8 для FLUX.1 (без _scaled). Не берите *_scaled* FP8 — с sd-cli даёт белый кадр.',
     preferredFile: 't5xxl_fp8_e4m3fn.safetensors',
     sizeGb: 4.9,
     minVramGb: 8,
@@ -356,9 +358,11 @@ export const HF_IMAGE_GEN_T5_MODELS: HfRecommendedModel[] = [
   },
   {
     repoId: 'Comfy-Org/stable-diffusion-3.5-fp8',
-    title: 'SD3.5 T5-XXL FP8',
-    description: 'T5-XXL for SD 3.5 split stack.',
-    descriptionRu: 'T5-XXL для раздельного стека SD 3.5.',
+    title: 'SD3.5 T5-XXL FP8 (scaled)',
+    description:
+      'Scaled FP8 for SD 3.5 only — do not use with FLUX (blank white). Prefer FLUX T5-XXL FP8 above for FLUX.1.',
+    descriptionRu:
+      'Scaled FP8 только для SD 3.5 — не для FLUX (белый кадр). Для FLUX.1 берите FLUX T5-XXL FP8 выше.',
     preferredFile: 'text_encoders/t5xxl_fp8_e4m3fn_scaled.safetensors',
     sizeGb: 4.9,
     minVramGb: 8,

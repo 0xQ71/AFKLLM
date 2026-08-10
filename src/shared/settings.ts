@@ -342,8 +342,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   imageGenCfg: 0,
   /** disk = reload weights from file on demand — avoids RAM crash spikes */
   imageGenWeightStorage: 'vram',
+  /** Quality pass on by default; keep base size ≤1536² */
   imageGenHires: true,
-  /** 1.25 keeps FLUX Q8 hires on 16 GB without shared-memory thrash */
   imageGenHiresScale: 1.25,
   imageGenHiresDenoising: 0.4
 }

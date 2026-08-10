@@ -1,6 +1,15 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
-import { existsSync, mkdirSync, statSync } from 'node:fs'
-import { dirname } from 'node:path'
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  renameSync,
+  rmSync,
+  statSync,
+  unlinkSync
+} from 'node:fs'
+import { tmpdir } from 'node:os'
+import { basename, dirname, join } from 'node:path'
 
 /** Active one-shot sd-cli — Stop / cancelAll can kill it. */
 let activeSdProc: ChildProcessWithoutNullStreams | null = null
@@ -10,10 +19,22 @@ export function killActiveSdCli(): boolean {
   const proc = activeSdProc
   if (!proc) return false
   activeSdProc = null
+  const pid = proc.pid
   try {
-    proc.kill()
+    if (process.platform === 'win32' && pid) {
+      spawn('taskkill', ['/pid', String(pid), '/T', '/F'], {
+        stdio: 'ignore',
+        windowsHide: true
+      })
+    } else {
+      proc.kill('SIGKILL')
+    }
   } catch {
-    /* ignore */
+    try {
+      proc.kill()
+    } catch {
+      /* ignore */
+    }
   }
   return true
 }
@@ -58,7 +79,7 @@ export interface SdGenerateParams extends SdSidecarPaths {
    */
   weightStorage?: 'disk' | 'ram' | 'vram'
   clipOnCpu?: boolean
-  /** Force VAE decode on CPU. Default false — staged offload uses CUDA VAE. */
+  /** Force VAE decode on CPU. Default: on for FLUX/SD3 (blank-image safety). */
   vaeOnCpu?: boolean
   /** Distilled guidance for FLUX.1-dev (sd-cli --guidance). Default 3.5. */
   guidance?: number
@@ -105,12 +126,13 @@ export function isNearlyBlankImage(filePath: string): boolean {
     if (width < 8 || height < 8) return true
     const buf = img.toBitmap()
     const pixels = width * height
-    const step = Math.max(1, Math.floor(pixels / 5000))
+    const step = Math.max(1, Math.floor(pixels / 8000))
     let n = 0
     let sum = 0
     let sum2 = 0
     let nearWhite = 0
     let nearBlack = 0
+    let nearGray = 0
     for (let i = 0; i < pixels; i += step) {
       const o = i * 4
       const b = buf[o] ?? 0
@@ -120,18 +142,37 @@ export function isNearlyBlankImage(filePath: string): boolean {
       sum += lum
       sum2 += lum * lum
       n++
-      if (r > 250 && g > 250 && b > 250) nearWhite++
-      if (r < 5 && g < 5 && b < 5) nearBlack++
+      if (r > 245 && g > 245 && b > 245) nearWhite++
+      if (r < 8 && g < 8 && b < 8) nearBlack++
+      if (Math.abs(r - g) < 3 && Math.abs(g - b) < 3 && lum > 240) nearGray++
     }
     if (n < 10) return true
     const mean = sum / n
     const variance = sum2 / n - mean * mean
-    const solidFrac = Math.max(nearWhite, nearBlack) / n
-    return variance < 8 || solidFrac > 0.985
+    const sd = Math.sqrt(Math.max(0, variance))
+    const solidFrac = Math.max(nearWhite, nearBlack, nearGray) / n
+    let size = 0
+    try {
+      size = statSync(filePath).size
+    } catch {
+      /* ignore */
+    }
+    // Only flag TRUE near-uniform outputs (real VAE failures = flat white/black).
+    // Dark dashboards have low mean but real structure (sd well above ~12), so
+    // do NOT use file size / mild-variance heuristics that killed valid dark art.
+    const blank =
+      sd < 6 || // essentially one flat tone
+      (mean > 250 && sd < 14) || // pure white VAE failure
+      (mean < 3 && sd < 8) || // pure black
+      solidFrac > 0.97 // ≥97% identical white/black/gray pixels
+    console.log(
+      `[isNearlyBlankImage] ${width}x${height} mean=${mean.toFixed(1)} sd=${sd.toFixed(1)} ` +
+        `solidFrac=${solidFrac.toFixed(3)} size=${size} → ${blank ? 'BLANK' : 'ok'}`
+    )
+    return blank
   } catch {
     try {
       const st = statSync(filePath)
-      // 1280² photo is usually >200KB; blank white PNG ~50KB
       return st.size > 0 && st.size < 90_000
     } catch {
       return true
@@ -239,18 +280,20 @@ export function parseSdProgressLine(
       detail: 'Image gen: loading weights from RAM → GPU…'
     }
   }
-  if (/loading|load.*model|load.*weight|gguf|clip|t5|vae/i.test(text) && /load/i.test(text)) {
+  // Narrow: only real weight/model load lines — not every "gguf"/"vae" mention.
+  if (
+    /\bloading\b/i.test(text) &&
+    /\b(weights?|model|checkpoint|tensor)\b/i.test(text)
+  ) {
     return {
       step: 0,
       total: totalSteps,
       remaining: totalSteps,
       phase: 'loading',
-      detail: /ram/i.test(text)
-        ? 'Image gen: loading weights from RAM…'
-        : 'Image gen: loading weights (disk)…'
+      detail: 'Image gen: loading weights…'
     }
   }
-  if (/saving|encode|vae|decode/i.test(text) && !/load/i.test(text)) {
+  if (/\b(saving|encoding|decoding)\b/i.test(text) && !/\bload/i.test(text)) {
     return {
       step: totalSteps,
       total: totalSteps,
@@ -266,6 +309,7 @@ export function buildSdCliArgs(params: SdGenerateParams): {
   args: string[]
   stack: SdStackKind
   steps: number
+  hiresSteps: number
   hires: boolean
   error?: string
 } {
@@ -275,6 +319,7 @@ export function buildSdCliArgs(params: SdGenerateParams): {
       args: [],
       stack: 'single',
       steps: 20,
+      hiresSteps: 20,
       hires: false,
       error: 'Image model not found'
     }
@@ -293,8 +338,8 @@ export function buildSdCliArgs(params: SdGenerateParams): {
     llmPath: llm
   })
 
-  const width = Math.max(64, params.width ?? 512)
-  const height = Math.max(64, params.height ?? 512)
+  const width = Math.max(64, Math.min(1536, params.width ?? 512))
+  const height = Math.max(64, Math.min(1536, params.height ?? 512))
   const steps = Math.max(1, params.steps ?? 20)
   const defaultCfg =
     stack === 'flux1' || stack === 'flux2' ? 1 : stack === 'sd3' ? 4.5 : 7
@@ -308,18 +353,18 @@ export function buildSdCliArgs(params: SdGenerateParams): {
     params.samplingMethod?.trim() ||
     (stack === 'single' ? '' : 'euler')
   /**
-   * Memory strategy (16 GB VRAM / 32 GB RAM):
-   * - TE on CPU (official flux.md)
-   * - VAE on CPU by default for FLUX/SD3 — CUDA VAE + hires has produced blank white PNGs
-   *   (sd.cpp silent decode failure); CPU decode is slower but reliable
-   * - Diffusion in VRAM when possible; --offload-to-cpu for hires / ram / disk
+   * Memory strategy (16 GB VRAM):
+   * - weightStorage=vram (default): diffusion on CUDA; TE + VAE on CPU.
+   *   VAE on GPU often yields blank PNGs / OOM on FLUX@16GB — keep it on CPU.
+   *   No --offload-to-cpu — keeps dedicated VRAM for diffusion.
+   * - ram/disk: offload paths for OOM-prone setups.
    */
   const weightStorage: 'disk' | 'ram' | 'vram' =
     params.weightStorage ??
     (params.offloadToCpu === true ? 'ram' : 'vram')
   const heavyStack = stack === 'flux1' || stack === 'flux2' || stack === 'sd3'
   const clipOnCpu = params.clipOnCpu ?? heavyStack
-  // Prefer CPU VAE for reliability (blank white = known CUDA/hires decode failure mode).
+  // Heavy stacks always decode VAE on CPU (blank-image / VRAM safety).
   const vaeOnCpu = params.vaeOnCpu ?? heavyStack
   const isSchnell = /schnell/i.test(model)
   const guidance =
@@ -383,7 +428,8 @@ export function buildSdCliArgs(params: SdGenerateParams): {
   let diffusionFa = params.diffusionFa ?? false
   if (wantHires) {
     const maxSide = Math.max(width, height)
-    const maxOutSide = heavyStack ? 1280 : 1536
+    // Final hires output must stay ≤1536 on each side.
+    const maxOutSide = 1536
     const scaleCap = Math.max(1.05, maxOutSide / maxSide)
     if (hiresScale > scaleCap) hiresScale = Math.round(scaleCap * 100) / 100
   }
@@ -401,22 +447,23 @@ export function buildSdCliArgs(params: SdGenerateParams): {
     parts.push(vaeOnCpu ? 'vae=cpu' : 'vae=cuda0')
     args.push('--backend', parts.join(','))
 
+    // Offload only when user asked ram/disk — never force offload just for hires.
     const needOffload =
-      wantHires || weightStorage === 'ram' || weightStorage === 'disk'
+      weightStorage === 'ram' || weightStorage === 'disk'
+    const maxVram = needOffload ? (wantHires ? '11' : '12') : '14'
     if (weightStorage === 'disk') {
-      args.push(
-        '--params-backend',
-        'disk',
-        '--mmap',
-        '--max-vram',
-        '13',
-        '--stream-layers'
-      )
+      args.push('--params-backend', 'disk', '--mmap', '--max-vram', maxVram)
+      if (!wantHires) args.push('--stream-layers')
     } else if (needOffload) {
-      // Staged: park weights in RAM, upload slices for hires / tight VRAM.
-      args.push('--offload-to-cpu', '--max-vram', '13', '--stream-layers')
+      if (wantHires) {
+        args.push('--offload-to-cpu', '--max-vram', maxVram)
+      } else {
+        args.push('--offload-to-cpu', '--max-vram', maxVram, '--stream-layers')
+      }
+    } else {
+      // vram: keep layers on GPU; soft cap leaves headroom for desktop compositor.
+      args.push('--max-vram', maxVram)
     }
-    // else vram + no hires: diffusion weights stay resident on GPU (fastest steps)
   } else if (weightStorage === 'disk') {
     args.push('--params-backend', 'disk', '--mmap')
   } else if (weightStorage === 'ram') {
@@ -424,6 +471,8 @@ export function buildSdCliArgs(params: SdGenerateParams): {
   }
 
   const hires = wantHires
+  /** Linked: hires pass uses the same step count as the base pass. */
+  const hiresSteps = steps
   if (hires) {
     const denoise = Math.max(
       0.05,
@@ -434,13 +483,13 @@ export function buildSdCliArgs(params: SdGenerateParams): {
       '--hires-scale',
       String(hiresScale),
       '--hires-steps',
-      String(steps),
+      String(hiresSteps),
       '--hires-denoising-strength',
       String(denoise)
     )
   }
 
-  return { args, stack, steps, hires }
+  return { args, stack, steps, hiresSteps, hires }
 }
 
 /** One-shot sd-cli text-to-image (single-file or FLUX / SD3 multi-file). */
@@ -482,7 +531,7 @@ export function runSdCli(params: SdGenerateParams): Promise<SdGenerateResult> {
     return copy.join(' ')
   }
   console.log(
-    `[sd-cli] stack=${built.stack} steps=${built.steps} hires=${built.hires} args: ${redactPrompt(built.args)}`
+    `[sd-cli] stack=${built.stack} steps=${built.steps} hires=${built.hires} hiresSteps=${built.hiresSteps} args: ${redactPrompt(built.args)}`
   )
 
   try {
@@ -496,9 +545,47 @@ export function runSdCli(params: SdGenerateParams): Promise<SdGenerateResult> {
     })
   }
 
+  // Always write under OS temp — never drop *.partial.png into the project tree.
+  const workDir = join(
+    tmpdir(),
+    'afkllm-img',
+    `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+  )
+  try {
+    mkdirSync(workDir, { recursive: true })
+  } catch (err) {
+    return Promise.resolve({
+      ok: false,
+      outputPath: out,
+      error: err instanceof Error ? err.message : String(err),
+      stack: built.stack
+    })
+  }
+  const partialOut = join(workDir, basename(out) || 'out.png')
+  const safeUnlink = (p: string): void => {
+    try {
+      if (existsSync(p)) unlinkSync(p)
+    } catch {
+      /* ignore */
+    }
+  }
+  const safeRmWork = (): void => {
+    safeUnlink(partialOut)
+    try {
+      rmSync(workDir, { recursive: true, force: true })
+    } catch {
+      /* ignore */
+    }
+  }
+
+  const argsForPartial = built.args.map((a, i, arr) =>
+    arr[i - 1] === '-o' ? partialOut : a
+  )
+
   const passes = built.hires ? 2 : 1
-  const baseTimeout = params.timeoutMs ?? 600_000
-  const timeoutMs = built.hires ? Math.max(baseTimeout, baseTimeout * 2) : baseTimeout
+  // Keep wall-clock bounded — long hangs thrash 16 GB systems into a hard freeze.
+  const baseTimeout = params.timeoutMs ?? (built.hires ? 720_000 : 420_000)
+  const timeoutMs = built.hires ? Math.max(baseTimeout, 600_000) : baseTimeout
   const notify = (p: SdStepProgress): void => {
     try {
       params.onProgress?.(p)
@@ -513,8 +600,8 @@ export function runSdCli(params: SdGenerateParams): Promise<SdGenerateResult> {
     remaining: built.steps,
     phase: 'loading',
     detail: built.hires
-      ? `Image gen (${built.stack}): loading · ${built.steps}+${built.steps} steps (hires)`
-      : `Image gen (${built.stack}): loading from disk · ${built.steps} steps`
+      ? `Image gen (${built.stack}): loading · ${built.steps}+${built.hiresSteps} steps (hires)`
+      : `Image gen (${built.stack}): loading · ${built.steps} steps`
   })
 
   return new Promise((resolve) => {
@@ -523,29 +610,51 @@ export function runSdCli(params: SdGenerateParams): Promise<SdGenerateResult> {
     let settled = false
     let pass = 1
     let lastStepSeen = 0
+    let pass1ReachedSampling = false
     let proc: ChildProcessWithoutNullStreams | null = null
     const finish = (result: SdGenerateResult): void => {
       if (settled) return
       settled = true
       if (proc && activeSdProc === proc) activeSdProc = null
+      if (!result.ok) {
+        safeRmWork()
+        // Remove a leftover blank final from a previous failed attempt.
+        if (existsSync(out) && isNearlyBlankImage(out)) safeUnlink(out)
+      } else {
+        safeRmWork()
+      }
       resolve({ ...result, stack: built.stack })
     }
 
     const emitProg = (prog: SdStepProgress): void => {
-      // Second pass resets the step counter; detect that for status labels.
-      if (passes > 1 && prog.step + 2 < lastStepSeen && pass < passes) {
+      if (prog.phase === 'sampling' || prog.step > 0) {
+        pass1ReachedSampling = true
+      }
+      // Pass 2 only after pass 1 actually sampled and the step counter resets.
+      if (
+        passes > 1 &&
+        pass1ReachedSampling &&
+        pass < passes &&
+        lastStepSeen >= 3 &&
+        prog.step > 0 &&
+        prog.step + 2 < lastStepSeen
+      ) {
         pass = 2
+        lastStepSeen = 0
       }
       if (prog.step > 0) lastStepSeen = prog.step
-      const prefix =
-        passes > 1 ? `Image gen: pass ${pass}/${passes} · ` : 'Image gen: '
+      // During loading, never claim pass 2/2 — show plain loading or pass 1/2.
+      const usePassLabel = passes > 1 && prog.phase !== 'loading'
+      const prefix = usePassLabel
+        ? `Image gen: pass ${pass}/${passes} · `
+        : 'Image gen: '
       notify({
         ...prog,
         detail: prog.detail.replace(/^Image gen:\s*/, prefix)
       })
     }
 
-    proc = spawn(binary, built.args, {
+    proc = spawn(binary, argsForPartial, {
       cwd: dirname(binary),
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
@@ -560,7 +669,13 @@ export function runSdCli(params: SdGenerateParams): Promise<SdGenerateResult> {
       const parts = lineBuf.split(/\r?\n/)
       lineBuf = parts.pop() ?? ''
       for (const line of parts) {
-        if (/highres|hires/i.test(line) && passes > 1 && pass < passes) {
+        // Do NOT bump pass on bare "hires" flag echoes in startup logs.
+        if (
+          passes > 1 &&
+          pass1ReachedSampling &&
+          pass < passes &&
+          /\b(highres|hires)\b.*\b(pass|stage|start|sampling)\b/i.test(line)
+        ) {
           pass = 2
           lastStepSeen = 0
         }
@@ -579,10 +694,22 @@ export function runSdCli(params: SdGenerateParams): Promise<SdGenerateResult> {
 
     const timer = setTimeout(() => {
       try {
-        proc?.kill()
+        if (proc?.pid && process.platform === 'win32') {
+          spawn('taskkill', ['/pid', String(proc.pid), '/T', '/F'], {
+            stdio: 'ignore',
+            windowsHide: true
+          })
+        } else {
+          proc?.kill('SIGKILL')
+        }
       } catch {
-        /* ignore */
+        try {
+          proc?.kill()
+        } catch {
+          /* ignore */
+        }
       }
+      if (activeSdProc === proc) activeSdProc = null
       notify({
         step: 0,
         total: built.steps,
@@ -617,10 +744,10 @@ export function runSdCli(params: SdGenerateParams): Promise<SdGenerateResult> {
 
     proc.on('close', (code) => {
       clearTimeout(timer)
-      if (code === 0 && existsSync(out)) {
-        if (isNearlyBlankImage(out)) {
+      if (code === 0 && existsSync(partialOut)) {
+        if (isNearlyBlankImage(partialOut)) {
           const detail =
-            'Image gen produced a blank image (likely VAE/hires CUDA decode failure). Try VAE on CPU / disable hires / lower resolution.'
+            'Image gen produced a blank image (likely VAE/hires CUDA decode failure). Try weightStorage=ram / disable hires / lower resolution.'
           notify({
             step: 0,
             total: built.steps,
@@ -632,6 +759,27 @@ export function runSdCli(params: SdGenerateParams): Promise<SdGenerateResult> {
             ok: false,
             outputPath: out,
             error: detail,
+            logs
+          })
+          return
+        }
+        try {
+          mkdirSync(dirname(out), { recursive: true })
+          safeUnlink(out)
+          try {
+            renameSync(partialOut, out)
+          } catch {
+            copyFileSync(partialOut, out)
+            safeUnlink(partialOut)
+          }
+        } catch (err) {
+          finish({
+            ok: false,
+            outputPath: out,
+            error:
+              err instanceof Error
+                ? `Failed to finalize image: ${err.message}`
+                : 'Failed to finalize image',
             logs
           })
           return
@@ -648,8 +796,8 @@ export function runSdCli(params: SdGenerateParams): Promise<SdGenerateResult> {
       }
       const logTail = logs.trim().slice(-1200)
       const missing =
-        code === 0 && !existsSync(out)
-          ? ` (exit 0 but output missing: ${out})`
+        code === 0 && !existsSync(partialOut)
+          ? ` (exit 0 but output missing)`
           : ''
       const detail = `Image gen failed (code ${code ?? 'null'})${missing}`
       notify({

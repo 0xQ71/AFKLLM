@@ -1,6 +1,7 @@
 ﻿import { app, BrowserWindow, dialog, ipcMain, Menu, shell } from 'electron'
-import { existsSync, mkdirSync, watch, type FSWatcher } from 'node:fs'
-import { join } from 'node:path'
+import { copyFileSync, existsSync, mkdirSync, rmSync, unlinkSync, watch, type FSWatcher } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { basename, dirname, join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { getLLMQueue } from './llama/LLMQueueManager'
 import { LlamaProcessManager } from './llama/LlamaProcessManager'
@@ -11,7 +12,7 @@ import { findMmprojForModel, scanGgufModels, scanMmprojFiles, scanWeightFiles } 
 import type { StoreDownloadTarget } from '../shared/hfStore'
 import { isImageGenStoreTarget, isStoreDownloadTarget } from '../shared/hfStore'
 import { sdRuntime } from './imagegen/SdRuntimeManager'
-import { killActiveSdCli, runSdCli } from './imagegen/SdCliRunner'
+import { isNearlyBlankImage, killActiveSdCli, runSdCli } from './imagegen/SdCliRunner'
 import { imageGenPathsNeedAutofill } from './imagegen/ImageGenAutofill'
 import {
   CHAT_IMAGE_MAX_COUNT,
@@ -1660,6 +1661,16 @@ app.whenReady().then(async () => {
       }
       const root = projectRoot || noWorkspaceDir()
       const abs = join(root, rel)
+      if (/favicon\.(ico|png)$/i.test(rel)) {
+        return {
+          id: '',
+          name: 'generate_image',
+          ok: false,
+          content: '',
+          error:
+            'FAVICON: do not generate favicon via generate_image. Skip it or use a tiny inline SVG in HTML.'
+        }
+      }
       const restoreChat = async (): Promise<void> => {
         if (!slotOrch) return
         try {
@@ -1675,50 +1686,198 @@ app.whenReady().then(async () => {
       }
       try {
         slotSwitchFromAgent = true
+        killActiveSdCli()
         await slotOrch.ensureSlot('imageGen')
         const rt = await sdRuntime.ensure(settings.sdCppPath)
         if (!rt.ready || !rt.binaryPath) {
           throw new Error('sd-cli runtime is not installed')
         }
-        const result = await runSdCli({
-          binaryPath: rt.binaryPath,
-          modelPath: settings.imageGenModelPath,
-          vaePath: settings.imageGenVaePath,
-          clipLPath: settings.imageGenClipLPath,
-          clipGPath: settings.imageGenClipGPath,
-          t5Path: settings.imageGenT5Path,
-          llmPath: settings.imageGenLlmPath,
-          prompt,
-          outputPath: abs,
-          negativePrompt: String(args.negative_prompt ?? '') || undefined,
-          width:
-            typeof args.width === 'number' ? args.width : settings.imageGenWidth,
-          height:
-            typeof args.height === 'number' ? args.height : settings.imageGenHeight,
-          steps:
-            typeof args.steps === 'number' ? args.steps : settings.imageGenSteps,
-          cfgScale: settings.imageGenCfg,
-          weightStorage: settings.imageGenWeightStorage,
-          hires: settings.imageGenHires,
-          hiresScale: settings.imageGenHiresScale,
-          hiresDenoising: settings.imageGenHiresDenoising,
-          onProgress: (p) => {
-            slotOrch?.setDetail(p.detail, 'switching')
+        const reqW =
+          typeof args.width === 'number' ? args.width : settings.imageGenWidth
+        const reqH =
+          typeof args.height === 'number' ? args.height : settings.imageGenHeight
+        // Absolute ceiling — anything above 1536 is rejected/clamped.
+        const width = Math.max(64, Math.min(1536, Number(reqW) || 1024))
+        const height = Math.max(64, Math.min(1536, Number(reqH) || 1024))
+        const steps = Math.max(
+          1,
+          Math.min(
+            40,
+            typeof args.steps === 'number' ? args.steps : settings.imageGenSteps
+          )
+        )
+        const runOnce = (
+          hires: boolean,
+          outputPath: string,
+          overrides?: {
+            width?: number
+            height?: number
+            vaeOnCpu?: boolean
+            weightStorage?: 'disk' | 'ram' | 'vram'
           }
-        })
+        ) =>
+          runSdCli({
+            binaryPath: rt.binaryPath!,
+            modelPath: settings!.imageGenModelPath,
+            vaePath: settings!.imageGenVaePath,
+            clipLPath: settings!.imageGenClipLPath,
+            clipGPath: settings!.imageGenClipGPath,
+            t5Path: settings!.imageGenT5Path,
+            llmPath: settings!.imageGenLlmPath,
+            prompt,
+            outputPath,
+            negativePrompt: String(args.negative_prompt ?? '') || undefined,
+            width: overrides?.width ?? width,
+            height: overrides?.height ?? height,
+            steps,
+            cfgScale: settings!.imageGenCfg,
+            weightStorage: overrides?.weightStorage ?? settings!.imageGenWeightStorage,
+            vaeOnCpu: overrides?.vaeOnCpu,
+            hires,
+            hiresScale: settings!.imageGenHiresScale,
+            hiresDenoising: settings!.imageGenHiresDenoising,
+            onProgress: (p) => {
+              slotOrch?.setDetail(p.detail, 'switching')
+            }
+          })
+
+        const stageDir = join(
+          tmpdir(),
+          'afkllm-img-stage',
+          `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+        )
+        mkdirSync(stageDir, { recursive: true })
+        const baseName = basename(abs) || 'image.png'
+        const baseTmp = join(stageDir, `base-${baseName}`)
+        const hiresTmp = join(stageDir, `hires-${baseName}`)
+        const safeTmp = join(stageDir, `safe-${baseName}`)
+        const cleanupStage = (): void => {
+          for (const p of [baseTmp, hiresTmp, safeTmp]) {
+            try {
+              if (existsSync(p)) unlinkSync(p)
+            } catch {
+              /* ignore */
+            }
+          }
+          try {
+            rmSync(stageDir, { recursive: true, force: true })
+          } catch {
+            /* ignore */
+          }
+        }
+
+        // Base-first: always produce a usable base image, then optionally upgrade with hires.
+        slotOrch?.setDetail('Image gen: base pass…', 'switching')
+        let baseResult = await runOnce(false, baseTmp)
+        const baseFileExists = existsSync(baseTmp)
+        let baseBlank = baseFileExists && isNearlyBlankImage(baseTmp)
+        let baseOk = baseResult.ok && baseFileExists && !baseBlank
+
+        // Retry ONLY on a hard failure (crash / no file). A produced-but-blank image
+        // means deterministic NaN/white for this model+runtime — retrying just wastes
+        // ~1–2 min, so we fail fast and let the agent fall back to a CSS placeholder.
+        const hardFail = !baseResult.ok || !baseFileExists
+        if (!baseOk && hardFail) {
+          console.warn(
+            '[generate_image] base hard-failed — safe retry @768 RAM offload',
+            baseResult.error
+          )
+          try {
+            if (existsSync(baseTmp)) unlinkSync(baseTmp)
+          } catch {
+            /* ignore */
+          }
+          slotOrch?.setDetail(
+            'Image gen: safe retry (768, RAM offload, VAE CPU)…',
+            'switching'
+          )
+          baseResult = await runOnce(false, safeTmp, {
+            width: Math.min(width, 768),
+            height: Math.min(height, 768),
+            vaeOnCpu: true,
+            weightStorage: 'ram'
+          })
+          if (baseResult.ok && existsSync(safeTmp) && !isNearlyBlankImage(safeTmp)) {
+            try {
+              copyFileSync(safeTmp, baseTmp)
+            } catch {
+              /* fall through */
+            }
+            baseBlank = existsSync(baseTmp) && isNearlyBlankImage(baseTmp)
+            baseOk = existsSync(baseTmp) && !baseBlank
+          }
+        }
+
+        if (!baseOk) {
+          cleanupStage()
+          await restoreChat()
+          return {
+            id: '',
+            name: 'generate_image',
+            ok: false,
+            content: '',
+            error: baseBlank
+              ? 'IMAGE_BLANK: the image model returned a blank/white frame (NaN decode) — this is a model/runtime issue, not the prompt. Do NOT retry generate_image this turn; use a CSS gradient/placeholder and continue.'
+              : baseResult.error ||
+                'Image gen failed to produce a base image. Try weightStorage=ram or lower resolution.',
+            filePath: rel.replace(/\\/g, '/')
+          }
+        }
+
+        mkdirSync(dirname(abs), { recursive: true })
+        try {
+          if (existsSync(abs)) unlinkSync(abs)
+        } catch {
+          /* ignore */
+        }
+        copyFileSync(baseTmp, abs)
+
+        let note = ''
+        if (settings.imageGenHires) {
+          slotOrch?.setDetail('Image gen: hires upgrade…', 'switching')
+          const hiresResult = await runOnce(true, hiresTmp)
+          if (
+            hiresResult.ok &&
+            existsSync(hiresTmp) &&
+            !isNearlyBlankImage(hiresTmp)
+          ) {
+            try {
+              if (existsSync(abs)) unlinkSync(abs)
+            } catch {
+              /* ignore */
+            }
+            copyFileSync(hiresTmp, abs)
+          } else {
+            console.warn(
+              '[generate_image] hires blank/failed — keeping base image',
+              hiresResult.error
+            )
+            slotOrch?.setDetail(
+              'Image gen: hires skipped (blank) — kept base',
+              'switching'
+            )
+            note = ' (hires skipped — kept base)'
+          }
+        }
+
+        cleanupStage()
         const posix = rel.replace(/\\/g, '/')
-        if (result.ok) {
+        if (existsSync(abs) && !isNearlyBlankImage(abs)) {
           emitWorkspaceChanged([posix])
-          // Restore after success is recorded — restore failure must not hide the image.
           await restoreChat()
           return {
             id: '',
             name: 'generate_image',
             ok: true,
             content:
-              `OK: image saved to ${posix}. IMAGE_DONE: do not read_file or edit this file — the UI already shows it. Continue other requested work if any; if the request was image-only, one short confirmation is enough.`,
+              `OK: image saved to ${posix}${note}. IMAGE_DONE: do not read_file or edit this file — the UI already shows it. Continue other requested work if any; if the request was image-only, one short confirmation is enough.`,
             filePath: posix
           }
+        }
+        try {
+          if (existsSync(abs)) unlinkSync(abs)
+        } catch {
+          /* ignore */
         }
         await restoreChat()
         return {
@@ -1726,7 +1885,7 @@ app.whenReady().then(async () => {
           name: 'generate_image',
           ok: false,
           content: '',
-          error: result.error || 'Image generation failed',
+          error: 'Final image was blank — not saved',
           filePath: posix
         }
       } catch (err) {

@@ -296,7 +296,7 @@ const en = {
   'settings.multimodal.stackHint':
     'FLUX.2: model + VAE + LLM. FLUX.1: model + VAE + CLIP-L + T5. SD3 split: model + CLIP-L + CLIP-G + T5. All-in-one SD3.5 needs only the model.',
   'settings.multimodal.imageGenAutofillHint':
-    'Empty fields auto-fill from the Models directory when matching files exist (prefers FLUX.1 Q8 + ae + CLIP-L + T5 FP8).',
+    'Empty fields auto-fill from the Models directory when matching files exist (prefers FLUX.1 Q8 + ae + CLIP-L + T5 FP8 non-scaled).',
   'settings.multimodal.vae': 'VAE (ae.safetensors)',
   'settings.multimodal.vaeHint': 'Required for FLUX.1 / FLUX.2',
   'settings.multimodal.clipL': 'CLIP-L',
@@ -304,20 +304,23 @@ const en = {
   'settings.multimodal.clipG': 'CLIP-G',
   'settings.multimodal.clipGHint': 'SD3 only',
   'settings.multimodal.t5': 'T5-XXL',
-  'settings.multimodal.t5Hint': 'FLUX.1 / SD3',
+  'settings.multimodal.t5Hint':
+    'Prefer t5xxl_fp8_e4m3fn.safetensors (or FP16). Avoid *_fp8_*_scaled — with FLUX it often yields a blank white image.',
+  'settings.multimodal.t5ScaledWarn':
+    'This path looks like a scaled FP8 T5. With FLUX that commonly produces blank white images. Use t5xxl_fp8_e4m3fn.safetensors (Store → T5) or FP16 instead.',
   'settings.multimodal.llm': 'Text LLM (FLUX.2)',
   'settings.multimodal.llmHint': 'Qwen3-4B (Klein) or Mistral-Small (Dev)',
   'settings.multimodal.offloadCpu': 'Offload to CPU (slower — only if GPU OOM)',
   'settings.multimodal.weightStorage': 'Image weights storage',
   'settings.multimodal.weightStorage.disk': 'Disk (safe — lowest RAM)',
   'settings.multimodal.weightStorage.ram': 'Offload RAM → CUDA (hires-safe)',
-  'settings.multimodal.weightStorage.vram': 'GPU diffusion (TE+VAE on CPU)',
+  'settings.multimodal.weightStorage.vram': 'GPU diffusion (VAE+TE on CPU)',
   'settings.multimodal.weightStorageHint':
-    'Default: diffusion in VRAM; T5 + VAE on CPU (avoids blank white CUDA VAE failures). Hires auto-enables weight offload. Disk = lowest system RAM.',
+    'vram = diffusion on GPU, VAE + T5/CLIP on CPU (no RAM offload). ram/disk = offload for OOM. Hires no longer forces CPU offload.',
   'settings.multimodal.cfgHint': 'CFG 0 = auto (FLUX≈1, SD3≈4.5, SDXL≈7)',
   'settings.multimodal.hires': 'Hires fix (quality pass)',
   'settings.multimodal.hiresHint':
-    'Second denoise after upscale. Hires steps = Steps (linked). ~2× time. Scale auto-capped (~1280px) on FLUX.',
+    'Second denoise after upscale (~2× time). On by default. Base size hard-capped at 1536×1536; hires scale is auto-clamped so the final side stays ≤1536. Hires steps match Steps.',
   'settings.multimodal.hiresScale': 'Hires scale',
   'settings.multimodal.hiresDenoising': 'Hires denoise',
   'settings.multimodal.sdCppPath': 'sd-cli path',
@@ -464,7 +467,7 @@ const en = {
   'changelog.ok': 'Got it',
   'changelog.fallback': 'Updated to {version}.',
   'changelog.releaseNotes':
-    '### AFKLLM 0.2.0-20260810\n\nMinor release on top of 0.1.0-20260807.\n\n🧭 **Onboarding** — full-screen welcome, coding / image modes, optional Vision (auto-suggested), models now or later\n\n👁 **Vision** — photo attach with VRAM cold-swap; PDF/DOCX attach (text + scanned pages via vision); click chat photos to open in-app lightbox\n\n🖼 **Image gen** — Settings → Agent master switch + composer Image; `generate_image` (FLUX / sd-cli)\n\n💬 **Polish** — Think-only answers promoted to visible reply; Context gauge fill fixed\n\nDownloads: `AFKLLM-0.2.0-20260810-x64-setup.exe`',
+    '### AFKLLM 0.2.0-20260811\n\nBuild on top of 0.2.0-20260810.\n\n🖼 **Image gen** — VAE on CPU for FLUX; blank-image detection tightened; prefer non-scaled T5 (`t5xxl_fp8_e4m3fn`, not `*_scaled`); base-first save + fast fail on white frames\n\n💬 **Agent** — chat auto-title in sidebar; small-file overwrite; fuzzy apply_patch/apply_diff; less premature context compact\n\nDownloads: `AFKLLM-0.2.0-20260811-x64-setup.exe`',
 
   'settings.diag': 'Logs',
   'settings.diag.note':
@@ -882,7 +885,7 @@ const ru: Record<MessageKey, string> = {
   'settings.multimodal.stackHint':
     'FLUX.2: model + VAE + LLM. FLUX.1: model + VAE + CLIP-L + T5. SD3 split: model + CLIP-L + CLIP-G + T5. All-in-one SD3.5 — только model.',
   'settings.multimodal.imageGenAutofillHint':
-    'Пустые поля подставляются из каталога Models, если файлы найдены (предпочтительно FLUX.1 Q8 + ae + CLIP-L + T5 FP8).',
+    'Пустые поля подставляются из каталога Models, если файлы найдены (предпочтительно FLUX.1 Q8 + ae + CLIP-L + T5 FP8 без _scaled).',
   'settings.multimodal.vae': 'VAE (ae.safetensors)',
   'settings.multimodal.vaeHint': 'Нужен для FLUX.1 / FLUX.2',
   'settings.multimodal.clipL': 'CLIP-L',
@@ -890,20 +893,23 @@ const ru: Record<MessageKey, string> = {
   'settings.multimodal.clipG': 'CLIP-G',
   'settings.multimodal.clipGHint': 'Только SD3',
   'settings.multimodal.t5': 'T5-XXL',
-  'settings.multimodal.t5Hint': 'FLUX.1 / SD3',
+  'settings.multimodal.t5Hint':
+    'Берите t5xxl_fp8_e4m3fn.safetensors (или FP16). Не *_fp8_*_scaled — с FLUX часто даёт белый кадр.',
+  'settings.multimodal.t5ScaledWarn':
+    'Похоже на scaled FP8 T5. С FLUX это часто даёт пустой белый кадр. Используйте t5xxl_fp8_e4m3fn.safetensors (Store → T5) или FP16.',
   'settings.multimodal.llm': 'Text LLM (FLUX.2)',
   'settings.multimodal.llmHint': 'Qwen3-4B (Klein) или Mistral-Small (Dev)',
   'settings.multimodal.offloadCpu': 'Offload на CPU (медленнее — только при OOM на GPU)',
   'settings.multimodal.weightStorage': 'Хранение весов image gen',
   'settings.multimodal.weightStorage.disk': 'Диск (безопасно — минимум RAM)',
   'settings.multimodal.weightStorage.ram': 'Offload RAM → CUDA (для hires)',
-  'settings.multimodal.weightStorage.vram': 'GPU diffusion (TE+VAE на CPU)',
+  'settings.multimodal.weightStorage.vram': 'GPU diffusion (VAE+TE на CPU)',
   'settings.multimodal.weightStorageHint':
-    'По умолчанию: diffusion в VRAM; T5 и VAE на CPU (обход белых кадров от CUDA VAE). Hires сам включает offload. Disk = минимум системной RAM.',
+    'vram = diffusion на GPU, VAE + T5/CLIP на CPU (без offload в RAM). ram/disk = offload при OOM. Hires больше не форсит CPU offload.',
   'settings.multimodal.cfgHint': 'CFG 0 = авто (FLUX≈1, SD3≈4.5, SDXL≈7)',
   'settings.multimodal.hires': 'Hires fix (проход качества)',
   'settings.multimodal.hiresHint':
-    'Второй denoise после апскейла. Hires steps = Шаги (привязано). ~2× времени. На FLUX scale режется (~1280px).',
+    'Второй denoise после апскейла (~2× время). Включён по умолчанию. Базовый размер жёстко ≤1536×1536; scale режется так, чтобы финальная сторона ≤1536. Шаги hires = Steps.',
   'settings.multimodal.hiresScale': 'Hires scale',
   'settings.multimodal.hiresDenoising': 'Hires denoise',
   'settings.multimodal.sdCppPath': 'Путь к sd-cli',
@@ -1050,7 +1056,7 @@ const ru: Record<MessageKey, string> = {
   'changelog.ok': 'Понятно',
   'changelog.fallback': 'Обновлено до {version}.',
   'changelog.releaseNotes':
-    '### AFKLLM 0.2.0-20260810\n\nМинорный релиз поверх 0.1.0-20260807.\n\n🧭 **Онбординг** — welcome на весь экран, режимы coding / image, опциональный Vision (автоподстановка), модели сейчас или позже\n\n👁 **Vision** — attach фото с cold-swap VRAM; PDF/DOCX (текст + сканы через vision); клик по фото в чате открывает lightbox\n\n🖼 **Image gen** — мастер в Настройки → Агент + кнопка Фото; `generate_image` (FLUX / sd-cli)\n\n💬 **Полировка** — ответ только в Think показывается пользователю; исправлена дуга Context\n\nЗагрузки: `AFKLLM-0.2.0-20260810-x64-setup.exe`',
+    '### AFKLLM 0.2.0-20260811\n\nСборка поверх 0.2.0-20260810.\n\n🖼 **Image gen** — VAE на CPU для FLUX; детект пустого кадра; предпочитать T5 без `_scaled` (`t5xxl_fp8_e4m3fn`); base-first и быстрый отказ на белом\n\n💬 **Агент** — авто-имя чата в сайдбаре; overwrite малых файлов; fuzzy apply_patch/apply_diff; реже premature compact\n\nЗагрузки: `AFKLLM-0.2.0-20260811-x64-setup.exe`',
 
   'settings.diag': 'Логи',
   'settings.diag.note':
