@@ -160,7 +160,6 @@ We're actively working on the following (community feedback welcome via [Issues]
 
 - Signed Windows releases as the default distribution path
 - Docs / i18n polish; more staff-pick GGUF recommendations
-- **Android client** (Kotlin): agent workspace (chat, explorer, code, terminal, browser, git, console) + full settings + E2B/E4B GGUF — see [android/README.md](android/README.md)
 - Evaluate Linux / macOS later (Windows remains the primary desktop target)
 
 Want to influence the roadmap? Open a [Feature request](https://github.com/0xQ71/AFKLLM/issues/new/choose) or discussion on an existing issue.
