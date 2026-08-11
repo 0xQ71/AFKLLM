@@ -6,35 +6,43 @@ Canonical copy for each tag lives in [`docs/releases/`](docs/releases/).
 That text is what AFKLLM shows in the post-update “What's new” modal
 (and is mirrored in-app under Help → Version).
 
-## 0.2.0-20260811 — build 2026-08-11
+## 0.2.0-20260811 — build 2026-08-11 (current)
 
-Image-gen reliability (VAE-on-CPU for FLUX, blank-frame handling, prefer
-non-scaled T5), chat auto-title in the sidebar, softer edit loops for small
-files (overwrite + fuzzy patch), and less aggressive context compaction.
+**Full 0.2 line vs public 0.1.0 / 0.1.0-20260807.** Canonical notes:
+[`docs/releases/v0.2.0-20260811.md`](docs/releases/v0.2.0-20260811.md).
 
-See [`docs/releases/v0.2.0-20260811.md`](docs/releases/v0.2.0-20260811.md).
+### Since 0.1.0 — product
+
+- **Onboarding** — welcome screen; coding / image modes; optional Vision; models now or later
+- **Vision attach** — VL GGUF + mmproj; VRAM cold-swap; photo lightbox
+- **File attach** — PDF/DOCX (text + scanned pages), text files, images (drag / paste / picker)
+- **Image generation** — Settings + composer Image mode; `generate_image` via sd-cli / FLUX
+  (sidecars in Settings → Multimodal / Store; hires; blank detection; non-scaled T5 preferred;
+  VAE on GPU in `vram` mode; default negative prompt for gibberish text)
+- **Chat UX** — auto-title from first prompt; Think answers not stuck inside `<think>`; Context gauge fix
+
+### Since 0.1.0 — agent reliability
+
+- Soft guards: tool loops, incomplete writes, favicon / blank-image fail-soft
+- Small files: overwrite-friendly edits; fuzzy patch/diff matching
+- Less premature context compaction
+- Settings overlay keeps chat mounted; block Unload while generating (from 0.1.0-20260807)
+
+### Installer
+
+- `AFKLLM-0.2.0-20260811-x64-setup.exe`
 
 ## 0.2.0-20260810 — build 2026-08-10
 
-First-run onboarding (welcome → coding / image modes → models or later),
-optional vision with autofill and chat photo cold-swap, PDF/DOCX attach
-(hybrid text + scanned-page vision), Image generation gate in Settings +
-composer, FLUX/`generate_image` stack, Think-only answer promotion, chat
-image lightbox, and Context gauge fix.
+First 0.2 snapshot: onboarding, vision/file attach, Image mode + `generate_image`,
+Think promotion, Context gauge. Superseded by **0.2.0-20260811**.
 
 See [`docs/releases/v0.2.0-20260810.md`](docs/releases/v0.2.0-20260810.md).
 
 ## 0.1.0-20260807 — build 2026-08-07
 
-Agent reliability: keep chat mounted while Settings is open (block Settings /
-Unload during generation); stop false `Edited · failed` on truncated writes;
-persist successful `write_file` chunks to disk; soft guards for tool loops /
-missing paths without aborting mid-stream when `relative_path` arrives late.
-
-Also: GitHub/docs polish (README EN/RU with screenshots, release notes,
-CI/release workflows), repo cleanup (drop unused bench/e2e scripts),
-NSIS-only installer (no portable), local installer verify script; public
-signing planned via SignPath Foundation (see docs/guides/code-signing.md).
+Agent reliability (Settings overlay, write persistence, soft tool guards) and
+docs/CI/installer polish.
 
 See [`docs/releases/v0.1.0-20260807.md`](docs/releases/v0.1.0-20260807.md).
 

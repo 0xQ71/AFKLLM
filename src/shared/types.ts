@@ -386,7 +386,8 @@ export const AGENT_TOOL_SCHEMAS = [
           },
           negative_prompt: {
             type: 'string',
-            description: 'Optional negative prompt'
+            description:
+              'Optional extra negative prompt (merged with Settings). Prefer “no text / no letters” in the positive prompt for UI art — FLUX cannot spell words.'
           },
           width: { type: 'integer', description: 'Width in pixels (default from settings)' },
           height: { type: 'integer', description: 'Height in pixels (default from settings)' },

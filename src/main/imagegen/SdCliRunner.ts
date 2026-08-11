@@ -79,7 +79,7 @@ export interface SdGenerateParams extends SdSidecarPaths {
    */
   weightStorage?: 'disk' | 'ram' | 'vram'
   clipOnCpu?: boolean
-  /** Force VAE decode on CPU. Default: on for FLUX/SD3 (blank-image safety). */
+  /** Force VAE decode on CPU. Default: CPU for ram/disk offload; CUDA in vram mode. */
   vaeOnCpu?: boolean
   /** Distilled guidance for FLUX.1-dev (sd-cli --guidance). Default 3.5. */
   guidance?: number
@@ -354,18 +354,19 @@ export function buildSdCliArgs(params: SdGenerateParams): {
     (stack === 'single' ? '' : 'euler')
   /**
    * Memory strategy (16 GB VRAM):
-   * - weightStorage=vram (default): diffusion on CUDA; TE + VAE on CPU.
-   *   VAE on GPU often yields blank PNGs / OOM on FLUX@16GB — keep it on CPU.
-   *   No --offload-to-cpu — keeps dedicated VRAM for diffusion.
-   * - ram/disk: offload paths for OOM-prone setups.
+   * - weightStorage=vram (default): diffusion + VAE on CUDA; TE on CPU.
+   *   TE stays on CPU — T5 + FLUX Q8 rarely fit together on 16 GB.
+   *   VAE on GPU is fine with non-scaled T5 (blank whites were from *_scaled* T5).
+   * - ram/disk: offload paths for OOM-prone setups (VAE stays on CPU).
    */
   const weightStorage: 'disk' | 'ram' | 'vram' =
     params.weightStorage ??
     (params.offloadToCpu === true ? 'ram' : 'vram')
   const heavyStack = stack === 'flux1' || stack === 'flux2' || stack === 'sd3'
   const clipOnCpu = params.clipOnCpu ?? heavyStack
-  // Heavy stacks always decode VAE on CPU (blank-image / VRAM safety).
-  const vaeOnCpu = params.vaeOnCpu ?? heavyStack
+  // VRAM mode → CUDA VAE; ram/disk keep CPU VAE under offload pressure.
+  const vaeOnCpu =
+    params.vaeOnCpu ?? (heavyStack && weightStorage !== 'vram')
   const isSchnell = /schnell/i.test(model)
   const guidance =
     params.guidance != null && params.guidance >= 0

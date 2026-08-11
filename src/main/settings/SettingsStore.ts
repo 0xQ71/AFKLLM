@@ -322,6 +322,10 @@ function sanitize(input: Record<string, unknown> | AppSettings): AppSettings {
         : DEFAULT_SETTINGS.imageGenHiresDenoising
     )
   )
+  next.imageGenNegativePrompt =
+    typeof next.imageGenNegativePrompt === 'string'
+      ? next.imageGenNegativePrompt
+      : DEFAULT_SETTINGS.imageGenNegativePrompt
 
   const fallbackProfile = defaultModelProfile()
   const profilesIn = raw.modelProfiles

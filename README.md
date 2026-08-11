@@ -30,7 +30,7 @@
 
 </div>
 
-AFKLLM is an agent-first desktop IDE: chat and tools on the left, editor / browser / terminal on the right. The core loop — chat, file tools, terminal, search, git — runs on your machine with local GGUF models. No cloud account required for everyday coding.
+AFKLLM is an agent-first desktop IDE: chat and tools on the left, editor / browser / terminal on the right. The core loop — chat, file tools, terminal, search, git — runs on your machine with local GGUF models. Optional **vision attach** and **local FLUX image generation** (`sd-cli`) stay on-device too. No cloud account required for everyday coding.
 
 👏 Feedback & bugs → [GitHub Issues](https://github.com/0xQ71/AFKLLM/issues) · docs → [Development](docs/guides/development.md)
 
@@ -66,7 +66,8 @@ AFKLLM is an agent-first desktop IDE: chat and tools on the left, editor / brows
 - Composer message queue, Think mode, auto-approve, checkpoints / rewind
 - MCP (stdio) servers as extra tools (`mcp__…`)
 - Context usage gauge, project rules, codebase index / `@codebase`
-- Soft guards for tool loops and truncated writes (persist successful chunks; continue with append)
+- Auto-named agent chats from the first prompt
+- Soft guards for tool loops and truncated writes; small-file overwrite + fuzzy patches
 
 2. **Editor & IDE shell**
 
@@ -77,16 +78,17 @@ AFKLLM is an agent-first desktop IDE: chat and tools on the left, editor / brows
 - Agent edits do **not** auto-open every changed file — open from chat chips or the tree
 - Built-in browser preview and PTY terminal
 
-3. **Models & llama.cpp runtime**
+3. **Models, vision & image generation**
 
-- Hugging Face GGUF store with GPU-aware picks (VRAM-aware “Best fit / Tight / Easy”)
+- Hugging Face store with GPU-aware picks (chat GGUF, vision, FLUX / SD sidecars)
 - Thin installer: CPU / CUDA 12 / CUDA / Vulkan packs from [official llama.cpp Releases](https://github.com/ggml-org/llama.cpp/releases)
-- First-run model wizard — `.gguf` files are **not** bundled
+- First-run onboarding — coding and/or image mode; `.gguf` / diffusion weights are **not** bundled
 - Per-model Performance / Memory / Generation profiles; Load / Unload from Settings or status bar
 - Optional OpenAI-compatible local API endpoint when enabled
-- **Vision attach** (separate VL GGUF + mmproj): cold-swaps chat↔vision in VRAM, describes the image, then restores the coding model
-- **`generate_image` tool** via [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) (`sd-cli`): unloads the LLM, generates a PNG into the project, reloads chat
-- Configure paths under **Settings → Model → Multimodal** (vision model, mmproj, SD weights, optional sd-cli path)
+- **Vision attach** (VL GGUF + mmproj): cold-swaps chat↔vision in VRAM, describes the image, restores the coding model
+- **File attach** — PDF / DOCX (text + scanned pages via vision), text files, images (drag / paste / picker); photo lightbox in chat
+- **`generate_image`** via [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) (`sd-cli`): FLUX stack, hires, VAE-on-GPU in `vram` mode, blank-frame guards; composer **Image** mode gated in Settings → Agent
+- Paths under **Settings → Model → Multimodal** (vision, mmproj, SD weights, T5 — prefer non-scaled FP8, negative prompt, optional sd-cli path)
 
 4. **Git, updates & app chrome**
 
@@ -100,7 +102,7 @@ AFKLLM is an agent-first desktop IDE: chat and tools on the left, editor / brows
 
 - Chat, tools, and edits stay on-device for the core loop
 - Optional local error log under `userData` — never uploaded by AFKLLM
-- Models and llama-server binaries live on your disk
+- Models and llama-server / sd-cli binaries live on your disk
 
 ---
 
@@ -121,9 +123,10 @@ see [Code signing](docs/guides/code-signing.md). Until then, Windows may show
 
 ### After install
 
-1. Open AFKLLM → pick or download a GGUF in **Settings → Model** (or the first-run wizard)
-2. Click **Load** (status bar or Settings)
-3. **Open folder…** for your project → start an agent chat
+1. Open AFKLLM → finish onboarding (coding and/or image mode) or open **Settings → Model**
+2. Pick or download a chat GGUF → **Load** (status bar or Settings)
+3. Optional: Vision GGUF + mmproj; for Image mode, FLUX sidecars under **Multimodal** / Store
+4. **Open folder…** for your project → start an agent chat (composer **Image** / **Фото** when Image mode is on)
 
 ### In-app updates
 

@@ -1144,6 +1144,18 @@ function ModelPage({
             />
           </Field>
         </div>
+        <Field label={t('settings.multimodal.negativePrompt')}>
+          <textarea
+            value={settings.imageGenNegativePrompt}
+            onChange={(e) => patch('imageGenNegativePrompt', e.target.value)}
+            rows={3}
+            className={settingsInputClass + ' font-mono text-xs'}
+            spellCheck={false}
+          />
+          <p className="mt-1 text-[11px] text-ink-mute">
+            {t('settings.multimodal.negativePromptHint')}
+          </p>
+        </Field>
         <SettingRow title={t('settings.multimodal.sdRuntime')}>
           <button
             type="button"

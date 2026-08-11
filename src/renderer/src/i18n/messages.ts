@@ -314,15 +314,18 @@ const en = {
   'settings.multimodal.weightStorage': 'Image weights storage',
   'settings.multimodal.weightStorage.disk': 'Disk (safe — lowest RAM)',
   'settings.multimodal.weightStorage.ram': 'Offload RAM → CUDA (hires-safe)',
-  'settings.multimodal.weightStorage.vram': 'GPU diffusion (VAE+TE on CPU)',
+  'settings.multimodal.weightStorage.vram': 'GPU diffusion + VAE (TE on CPU)',
   'settings.multimodal.weightStorageHint':
-    'vram = diffusion on GPU, VAE + T5/CLIP on CPU (no RAM offload). ram/disk = offload for OOM. Hires no longer forces CPU offload.',
+    'vram = diffusion + VAE on GPU, T5/CLIP on CPU (no RAM offload). Use non-scaled T5 (t5xxl_fp8_e4m3fn) — *_scaled* often yields blank white. ram/disk = offload for OOM.',
   'settings.multimodal.cfgHint': 'CFG 0 = auto (FLUX≈1, SD3≈4.5, SDXL≈7)',
   'settings.multimodal.hires': 'Hires fix (quality pass)',
   'settings.multimodal.hiresHint':
     'Second denoise after upscale (~2× time). On by default. Base size hard-capped at 1536×1536; hires scale is auto-clamped so the final side stays ≤1536. Hires steps match Steps.',
   'settings.multimodal.hiresScale': 'Hires scale',
   'settings.multimodal.hiresDenoising': 'Hires denoise',
+  'settings.multimodal.negativePrompt': 'Negative prompt (always applied)',
+  'settings.multimodal.negativePromptHint':
+    'Merged into every generate_image. Default bans gibberish letters — FLUX cannot render real text; prefer text-free UI art.',
   'settings.multimodal.sdCppPath': 'sd-cli path',
   'settings.multimodal.sdCppHint': 'Empty = auto-download under userData/sd-runtime',
   'settings.multimodal.steps': 'Steps',
@@ -467,7 +470,7 @@ const en = {
   'changelog.ok': 'Got it',
   'changelog.fallback': 'Updated to {version}.',
   'changelog.releaseNotes':
-    '### AFKLLM 0.2.0-20260811\n\nBuild on top of 0.2.0-20260810.\n\n🖼 **Image gen** — VAE on CPU for FLUX; blank-image detection tightened; prefer non-scaled T5 (`t5xxl_fp8_e4m3fn`, not `*_scaled`); base-first save + fast fail on white frames\n\n💬 **Agent** — chat auto-title in sidebar; small-file overwrite; fuzzy apply_patch/apply_diff; less premature context compact\n\nDownloads: `AFKLLM-0.2.0-20260811-x64-setup.exe`',
+    '### AFKLLM 0.2.0-20260811\n\nFull **0.2** line vs public **0.1.0**.\n\n🧭 **Onboarding** — coding and/or image mode; optional Vision; models now or later\n\n👁 **Vision & attach** — VL cold-swap; PDF/DOCX/text/images; photo lightbox\n\n🖼 **Image gen** — `generate_image` via sd-cli / FLUX; hires in one job; VAE on GPU in `vram` mode; prefer non-scaled T5; blank detection; Settings negative prompt\n\n💬 **Agent** — auto-title chats; small-file overwrite; fuzzy patch/diff; less premature compact; Think replies not stuck in `<think>`\n\nDownloads: `AFKLLM-0.2.0-20260811-x64-setup.exe`',
 
   'settings.diag': 'Logs',
   'settings.diag.note':
@@ -903,15 +906,18 @@ const ru: Record<MessageKey, string> = {
   'settings.multimodal.weightStorage': 'Хранение весов image gen',
   'settings.multimodal.weightStorage.disk': 'Диск (безопасно — минимум RAM)',
   'settings.multimodal.weightStorage.ram': 'Offload RAM → CUDA (для hires)',
-  'settings.multimodal.weightStorage.vram': 'GPU diffusion (VAE+TE на CPU)',
+  'settings.multimodal.weightStorage.vram': 'GPU diffusion + VAE (TE на CPU)',
   'settings.multimodal.weightStorageHint':
-    'vram = diffusion на GPU, VAE + T5/CLIP на CPU (без offload в RAM). ram/disk = offload при OOM. Hires больше не форсит CPU offload.',
+    'vram = diffusion + VAE на GPU, T5/CLIP на CPU (без offload в RAM). Берите T5 без _scaled (t5xxl_fp8_e4m3fn) — иначе часто белый кадр. ram/disk = offload при OOM.',
   'settings.multimodal.cfgHint': 'CFG 0 = авто (FLUX≈1, SD3≈4.5, SDXL≈7)',
   'settings.multimodal.hires': 'Hires fix (проход качества)',
   'settings.multimodal.hiresHint':
     'Второй denoise после апскейла (~2× время). Включён по умолчанию. Базовый размер жёстко ≤1536×1536; scale режется так, чтобы финальная сторона ≤1536. Шаги hires = Steps.',
   'settings.multimodal.hiresScale': 'Hires scale',
   'settings.multimodal.hiresDenoising': 'Hires denoise',
+  'settings.multimodal.negativePrompt': 'Negative prompt (всегда)',
+  'settings.multimodal.negativePromptHint':
+    'Добавляется к каждому generate_image. По умолчанию запрет «иероглифов» — FLUX не умеет настоящий текст; для UI лучше без букв.',
   'settings.multimodal.sdCppPath': 'Путь к sd-cli',
   'settings.multimodal.sdCppHint': 'Пусто = автозагрузка в userData/sd-runtime',
   'settings.multimodal.steps': 'Шаги',
@@ -1056,7 +1062,7 @@ const ru: Record<MessageKey, string> = {
   'changelog.ok': 'Понятно',
   'changelog.fallback': 'Обновлено до {version}.',
   'changelog.releaseNotes':
-    '### AFKLLM 0.2.0-20260811\n\nСборка поверх 0.2.0-20260810.\n\n🖼 **Image gen** — VAE на CPU для FLUX; детект пустого кадра; предпочитать T5 без `_scaled` (`t5xxl_fp8_e4m3fn`); base-first и быстрый отказ на белом\n\n💬 **Агент** — авто-имя чата в сайдбаре; overwrite малых файлов; fuzzy apply_patch/apply_diff; реже premature compact\n\nЗагрузки: `AFKLLM-0.2.0-20260811-x64-setup.exe`',
+    '### AFKLLM 0.2.0-20260811\n\nПолная линейка **0.2** относительно публичного **0.1.0**.\n\n🧭 **Онбординг** — coding и/или image; опциональный Vision; модели сейчас или позже\n\n👁 **Vision и attach** — VL cold-swap; PDF/DOCX/текст/фото; lightbox\n\n🖼 **Image gen** — `generate_image` через sd-cli / FLUX; hires одним прогоном; VAE на GPU в `vram`; T5 без `_scaled`; детект пустого кадра; negative prompt в Settings\n\n💬 **Агент** — авто-имя чатов; overwrite малых файлов; fuzzy patch/diff; реже premature compact; ответы Think не застревают в `<think>`\n\nЗагрузки: `AFKLLM-0.2.0-20260811-x64-setup.exe`',
 
   'settings.diag': 'Логи',
   'settings.diag.note':

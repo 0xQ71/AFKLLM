@@ -326,12 +326,16 @@ Rules for multi-file work (critical):
 const IMAGE_GEN_RULES_ON = `
 - Image generation (Image mode ON):
   1) To CREATE an image: call generate_image ONCE with a clear prompt (+ optional relative_path). Use Settings size (often 1024²); do not invent huge resolutions.
-  2) After generate_image succeeds: do NOT read_file the PNG, do NOT write_file/edit it, do NOT describe pixels from disk. Note the saved path briefly.
+  2) Text in images (critical): FLUX cannot render readable words — it produces gibberish glyphs.
+     For UI/dashboard/hero art: explicitly say "no text, no letters, no logos, no watermarks, blank panels" in the prompt.
+     Only ask for readable text if the user explicitly wants lettering; even then results are unreliable.
+     Optional negative_prompt may add extras; Settings already bans common text artifacts.
+  3) After generate_image succeeds: do NOT read_file the PNG, do NOT write_file/edit it, do NOT describe pixels from disk. Note the saved path briefly.
      If the user ALSO asked for code, HTML/CSS, other files, or further steps — CONTINUE those tools. Do not end the whole turn only because an image was saved.
      Stop after the image ONLY when image creation was the sole request.
-  3) If generate_image FAILS, times out, or returns a blank/white image: do NOT call generate_image again this turn. Finish HTML/CSS with a CSS gradient / placeholder and say the image step failed.
-  4) NEVER generate_image or write_file for favicon.ico / favicon.png — skip favicon or use a tiny inline SVG in HTML.
-  5) Keep image prompts focused — do not dump file contents or long plans into the prompt unless the user asked.
+  4) If generate_image FAILS, times out, or returns a blank/white image: do NOT call generate_image again this turn. Finish HTML/CSS with a CSS gradient / placeholder and say the image step failed.
+  5) NEVER generate_image or write_file for favicon.ico / favicon.png — skip favicon or use a tiny inline SVG in HTML.
+  6) Keep image prompts focused — do not dump file contents or long plans into the prompt unless the user asked.
 `
 
 const IMAGE_GEN_RULES_OFF = `

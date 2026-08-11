@@ -1726,7 +1726,12 @@ app.whenReady().then(async () => {
             llmPath: settings!.imageGenLlmPath,
             prompt,
             outputPath,
-            negativePrompt: String(args.negative_prompt ?? '') || undefined,
+            negativePrompt: (() => {
+              const fromAgent = String(args.negative_prompt ?? '').trim()
+              const fromSettings = String(settings!.imageGenNegativePrompt ?? '').trim()
+              if (fromAgent && fromSettings) return `${fromSettings}, ${fromAgent}`
+              return fromAgent || fromSettings || undefined
+            })(),
             width: overrides?.width ?? width,
             height: overrides?.height ?? height,
             steps,
@@ -1766,49 +1771,80 @@ app.whenReady().then(async () => {
           }
         }
 
-        // Base-first: always produce a usable base image, then optionally upgrade with hires.
-        slotOrch?.setDetail('Image gen: base pass…', 'switching')
-        let baseResult = await runOnce(false, baseTmp)
-        const baseFileExists = existsSync(baseTmp)
-        let baseBlank = baseFileExists && isNearlyBlankImage(baseTmp)
-        let baseOk = baseResult.ok && baseFileExists && !baseBlank
+        // One sampling job only:
+        // - hires ON → single run with --hires (pass1+pass2 inside sd-cli ≈ 2×steps)
+        // - hires OFF → single base run
+        // Old "base-first then full hires redo" did base + (base+hires) = 3×steps — waste.
+        const wantHires = settings.imageGenHires === true
+        let outTmp = wantHires ? hiresTmp : baseTmp
+        slotOrch?.setDetail(
+          wantHires ? 'Image gen: pass 1–2 (hires)…' : 'Image gen: base pass…',
+          'switching'
+        )
+        let primaryResult = await runOnce(wantHires, outTmp)
+        let primaryExists = existsSync(outTmp)
+        let primaryBlank = primaryExists && isNearlyBlankImage(outTmp)
+        let primaryOk =
+          primaryResult.ok && primaryExists && !primaryBlank
 
-        // Retry ONLY on a hard failure (crash / no file). A produced-but-blank image
-        // means deterministic NaN/white for this model+runtime — retrying just wastes
-        // ~1–2 min, so we fail fast and let the agent fall back to a CSS placeholder.
-        const hardFail = !baseResult.ok || !baseFileExists
-        if (!baseOk && hardFail) {
+        // If hires produced blank/hard-fail, fall back to one base-only pass (keep usable image).
+        let note = ''
+        if (!primaryOk && wantHires) {
           console.warn(
-            '[generate_image] base hard-failed — safe retry @768 RAM offload',
-            baseResult.error
+            '[generate_image] hires blank/failed — falling back to base-only',
+            primaryResult.error
           )
+          slotOrch?.setDetail('Image gen: hires failed — base fallback…', 'switching')
           try {
-            if (existsSync(baseTmp)) unlinkSync(baseTmp)
+            if (existsSync(outTmp)) unlinkSync(outTmp)
           } catch {
             /* ignore */
           }
+          outTmp = baseTmp
+          primaryResult = await runOnce(false, outTmp)
+          primaryExists = existsSync(outTmp)
+          primaryBlank = primaryExists && isNearlyBlankImage(outTmp)
+          primaryOk = primaryResult.ok && primaryExists && !primaryBlank
+          if (primaryOk) note = ' (hires failed — kept base)'
+        }
+
+        // Hard fail (crash / no file): one safe retry @768 RAM offload.
+        // Blank-but-saved = model/runtime NaN — do not burn another full pass.
+        const hardFail = !primaryResult.ok || !primaryExists
+        if (!primaryOk && hardFail) {
+          console.warn(
+            '[generate_image] hard-failed — safe retry @768 RAM offload',
+            primaryResult.error
+          )
           slotOrch?.setDetail(
             'Image gen: safe retry (768, RAM offload, VAE CPU)…',
             'switching'
           )
-          baseResult = await runOnce(false, safeTmp, {
+          primaryResult = await runOnce(false, safeTmp, {
             width: Math.min(width, 768),
             height: Math.min(height, 768),
             vaeOnCpu: true,
             weightStorage: 'ram'
           })
-          if (baseResult.ok && existsSync(safeTmp) && !isNearlyBlankImage(safeTmp)) {
+          if (
+            primaryResult.ok &&
+            existsSync(safeTmp) &&
+            !isNearlyBlankImage(safeTmp)
+          ) {
             try {
               copyFileSync(safeTmp, baseTmp)
+              outTmp = baseTmp
             } catch {
-              /* fall through */
+              outTmp = safeTmp
             }
-            baseBlank = existsSync(baseTmp) && isNearlyBlankImage(baseTmp)
-            baseOk = existsSync(baseTmp) && !baseBlank
+            primaryExists = existsSync(outTmp)
+            primaryBlank = primaryExists && isNearlyBlankImage(outTmp)
+            primaryOk = primaryExists && !primaryBlank
+            if (primaryOk) note = ' (safe retry)'
           }
         }
 
-        if (!baseOk) {
+        if (!primaryOk) {
           cleanupStage()
           await restoreChat()
           return {
@@ -1816,10 +1852,10 @@ app.whenReady().then(async () => {
             name: 'generate_image',
             ok: false,
             content: '',
-            error: baseBlank
+            error: primaryBlank
               ? 'IMAGE_BLANK: the image model returned a blank/white frame (NaN decode) — this is a model/runtime issue, not the prompt. Do NOT retry generate_image this turn; use a CSS gradient/placeholder and continue.'
-              : baseResult.error ||
-                'Image gen failed to produce a base image. Try weightStorage=ram or lower resolution.',
+              : primaryResult.error ||
+                'Image gen failed to produce an image. Try weightStorage=ram or lower resolution.',
             filePath: rel.replace(/\\/g, '/')
           }
         }
@@ -1830,35 +1866,7 @@ app.whenReady().then(async () => {
         } catch {
           /* ignore */
         }
-        copyFileSync(baseTmp, abs)
-
-        let note = ''
-        if (settings.imageGenHires) {
-          slotOrch?.setDetail('Image gen: hires upgrade…', 'switching')
-          const hiresResult = await runOnce(true, hiresTmp)
-          if (
-            hiresResult.ok &&
-            existsSync(hiresTmp) &&
-            !isNearlyBlankImage(hiresTmp)
-          ) {
-            try {
-              if (existsSync(abs)) unlinkSync(abs)
-            } catch {
-              /* ignore */
-            }
-            copyFileSync(hiresTmp, abs)
-          } else {
-            console.warn(
-              '[generate_image] hires blank/failed — keeping base image',
-              hiresResult.error
-            )
-            slotOrch?.setDetail(
-              'Image gen: hires skipped (blank) — kept base',
-              'switching'
-            )
-            note = ' (hires skipped — kept base)'
-          }
-        }
+        copyFileSync(outTmp, abs)
 
         cleanupStage()
         const posix = rel.replace(/\\/g, '/')

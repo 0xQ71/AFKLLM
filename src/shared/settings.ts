@@ -235,6 +235,11 @@ export interface AppSettings {
   /** Denoising strength for hires pass (0–1). */
   imageGenHiresDenoising: number
   /**
+   * Extra negative prompt always merged into generate_image (-n).
+   * Default suppresses gibberish UI text / glyphs (FLUX cannot render real words well).
+   */
+  imageGenNegativePrompt: string
+  /**
    * @deprecated Prefer imageGenWeightStorage. Kept for settings.json migration.
    * true → ram, false ignored when weightStorage is set.
    */
@@ -345,7 +350,12 @@ export const DEFAULT_SETTINGS: AppSettings = {
   /** Quality pass on by default; keep base size ≤1536² */
   imageGenHires: true,
   imageGenHiresScale: 1.25,
-  imageGenHiresDenoising: 0.4
+  imageGenHiresDenoising: 0.4,
+  /** Ban gibberish lettering; FLUX is poor at readable text — prefer text-free UI art. */
+  imageGenNegativePrompt:
+    'text, letters, words, typography, watermark, logo, caption, title, subtitle, ' +
+    'gibberish text, misspelled text, random characters, hieroglyphs, glyphs, ' +
+    'unreadable text, lorem ipsum, ui labels with text, written language'
 }
 
 export interface DiscoveredModel {
