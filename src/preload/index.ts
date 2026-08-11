@@ -63,7 +63,7 @@ import type {
 } from '../shared/llamaRuntime'
 import type { TelemetryEvent, TelemetryReportResult } from '../shared/telemetry'
 import type { ModelSlot, ModelSlotStatus } from '../shared/modelSlots'
-import type { SdRuntimeProgress, SdRuntimeStatus } from '../shared/sdRuntime'
+import type { SdRuntimeEnsureOptions, SdRuntimeProgress, SdRuntimeStatus } from '../shared/sdRuntime'
 
 const api = {
   getVersion: (): Promise<string> => ipcRenderer.invoke('app:get-version'),
@@ -383,7 +383,9 @@ const api = {
 
   sdRuntime: {
     status: (): Promise<SdRuntimeStatus> => ipcRenderer.invoke('sd-runtime:status'),
-    ensure: (): Promise<SdRuntimeStatus> => ipcRenderer.invoke('sd-runtime:ensure'),
+    check: (): Promise<SdRuntimeStatus> => ipcRenderer.invoke('sd-runtime:check'),
+    ensure: (opts?: SdRuntimeEnsureOptions): Promise<SdRuntimeStatus> =>
+      ipcRenderer.invoke('sd-runtime:ensure', opts ?? {}),
     progress: (): Promise<SdRuntimeProgress> => ipcRenderer.invoke('sd-runtime:progress'),
     onProgress: (cb: (p: SdRuntimeProgress) => void): (() => void) => {
       const listener = (_: unknown, p: SdRuntimeProgress): void => cb(p)

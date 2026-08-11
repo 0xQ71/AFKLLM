@@ -1,5 +1,6 @@
 ﻿import { useEffect, useMemo, useState } from 'react'
 import { useI18n } from '../i18n/I18nProvider'
+import { isDefaultChatTitle } from '../../../shared/chats'
 import { SettingsGearIcon } from './SettingsGearIcon'
 
 export interface AgentSessionMeta {
@@ -211,7 +212,7 @@ export function AgentRail({
                                     (active ? 'text-ink-bright' : 'text-ink-soft')
                                   }
                                 >
-                                  {s.title || 'New agent'}
+                                  {isDefaultChatTitle(s.title) ? t('chat.newAgent') : s.title || t('chat.newAgent')}
                                 </div>
                                 <div className="font-mono text-[9px] text-ink-mute">
                                   {formatRelativeTime(s.updatedAt)}

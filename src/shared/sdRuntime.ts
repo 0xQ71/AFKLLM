@@ -13,4 +13,14 @@ export type SdRuntimeStatus = {
   tag: string | null
   source: 'custom' | 'downloaded' | 'missing'
   error?: string
+  /** Latest GitHub release tag from last check (cached). */
+  latestTag?: string | null
+  /** True when installed (downloaded) tag differs from latestTag after a check. */
+  updateAvailable?: boolean
+  /** Last check failure message (offline / GitHub error). */
+  checkError?: string | null
+}
+
+export type SdRuntimeEnsureOptions = {
+  force?: boolean
 }

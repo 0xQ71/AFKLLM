@@ -26,6 +26,7 @@ import {
   LLAMA_RUNTIME_PACKS,
   llamaRuntimePackLabel
 } from '../../../shared/llamaRuntime'
+import type { SdRuntimeStatus } from '../../../shared/sdRuntime'
 import type { UpdaterCheckResult } from '../../../shared/updater'
 import { PAGE_TITLE, SETTINGS_NAV, type SettingsPageId } from './settings/nav'
 import {
@@ -711,10 +712,112 @@ function ModelPage({
   onOpenStore: (target?: StoreDownloadTarget) => void
 }): React.JSX.Element {
   const { t } = useI18n()
+  const [sdStatus, setSdStatus] = useState<SdRuntimeStatus | null>(null)
+  const [sdBusy, setSdBusy] = useState(false)
+  const [sdMessage, setSdMessage] = useState<string | null>(null)
+
+  useEffect(() => {
+    void window.api.sdRuntime.status().then(setSdStatus).catch(() => setSdStatus(null))
+    return window.api.sdRuntime.onProgress(() => {
+      void window.api.sdRuntime.status().then(setSdStatus).catch(() => undefined)
+    })
+  }, [])
+
+  useEffect(() => {
+    void window.api.sdRuntime.status().then(setSdStatus).catch(() => undefined)
+  }, [settings.sdCppPath])
+
   const pickModelsDir = async (): Promise<void> => {
     const dir = await window.api.workspace.pickModelsDir()
     if (dir) await onModelsDirChange(dir)
   }
+
+  const usingCustomSd = Boolean(settings.sdCppPath?.trim())
+  const canUpdateSd = !usingCustomSd && Boolean(sdStatus?.updateAvailable)
+  const canCheckSd = !usingCustomSd
+
+  const refreshSd = async (): Promise<SdRuntimeStatus | null> => {
+    try {
+      const next = await window.api.sdRuntime.status()
+      setSdStatus(next)
+      return next
+    } catch {
+      setSdStatus(null)
+      return null
+    }
+  }
+
+  const runSdCheck = (): void => {
+    void (async () => {
+      setSdBusy(true)
+      setSdMessage(t('settings.multimodal.sdChecking'))
+      try {
+        const next = await window.api.sdRuntime.check()
+        setSdStatus(next)
+        if (next.checkError) {
+          setSdMessage(next.checkError)
+        } else if (next.updateAvailable && next.latestTag) {
+          setSdMessage(
+            t('settings.multimodal.sdUpdateAvailable', { tag: next.latestTag })
+          )
+        } else if (next.source === 'missing') {
+          setSdMessage(t('settings.multimodal.sdNotInstalled'))
+        } else if (next.source === 'custom') {
+          setSdMessage(t('settings.multimodal.sdCustomPath'))
+        } else {
+          setSdMessage(t('settings.multimodal.sdUptoDate'))
+        }
+      } catch (e) {
+        setSdMessage(e instanceof Error ? e.message : String(e))
+      } finally {
+        setSdBusy(false)
+      }
+    })()
+  }
+
+  const runSdUpdate = (): void => {
+    void (async () => {
+      setSdBusy(true)
+      setSdMessage(t('settings.multimodal.sdBusy'))
+      try {
+        const next = await window.api.sdRuntime.ensure({ force: true })
+        setSdStatus(next)
+        setSdMessage(
+          next.ready
+            ? t('settings.multimodal.sdReady', {
+                tag: next.tag ? ` · ${next.tag}` : ''
+              })
+            : t('settings.multimodal.sdNotInstalled')
+        )
+      } catch (e) {
+        setSdMessage(e instanceof Error ? e.message : String(e))
+        await refreshSd()
+      } finally {
+        setSdBusy(false)
+      }
+    })()
+  }
+
+  const sdStatusLine = [
+    usingCustomSd
+      ? t('settings.multimodal.sdCustomPath')
+      : sdStatus?.source === 'missing'
+        ? t('settings.multimodal.sdNotInstalled')
+        : sdStatus?.ready
+          ? t('settings.multimodal.sdReady', {
+              tag: sdStatus.tag ? ` · ${sdStatus.tag}` : ''
+            })
+          : t('settings.multimodal.sdNotInstalled'),
+    !usingCustomSd && sdStatus?.updateAvailable && sdStatus.latestTag
+      ? t('settings.multimodal.sdUpdateAvailable', { tag: sdStatus.latestTag })
+      : !usingCustomSd && sdStatus?.ready && sdStatus.latestTag && !sdStatus.updateAvailable
+        ? t('settings.multimodal.sdUptoDate')
+        : null,
+    sdMessage
+  ]
+    .filter(Boolean)
+    .join(' · ')
+
   return (
     <>
       <PageIntro>{t('settings.page.modelIntro')}</PageIntro>
@@ -1156,18 +1259,37 @@ function ModelPage({
             {t('settings.multimodal.negativePromptHint')}
           </p>
         </Field>
-        <SettingRow title={t('settings.multimodal.sdRuntime')}>
-          <button
-            type="button"
-            className={settingsBtnClass}
-            onClick={() => {
-              void window.api.sdRuntime.ensure().catch((err: unknown) => {
-                console.error(err)
-              })
-            }}
-          >
-            {t('settings.multimodal.ensureSd')}
-          </button>
+        <SettingRow title={t('settings.multimodal.sdRuntime')} description={sdStatusLine}>
+          <div className="flex flex-wrap items-center justify-end gap-2">
+            <button
+              type="button"
+              disabled={sdBusy || busy || !canCheckSd}
+              onClick={() => runSdCheck()}
+              className={settingsBtnClass}
+              title={
+                usingCustomSd
+                  ? t('settings.multimodal.sdCustomPath')
+                  : t('settings.multimodal.sdCheckHint')
+              }
+            >
+              {t('settings.multimodal.sdCheck')}
+            </button>
+            <button
+              type="button"
+              disabled={sdBusy || busy || !canUpdateSd}
+              onClick={() => runSdUpdate()}
+              className={canUpdateSd ? settingsPrimaryBtnClass : settingsBtnClass}
+              title={
+                canUpdateSd && sdStatus?.latestTag
+                  ? t('settings.multimodal.sdUpdateAvailable', {
+                      tag: sdStatus.latestTag
+                    })
+                  : t('settings.multimodal.sdUpdateDisabled')
+              }
+            >
+              {t('settings.multimodal.sdUpdate')}
+            </button>
+          </div>
         </SettingRow>
       </Well>
     </>

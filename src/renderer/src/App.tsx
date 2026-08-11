@@ -42,6 +42,10 @@ import { WorkspacePlusMenu } from './components/WorkspacePlusMenu'
 import { TitleBar, listMenuShortcuts, type TitleBarAction } from './components/TitleBar'
 import { useI18n } from './i18n/I18nProvider'
 import {
+  localizeLlmState,
+  localizeStatusDetail
+} from './i18n/localizeStatusDetail'
+import {
   CommandPalette,
   type PaletteCommand,
   type PaletteMode
@@ -735,9 +739,9 @@ export default function App(): React.JSX.Element {
 
   const deleteSessionInRoot = useCallback((root: string, id: string) => {
     const sessions = sessionsByRoot[root] ?? []
-    const title = sessions.find((s) => s.id === id)?.title || 'New agent'
+    const title = sessions.find((s) => s.id === id)?.title || t('chat.newAgent')
     setDeleteChatTarget({ root, id, title })
-  }, [sessionsByRoot])
+  }, [sessionsByRoot, t])
 
   const confirmDeleteChat = useCallback(async () => {
     const target = deleteChatTarget
@@ -1746,12 +1750,16 @@ export default function App(): React.JSX.Element {
           onClick={openScm}
           title={
             gitStatus?.available
-              ? `${gitStatus.branch ?? 'git'}${
-                  gitStatus.ahead != null || gitStatus.behind != null
-                    ? ` · ↑${gitStatus.ahead ?? 0} ↓${gitStatus.behind ?? 0}`
-                    : ''
-                } · staged ${gitStatus.stagedCount} · changes ${gitStatus.unstagedCount}`
-              : 'Source Control'
+              ? t('status.git.title', {
+                  branch: `${gitStatus.branch ?? 'git'}${
+                    gitStatus.ahead != null || gitStatus.behind != null
+                      ? ` · ↑${gitStatus.ahead ?? 0} ↓${gitStatus.behind ?? 0}`
+                      : ''
+                  }`,
+                  staged: gitStatus.stagedCount,
+                  changes: gitStatus.unstagedCount
+                })
+              : t('status.git.sourceControl')
           }
           className="max-w-[240px] truncate text-left hover:text-ink-bright"
         >
@@ -1761,12 +1769,12 @@ export default function App(): React.JSX.Element {
                   ? ` ↑${gitStatus.ahead ?? 0} ↓${gitStatus.behind ?? 0}`
                   : ''
               } · ${gitStatus.stagedCount + gitStatus.unstagedCount}`
-            : 'no git'}
+            : t('status.git.none')}
         </button>
         <span className="text-ink-line">|</span>
         <button
           type="button"
-          title="Problems (repo + Monaco diagnostics)"
+          title={t('status.problemsTitle')}
           onClick={() => {
             setIdeOpen(true)
             setWorkspaceTab('code')
@@ -1786,7 +1794,7 @@ export default function App(): React.JSX.Element {
         <span className="text-ink-line">|</span>
         <button
           type="button"
-          title="Debug (Node Inspector)"
+          title={t('status.debugTitle')}
           onClick={() => {
             setIdeOpen(true)
             setWorkspaceTab('code')
@@ -1806,45 +1814,55 @@ export default function App(): React.JSX.Element {
         <span className="text-ink-line">|</span>
         <span
           className={`max-w-[280px] truncate ${stateColor}`}
-          title={status?.error ?? status?.detail ?? undefined}
+          title={
+            status?.error
+              ? localizeStatusDetail(status.error, t)
+              : status?.detail
+                ? localizeStatusDetail(status.detail, t)
+                : undefined
+          }
         >
-          {status?.state ?? '…'}
+          {localizeLlmState(status?.state, t)}
           {status?.detail && status.detail !== status.state
-            ? ` · ${status.detail}`
+            ? ` · ${localizeStatusDetail(status.detail, t)}`
             : ''}
         </span>
         {status?.state === 'ready' ? (
           <button
             type="button"
             onClick={() => void unloadModel()}
-            title="Unload model (free VRAM/RAM)"
+            title={t('status.action.unloadTitle')}
             className="text-rose-400 hover:text-rose-300"
           >
-            unload
+            {t('status.action.unload')}
           </button>
         ) : status?.state === 'starting' ? (
           <button
             type="button"
             onClick={() => void unloadModel()}
-            title="Cancel model load"
+            title={t('status.action.cancelLoadTitle')}
             className="text-amber-400 hover:text-ink-bright"
           >
-            Loading…
+            {t('status.action.loading')}
           </button>
         ) : (
           <button
             type="button"
             onClick={() => void reloadModel()}
-            title="Start llama-server and load model"
+            title={t('status.action.loadTitle')}
             className="text-blue-400 hover:text-blue-300"
           >
-            load
+            {t('status.action.load')}
           </button>
         )}
         <span className="text-ink-line">|</span>
-        <span>Ctrl+` term</span>
-        <span>Ctrl+, settings</span>
-        {status?.ctxSize != null && <span title="llama --ctx-size">ctx {status.ctxSize}</span>}
+        <span>{t('status.termHint')}</span>
+        <span>{t('status.settingsHint')}</span>
+        {status?.ctxSize != null && (
+          <span title={t('status.ctxTitle')}>
+            {t('status.ctx', { n: status.ctxSize })}
+          </span>
+        )}
         {appVersion ? (
           <button
             type="button"
@@ -1866,10 +1884,10 @@ export default function App(): React.JSX.Element {
           }
           title={
             !localApiEnabled
-              ? 'Local API disabled'
+              ? t('status.api.off')
               : status?.state === 'ready'
-                ? `Local API · ${status.baseUrl ?? ''}`
-                : 'Local API on · model not loaded'
+                ? t('status.api.onReady', { url: status.baseUrl ?? '' })
+                : t('status.api.onWaiting')
           }
         >
           {(status?.baseUrl ?? 'http://127.0.0.1:8080').replace(/^https?:\/\//, '')}

@@ -59,6 +59,11 @@ import {
 } from '../../../shared/diffStat'
 import { useI18n } from '../i18n/I18nProvider'
 import {
+  localizeActivitySuffix,
+  localizeActivityVerb,
+  localizeStatusDetail
+} from '../i18n/localizeStatusDetail'
+import {
   registerAgentGenerationStop,
   setAgentGenerationBusy
 } from '../agent/agentBusyGate'
@@ -1070,8 +1075,9 @@ export function ChatPanel({
   )
 
   const visibleMessages = messages.filter((m) => isVisibleChatMessage(m))
-  const threadTitle =
+  const rawTitle =
     sessionList.find((s) => s.id === sessionId)?.title || deriveThreadTitle(messages)
+  const threadTitle = isDefaultChatTitle(rawTitle) ? t('chat.newAgent') : rawTitle
 
   const feedItems = buildComposerFeed(visibleMessages)
 
@@ -1098,7 +1104,7 @@ export function ChatPanel({
         {!hideSessionChrome && (
           <button
             type="button"
-            title="New agent"
+            title={t('chat.newAgentTitle')}
             onClick={() => void newAgent()}
             className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-ink-mute hover:bg-ink-900 hover:text-ink-bright"
           >
@@ -1528,7 +1534,7 @@ export function ChatPanel({
         <form onSubmit={onSubmit}>
           {slotBanner ? (
             <div className="mb-1.5 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-1.5 text-[11px] text-amber-200">
-              {slotBanner}
+              {localizeStatusDetail(slotBanner, t)}
             </div>
           ) : null}
           <div
@@ -2015,6 +2021,7 @@ function ThinkThroughBody({
   streaming?: boolean
   durationLabel?: string
 }): React.JSX.Element {
+  const { t } = useI18n()
   const parts = parseThinkBlocks(promoteThinkOnlyAnswer(content))
   const hasThink = parts.some((p) => p.kind === 'think')
   if (!hasThink) {
@@ -2024,10 +2031,10 @@ function ThinkThroughBody({
   }
   const thoughtLabel =
     durationLabel && !streaming
-      ? `Thought for ${durationLabel}`
+      ? t('chat.thought.forDuration', { duration: durationLabel })
       : streaming
-        ? 'Thinking'
-        : 'Thought briefly'
+        ? t('chat.thought.thinking')
+        : t('chat.thought.briefly')
   return (
     <div className="space-y-2">
       {parts.map((p, i) =>
@@ -2112,6 +2119,12 @@ function ToolActivityRow({
   const { t } = useI18n()
   const activity = activityProp ?? resolveActivity(m)
   const parts = formatActivityParts(activity)
+  const verbLabel = localizeActivityVerb(parts.verb, t)
+  const suffixLabel = localizeActivitySuffix(parts.suffix, t)
+  const targetLabel =
+    parts.target && /^(1 file|\d+ files)$/i.test(parts.target)
+      ? localizeActivitySuffix(parts.target, t)
+      : parts.target
   const stat = diffStatFromCodePreview(m.toolName, m.codePreview, m.content)
   const add = stat?.added ?? 0
   const rem = stat?.removed ?? 0
@@ -2142,7 +2155,7 @@ function ToolActivityRow({
   return (
     <div className="space-y-1.5">
       <div className="flex flex-wrap items-baseline gap-x-1.5 gap-y-0 text-[12.5px] leading-snug text-ink-mute">
-        <span className="text-ink-mute/90">{parts.verb}</span>
+        <span className="text-ink-mute/90">{verbLabel}</span>
         {pathForOpen &&
         (activity.kind === 'read' ||
           activity.kind === 'edit' ||
@@ -2165,11 +2178,11 @@ function ToolActivityRow({
               <span className="font-mono text-[11px] text-ink-mute">{parts.lineRange}</span>
             ) : null}
           </>
-        ) : parts.target ? (
-          <span className="truncate text-ink-soft">{parts.target}</span>
+        ) : targetLabel ? (
+          <span className="truncate text-ink-soft">{targetLabel}</span>
         ) : null}
-        {parts.suffix ? (
-          <span className="text-ink-mute/70">({parts.suffix})</span>
+        {suffixLabel ? (
+          <span className="text-ink-mute/70">({suffixLabel})</span>
         ) : null}
         {showStat && (
           <span className="font-mono text-[11px]">

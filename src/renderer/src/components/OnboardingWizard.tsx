@@ -1,7 +1,10 @@
 import { useEffect, useMemo, useState } from 'react'
-import type { AppSettings, DiscoveredModel } from '../../../shared/settings'
+import type { AppSettings, DiscoveredModel, UiTheme } from '../../../shared/settings'
+import type { UiLanguage } from '../../../shared/i18n'
 import type { StoreDownloadTarget } from '../../../shared/hfStore'
+import { applyDocumentTheme, UI_THEMES } from '../../../shared/theme'
 import { isLikelyVisionGguf, scoreVisionGguf } from '../../../shared/visionDetect'
+import { applyMonacoTheme } from '../editor/monacoSetup'
 import { useI18n } from '../i18n/I18nProvider'
 import { ModelStorePanel } from './ModelStorePanel'
 
@@ -23,7 +26,7 @@ export function OnboardingWizard({
   onComplete,
   onOpenSettings
 }: OnboardingWizardProps): React.JSX.Element | null {
-  const { t } = useI18n()
+  const { t, lang, setLang } = useI18n()
   const [step, setStep] = useState<Step>('welcome')
   const [codingMode, setCodingMode] = useState(true)
   const [imageMode, setImageMode] = useState(false)
@@ -34,6 +37,16 @@ export function OnboardingWizard({
   const [loadAfterSave, setLoadAfterSave] = useState(true)
   const [storeOpen, setStoreOpen] = useState(false)
   const [storeTarget, setStoreTarget] = useState<StoreDownloadTarget>('chat')
+
+  const themeLabelKey: Record<(typeof UI_THEMES)[number], string> = {
+    auto: 'settings.theme.auto',
+    classic: 'settings.theme.classic',
+    light: 'settings.theme.light',
+    sepia: 'settings.theme.sepia',
+    dark: 'settings.theme.dark',
+    'deep-dark': 'settings.theme.deepDark',
+    'solarized-dark': 'settings.theme.solarizedDark'
+  }
 
   const refreshModels = async (modelsDir?: string): Promise<void> => {
     if (modelsDir) {
@@ -85,6 +98,18 @@ export function OnboardingWizard({
 
   const patch = <K extends keyof AppSettings>(key: K, value: AppSettings[K]): void => {
     setSettings({ ...settings, [key]: value })
+  }
+
+  const setTheme = (theme: UiTheme): void => {
+    patch('uiTheme', theme)
+    applyDocumentTheme(theme)
+    applyMonacoTheme(theme)
+    void window.api.settings.save({ uiTheme: theme })
+  }
+
+  const setLanguage = (next: UiLanguage): void => {
+    patch('uiLanguage', next)
+    setLang(next)
   }
 
   const pickDir = async (): Promise<void> => {
@@ -408,7 +433,46 @@ export function OnboardingWizard({
           )}
         </div>
 
-        <div className="mt-6 flex flex-wrap items-center justify-end gap-2 border-t border-ink-line pt-4">
+        <div className="mt-6 flex flex-wrap items-center justify-between gap-3 border-t border-ink-line pt-4">
+          <div className="flex flex-wrap items-center gap-2">
+            <select
+              value={settings.uiTheme}
+              onChange={(e) => setTheme(e.target.value as UiTheme)}
+              className="onb-input !w-auto min-w-[9rem] py-1.5 text-xs"
+              aria-label={t('settings.theme')}
+              title={t('settings.theme')}
+            >
+              {UI_THEMES.map((id) => (
+                <option key={id} value={id}>
+                  {t(themeLabelKey[id] as 'settings.theme.auto')}
+                </option>
+              ))}
+            </select>
+            <div className="flex gap-1">
+              {(
+                [
+                  ['en', 'settings.language.en'],
+                  ['ru', 'settings.language.ru']
+                ] as const
+              ).map(([id, labelKey]) => (
+                <button
+                  key={id}
+                  type="button"
+                  onClick={() => setLanguage(id)}
+                  className={
+                    'rounded-md border px-2.5 py-1.5 text-xs ' +
+                    (lang === id
+                      ? 'border-signal bg-signal/15 text-ink-bright'
+                      : 'border-ink-line text-ink-mute hover:bg-ink-800')
+                  }
+                  title={t(labelKey)}
+                >
+                  {id.toUpperCase()}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="flex flex-wrap items-center justify-end gap-2">
           {step === 'welcome' && (
             <button
               type="button"
@@ -496,6 +560,7 @@ export function OnboardingWizard({
               </button>
             </>
           )}
+          </div>
         </div>
       </div>
 

@@ -1061,13 +1061,21 @@ function registerIpc(): void {
 
   ipcMain.handle('sd-runtime:status', () => {
     const settings = settingsStore?.get()
-    return sdRuntime.resolveStatus(settings?.sdCppPath)
+    return sdRuntime.getStatus(settings?.sdCppPath)
   })
 
-  ipcMain.handle('sd-runtime:ensure', async () => {
+  ipcMain.handle('sd-runtime:check', async () => {
     const settings = settingsStore?.get()
-    return sdRuntime.ensure(settings?.sdCppPath)
+    return sdRuntime.check(settings?.sdCppPath)
   })
+
+  ipcMain.handle(
+    'sd-runtime:ensure',
+    async (_e, opts?: { force?: boolean }) => {
+      const settings = settingsStore?.get()
+      return sdRuntime.ensure(settings?.sdCppPath, opts?.force === true)
+    }
+  )
 
   ipcMain.handle('sd-runtime:progress', () => sdRuntime.getProgress())
 
@@ -1931,8 +1939,12 @@ app.whenReady().then(async () => {
     },
     settingsStore?.get().uiLanguage ?? 'en'
   )
-  // Quiet update check once UI is up (packaged only)
+  // Quiet update checks once UI is up
   setTimeout(() => appUpdater.checkQuiet(), 4_000)
+  setTimeout(() => {
+    const path = settingsStore?.get().sdCppPath
+    sdRuntime.checkQuiet(path)
+  }, 5_000)
 
   try {
     await bootInference()

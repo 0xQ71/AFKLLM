@@ -21,12 +21,14 @@ That text is what AFKLLM shows in the post-update “What's new” modal
   VAE on GPU in `vram` mode; default negative prompt for gibberish text)
 - **Chat UX** — auto-title from first prompt; Think answers not stuck inside `<think>`; Context gauge fix
 
-### Since 0.1.0 — agent reliability
+### Fixed (what we repaired)
 
-- Soft guards: tool loops, incomplete writes, favicon / blank-image fail-soft
-- Small files: overwrite-friendly edits; fuzzy patch/diff matching
-- Less premature context compaction
-- Settings overlay keeps chat mounted; block Unload while generating (from 0.1.0-20260807)
+- **Blank white FLUX images** — prefer non-scaled T5; blank detection; VAE on GPU in `vram`
+- **3× Steps** on hires (base + full redo) → single hires pass (~2×), base only as fallback
+- Chat title stuck as **“New agent”** in the sidebar after auto-name
+- **`Edited · failed` loops** on small files — overwrite + fuzzy patch/diff
+- Premature context compact; Think replies trapped in `<think>`; Context gauge arc
+- Favicon / hard image-gen fail-soft; Settings overlay + write persistence (0.1.0-20260807)
 
 ### Installer
 

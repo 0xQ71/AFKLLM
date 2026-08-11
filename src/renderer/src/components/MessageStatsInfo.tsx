@@ -1,4 +1,6 @@
 import type { ChatMessageStats } from '../agent/runAgentTurn'
+import { useI18n } from '../i18n/I18nProvider'
+import type { MessageKey } from '../i18n/messages'
 
 function formatDuration(ms: number): string {
   if (ms < 1000) return `${Math.max(1, Math.round(ms))}ms`
@@ -9,28 +11,41 @@ function formatDuration(ms: number): string {
   return `${m}m ${s.toString().padStart(2, '0')}s`
 }
 
-export function formatStatsSummary(stats: ChatMessageStats): string {
+type TFn = (key: MessageKey, vars?: Record<string, string | number>) => string
+
+export function formatStatsSummary(stats: ChatMessageStats, t?: TFn): string {
   const parts: string[] = []
   const gen = stats.genMs ?? stats.elapsedMs
   if (gen != null) parts.push(formatDuration(gen))
   if (stats.tps != null) parts.push(`${stats.tps} t/s`)
   if (stats.completionTokens != null) parts.push(`${stats.completionTokens} tok`)
   else if (stats.totalTokens != null) parts.push(`${stats.totalTokens} tok`)
-  if (stats.promptTps != null) parts.push(`prompt ${stats.promptTps} t/s`)
-  if (stats.turnElapsedMs != null) parts.push(`total ${formatDuration(stats.turnElapsedMs)}`)
+  if (stats.promptTps != null) {
+    parts.push(
+      t
+        ? t('stats.promptShort', { n: stats.promptTps })
+        : `prompt ${stats.promptTps} t/s`
+    )
+  }
+  if (stats.turnElapsedMs != null) {
+    const d = formatDuration(stats.turnElapsedMs)
+    parts.push(t ? t('stats.totalShort', { duration: d }) : `total ${d}`)
+  }
   return parts.join(' · ')
 }
 
-function statsLines(stats: ChatMessageStats): string[] {
+function statsLines(stats: ChatMessageStats, t: TFn): string[] {
   const lines: string[] = []
   const gen = stats.genMs ?? stats.elapsedMs
-  if (gen != null) lines.push(`Generation ${formatDuration(gen)}`)
-  if (stats.tps != null) lines.push(`${stats.tps} tokens/sec`)
-  if (stats.promptTps != null) lines.push(`Prompt eval ${stats.promptTps} t/s`)
-  if (stats.completionTokens != null) lines.push(`Completion +${stats.completionTokens} tok`)
-  if (stats.promptTokens != null) lines.push(`Prompt ${stats.promptTokens} tok`)
-  if (stats.totalTokens != null) lines.push(`Total ${stats.totalTokens} tok`)
-  if (stats.turnElapsedMs != null) lines.push(`Turn ${formatDuration(stats.turnElapsedMs)}`)
+  if (gen != null) lines.push(t('stats.generation', { duration: formatDuration(gen) }))
+  if (stats.tps != null) lines.push(t('stats.tokensPerSec', { n: stats.tps }))
+  if (stats.promptTps != null) lines.push(t('stats.promptEval', { n: stats.promptTps }))
+  if (stats.completionTokens != null)
+    lines.push(t('stats.completion', { n: stats.completionTokens }))
+  if (stats.promptTokens != null) lines.push(t('stats.prompt', { n: stats.promptTokens }))
+  if (stats.totalTokens != null) lines.push(t('stats.total', { n: stats.totalTokens }))
+  if (stats.turnElapsedMs != null)
+    lines.push(t('stats.turn', { duration: formatDuration(stats.turnElapsedMs) }))
   return lines
 }
 
@@ -58,50 +73,30 @@ export function MessageStatsInfo({
   stats,
   align = 'start'
 }: MessageStatsInfoProps): React.JSX.Element | null {
+  const { t } = useI18n()
   if (!hasDisplayableStats(stats)) return null
-  const lines = statsLines(stats)
-  const summary = formatStatsSummary(stats)
-  if (lines.length === 0) return null
-
+  const summary = formatStatsSummary(stats, t)
+  const lines = statsLines(stats, t)
   return (
-    <div
+    <details
       className={
-        'group/stats relative mt-1 inline-flex ' +
-        (align === 'end' ? 'justify-end self-end' : '')
+        'group mt-0.5 text-[10px] text-ink-mute ' +
+        (align === 'end' ? 'text-right' : 'text-left')
       }
     >
-      <button
-        type="button"
-        className="flex h-5 w-5 items-center justify-center rounded-full text-ink-mute hover:bg-ink-800 hover:text-ink-soft"
-        aria-label={summary}
-        title={summary}
-      >
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden>
-          <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="1.6" />
-          <path
-            d="M12 11v5"
-            stroke="currentColor"
-            strokeWidth="1.8"
-            strokeLinecap="round"
-          />
-          <circle cx="12" cy="8" r="1" fill="currentColor" />
-        </svg>
-      </button>
+      <summary className="cursor-pointer list-none select-none hover:text-ink-soft [&::-webkit-details-marker]:hidden">
+        {summary}
+      </summary>
       <div
-        role="tooltip"
         className={
-          'pointer-events-none absolute bottom-full z-40 mb-1.5 hidden min-w-[11rem] max-w-[18rem] ' +
-          'rounded-md border border-ink-line bg-ink-900 px-2.5 py-2 shadow-xl ' +
-          'group-hover/stats:block ' +
-          (align === 'end' ? 'right-0' : 'left-0')
+          'mt-1 space-y-0.5 font-mono leading-relaxed ' +
+          (align === 'end' ? 'text-right' : 'text-left')
         }
       >
-        <ul className="space-y-0.5 font-mono text-[10px] leading-snug text-ink-soft">
-          {lines.map((line) => (
-            <li key={line}>{line}</li>
-          ))}
-        </ul>
+        {lines.map((line) => (
+          <div key={line}>{line}</div>
+        ))}
       </div>
-    </div>
+    </details>
   )
 }

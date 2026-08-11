@@ -44,6 +44,8 @@ export class SdRuntimeManager {
     fraction: 0
   }
   private inflight: Promise<SdRuntimeStatus> | null = null
+  private latestTagCache: { tag: string; at: number } | null = null
+  private lastCheckError: string | null = null
 
   setWindow(win: BrowserWindow | null): void {
     this.window = win
@@ -68,42 +70,105 @@ export class SdRuntimeManager {
   resolveStatus(customPath?: string): SdRuntimeStatus {
     const dir = this.runtimeDir()
     if (customPath?.trim() && existsSync(customPath.trim())) {
-      return {
+      return this.withCheckCache({
         ready: true,
         binaryPath: customPath.trim(),
         dir: dirname(customPath.trim()),
         tag: null,
         source: 'custom'
-      }
+      })
     }
     const binaryPath = join(dir, this.binaryName())
     if (existsSync(binaryPath)) {
       const manifest = this.readManifest()
-      return {
+      return this.withCheckCache({
         ready: true,
         binaryPath,
         dir,
         tag: manifest?.tag ?? null,
         source: 'downloaded'
-      }
+      })
     }
     const nested = this.findBinaryRecursive(dir)
     if (nested) {
-      return {
+      return this.withCheckCache({
         ready: true,
         binaryPath: nested,
         dir,
         tag: this.readManifest()?.tag ?? null,
         source: 'downloaded'
-      }
+      })
     }
-    return {
+    return this.withCheckCache({
       ready: false,
       binaryPath: null,
       dir,
       tag: null,
       source: 'missing'
+    })
+  }
+
+  /** Local status merged with last GitHub check cache (no network). */
+  getStatus(customPath?: string): SdRuntimeStatus {
+    return this.resolveStatus(customPath)
+  }
+
+  private withCheckCache(base: SdRuntimeStatus): SdRuntimeStatus {
+    const latestTag = this.latestTagCache?.tag ?? null
+    const updateAvailable = Boolean(
+      base.source === 'downloaded' &&
+        base.tag &&
+        latestTag &&
+        base.tag !== latestTag
+    )
+    return {
+      ...base,
+      latestTag,
+      updateAvailable,
+      checkError: this.lastCheckError
     }
+  }
+
+  /**
+   * Fetch latest GitHub release tag and compare to installed manifest.
+   * Does not download. Sets checkError on failure (does not throw when quiet).
+   */
+  async check(
+    customPath?: string,
+    opts: { quiet?: boolean } = {}
+  ): Promise<SdRuntimeStatus> {
+    const quiet = opts.quiet === true
+    const base = this.resolveStatus(customPath)
+    if (base.source === 'custom') {
+      this.lastCheckError = null
+      return this.withCheckCache(base)
+    }
+    try {
+      const release = await fetchLatestRelease()
+      this.latestTagCache = { tag: release.tag_name, at: Date.now() }
+      this.lastCheckError = null
+      if (!quiet) {
+        this.emit({
+          phase: 'ready',
+          label: `Latest sd-cli: ${release.tag_name}`,
+          fraction: 1,
+          tag: release.tag_name
+        })
+      }
+      return this.withCheckCache(this.resolveStatus(customPath))
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      this.lastCheckError = msg
+      if (!quiet) {
+        this.emit({ phase: 'error', label: msg, error: msg, fraction: 0 })
+      }
+      return this.withCheckCache(this.resolveStatus(customPath))
+    }
+  }
+
+  /** Background launch check; never downloads. */
+  checkQuiet(customPath?: string): void {
+    void this.check(customPath, { quiet: true })
   }
 
   private findBinaryRecursive(root: string, depth = 0): string | null {
@@ -262,6 +327,8 @@ export class SdRuntimeManager {
       cudart
     }
     await fs.writeFile(this.manifestPath(), JSON.stringify(manifest, null, 2), 'utf8')
+    this.latestTagCache = { tag: release.tag_name, at: Date.now() }
+    this.lastCheckError = null
 
     this.emit({
       phase: 'ready',
