@@ -5,6 +5,10 @@ import { app } from 'electron'
 import { EventEmitter } from 'node:events'
 import { execSync } from 'node:child_process'
 import type { CacheQuant, FlashAttnMode, LoadMode } from '../../shared/settings'
+import {
+  shouldEnableDraftMtp,
+  speculativeMtpUnsupported
+} from '../../shared/llamaSpec'
 
 export interface LlamaProcessOptions {
   binaryPath?: string
@@ -108,6 +112,10 @@ export class LlamaProcessManager extends EventEmitter {
     return this.options.modelPath
   }
 
+  get mmprojPath(): string {
+    return this.options.mmprojPath ?? ''
+  }
+
   get port(): number {
     return this.options.port
   }
@@ -142,7 +150,7 @@ export class LlamaProcessManager extends EventEmitter {
     return false
   }
 
-  async start(opts?: { force?: boolean }): Promise<void> {
+  async start(opts?: { force?: boolean; skipMtp?: boolean }): Promise<void> {
     if (!opts?.force && this.state === 'ready') return
 
     if (!opts?.force && this.state === 'starting') {
@@ -180,7 +188,16 @@ export class LlamaProcessManager extends EventEmitter {
     this.statusDetail = 'spawning llama-server…'
     this.recentLogs = ''
 
-    const parallel = Math.max(1, this.options.parallel | 0)
+    const skipMtp = opts?.skipMtp === true
+    const useMtp =
+      !skipMtp &&
+      shouldEnableDraftMtp({
+        modelPath: this.options.modelPath,
+        mmprojPath: this.options.mmprojPath
+      })
+    // Speculative MTP is single-stream; keep user --parallel for non-MTP models only.
+    const parallel = useMtp ? 1 : Math.max(1, this.options.parallel | 0)
+    const draftN = 3
     const args = [
       '-m',
       this.options.modelPath,
@@ -212,6 +229,14 @@ export class LlamaProcessManager extends EventEmitter {
       this.options.fitHardware ? 'on' : 'off',
       '--jinja'
     ]
+
+    if (useMtp) {
+      args.push('--spec-type', 'draft-mtp', '--spec-draft-n-max', String(draftN))
+      this.emit(
+        'log',
+        `[afkllm] speculative MTP on (--spec-type draft-mtp --spec-draft-n-max ${draftN}, --parallel 1)\n`
+      )
+    }
 
     if (this.options.threads > 0) {
       args.push('--threads', String(this.options.threads))
@@ -284,7 +309,21 @@ export class LlamaProcessManager extends EventEmitter {
       this.setState('error')
     })
 
-    await this.waitUntilReady(600_000, epoch)
+    try {
+      await this.waitUntilReady(600_000, epoch)
+    } catch (err) {
+      if (
+        useMtp &&
+        epoch === this.startEpoch &&
+        speculativeMtpUnsupported(`${this.recentLogs}\n${this.lastError ?? ''}`)
+      ) {
+        this.statusDetail = 'MTP flags unsupported · retrying without…'
+        this.emit('log', '[afkllm] llama-server has no --spec-type draft-mtp; retrying without MTP\n')
+        await this.start({ force: true, skipMtp: true })
+        return
+      }
+      throw err
+    }
   }
 
   async stop(): Promise<void> {
@@ -415,15 +454,19 @@ export class LlamaProcessManager extends EventEmitter {
     throw new Error(this.lastError)
   }
 
-  /** Kill stray listeners on our port (Windows). Safe to call without a manager instance. */
+  /** Kill stray listeners on our exact TCP port (Windows). Safe without a manager instance. */
   static killListenersOnPort(port: number): void {
     if (process.platform !== 'win32') return
+    if (!Number.isInteger(port) || port <= 0) return
     try {
-      const out = execSync(`netstat -ano | findstr :${port}`, { encoding: 'utf8' })
+      const out = execSync('netstat -ano', { encoding: 'utf8' })
       const pids = new Set<string>()
       for (const line of out.split(/\r?\n/)) {
         if (!/LISTENING/i.test(line)) continue
         const parts = line.trim().split(/\s+/)
+        const local = parts[1] ?? ''
+        const m = local.match(/:(\d+)$/)
+        if (!m || Number(m[1]) !== port) continue
         const pid = parts[parts.length - 1]
         if (pid && /^\d+$/.test(pid) && pid !== '0') pids.add(pid)
       }

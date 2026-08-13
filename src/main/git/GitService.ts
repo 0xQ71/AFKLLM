@@ -190,7 +190,7 @@ export class GitService {
     const msg = message.trim()
     if (!msg) return { ok: false, error: 'Empty commit message' }
     try {
-      await this.git(['commit', '-m', msg])
+      await this.git(['commit', '-m', msg], 60_000)
       return { ok: true }
     } catch (err) {
       return { ok: false, error: errMsg(err) }

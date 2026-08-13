@@ -265,3 +265,5 @@ AFKLLM is released under the **MIT License** — see [LICENSE](LICENSE).
   (regenerate with `npm run licenses:third-party` after dependency changes)
 
 Copyright © 2026 [0xQ71](https://github.com/0xQ71).
+
+> **Примечание:** AFKLLM разрабатывается с использованием современных AI-инструментов для ускорения разработки. Автор является ответственным за всю архитектуру и финальные инженерные решения.

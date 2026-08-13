@@ -25,14 +25,22 @@ export class TerminalManager {
   private dataListeners = new Set<(id: string, data: string) => void>()
   /** Stop button cancels in-flight runVisibleCommand. */
   private activeCommandCancel: (() => void) | null = null
-  /** Blocks UI keystrokes during inject (IME races → сWrite-Host). */
+  /** Blocks UI keystrokes only during inject (IME races). */
   private agentInputLocked = false
+  /** When true, auto-answer CLI y/n prompts while an agent command runs. */
+  private autoConfirmGetter: (() => boolean) | null = null
+  private autoYesSent = false
+  private autoYesAt = 0
   private previewScanBuf = ''
   private lastPreviewUrl: string | null = null
   private lastPreviewAt = 0
 
   setWindow(win: BrowserWindow | null): void {
     this.window = win
+  }
+
+  setAutoConfirm(getter: (() => boolean) | null): void {
+    this.autoConfirmGetter = getter
   }
 
   ensureOpen(): void {
@@ -159,7 +167,7 @@ export class TerminalManager {
     this.sessions.get(id)?.write(data)
   }
 
-  /** Drop UI keystrokes while agent command is injecting/running. */
+  /** Drop UI keystrokes only while agent is injecting the command line. */
   writeFromUi(id: string, data: string): void {
     if (this.agentInputLocked) return
     this.write(id, data)
@@ -234,6 +242,8 @@ export class TerminalManager {
         .replace(/\r/g, '')
 
     this.agentInputLocked = true
+    this.autoYesSent = false
+    this.autoYesAt = 0
 
     try {
       await this.flushPromptLine(session.id)
@@ -276,6 +286,22 @@ export class TerminalManager {
           const m = after.match(/^(\d+)/)
           if (m) finish(Number(m[1]))
         }
+        // Auto-confirm CLI y/n when agent has full rights (agentAutoApprove).
+        if (
+          this.autoConfirmGetter?.() &&
+          !this.autoYesSent &&
+          Date.now() - this.autoYesAt > 800
+        ) {
+          const tail = plain.slice(-500)
+          if (
+            /(?:\(y\/n\)|\[Y\/n\]|\[y\/N\]|\byes\s*\/\s*no\b|\b\(yes\/no\))/i.test(tail) &&
+            !/password|passphrase|pin\b/i.test(tail)
+          ) {
+            this.autoYesSent = true
+            this.autoYesAt = Date.now()
+            this.write(session.id, 'y\r')
+          }
+        }
       }
 
       this.dataListeners.add(onData)
@@ -291,6 +317,8 @@ export class TerminalManager {
 
       const script = this.wrapCommand(command, marker)
       this.write(session.id, script + '\r')
+      // Unlock stdin after inject so the user can answer prompts; agent wait continues.
+      this.agentInputLocked = false
     })
   }
 

@@ -61,7 +61,7 @@ type Manifest = {
 export class LlamaRuntimeManager {
   private window: BrowserWindow | null = null
   private progress: LlamaRuntimeProgress = idleProgress()
-  private inflight: Promise<LlamaRuntimeStatus> | null = null
+  private inflight = new Map<string, Promise<LlamaRuntimeStatus>>()
   private latestTagCache: { tag: string; at: number } | null = null
 
   setWindow(win: BrowserWindow | null): void {
@@ -268,11 +268,14 @@ export class LlamaRuntimeManager {
     customPath?: string,
     selection: LlamaRuntimeSelection = 'auto'
   ): Promise<LlamaRuntimeStatus> {
-    if (this.inflight) return this.inflight
-    this.inflight = this.ensureInner(options, customPath, selection).finally(() => {
-      this.inflight = null
+    const key = `${options.variant ?? selection}:${options.force ? '1' : '0'}:${customPath ?? ''}`
+    const existing = this.inflight.get(key)
+    if (existing) return existing
+    const run = this.ensureInner(options, customPath, selection).finally(() => {
+      this.inflight.delete(key)
     })
-    return this.inflight
+    this.inflight.set(key, run)
+    return run
   }
 
   private async ensureInner(

@@ -515,18 +515,23 @@ export class AgentToolRegistry {
       /* new file */
     }
 
-    // Block silent full rewrites — the #1 cause of "rewrites everything after compact"
+    // Block silent full rewrites of large files — the #1 cause of "rewrites everything after compact"
     if (!append && !overwrite && existing.trim().length > 40) {
       const tail = existing.slice(-350)
+      const small = existing.length < 6000
       return {
         id: '',
         name: 'write_file',
         ok: false,
         content:
           `FILE_EXISTS: "${relativePath}" already has ${existing.length} bytes.\n` +
-          `Do NOT rewrite from scratch. Use append=true to continue, or apply_diff to edit.\n` +
+          (small
+            ? `This is a small file. Call write_file again with overwrite=true and the FULL corrected content.\n`
+            : `Do NOT rewrite from scratch. Use apply_patch / apply_diff to edit, or append=true to continue.\n`) +
           `File currently ends with:\n<<<\n${tail}\n>>>`,
-        error: `FILE_EXISTS: ${relativePath} — use append=true or apply_diff`
+        error: small
+          ? `FILE_EXISTS: ${relativePath} — use overwrite=true for this small file`
+          : `FILE_EXISTS: ${relativePath} — use append=true or apply_diff`
       }
     }
 
@@ -652,7 +657,7 @@ export class AgentToolRegistry {
         content:
           `${applied.error}\n\n` +
           `NEXT: call read_file on "${relativePath}", then apply_diff again with a SHORT unique exact substring copied from the file.\n` +
-          `Do NOT rewrite the whole file with overwrite=true unless the user explicitly asked for a full rewrite.\n` +
+          `If this file is small (HTML/CSS/short script), use write_file overwrite=true with the full corrected content instead of retrying a long hunk.\n` +
           `Do not claim the environment forbids shell operators — use cwd=… or PowerShell ";".\n\n` +
           `--- file preview (first ~1200 chars) ---\n${preview}`,
         error: applied.error

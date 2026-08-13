@@ -37,6 +37,16 @@ export class ChatStore {
   private activeRootKey = '__none__'
   private roots: Record<string, ChatStoreSnapshot> = {}
   private cache: ChatStoreSnapshot
+  private writeChain: Promise<void> = Promise.resolve()
+
+  private enqueueWrite<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.writeChain.then(fn, fn)
+    this.writeChain = run.then(
+      () => undefined,
+      () => undefined
+    )
+    return run
+  }
 
   constructor() {
     this.path = join(app.getPath('userData'), 'chats.json')
@@ -60,6 +70,10 @@ export class ChatStore {
 
   /** Switch chat bucket for a project root; persists previous first. */
   async setWorkspaceRoot(root: string): Promise<ChatStoreSnapshot> {
+    return this.enqueueWrite(() => this.setWorkspaceRootInner(root))
+  }
+
+  private async setWorkspaceRootInner(root: string): Promise<ChatStoreSnapshot> {
     this.stashCurrent()
     const key = chatRootKey(root)
     // One-time: move pre-repo chats into the first real workspace
@@ -82,6 +96,10 @@ export class ChatStore {
    * the composer can create a fresh agent on the next send.
    */
   async forgetRoot(root: string): Promise<ChatStoreSnapshot> {
+    return this.enqueueWrite(() => this.forgetRootInner(root))
+  }
+
+  private async forgetRootInner(root: string): Promise<ChatStoreSnapshot> {
     const key = chatRootKey(root)
     if (this.activeRootKey === key) {
       this.cache = blankSnapshot()
@@ -139,33 +157,47 @@ export class ChatStore {
   }
 
   async setActive(id: string): Promise<ChatStoreSnapshot> {
-    if (!this.cache.sessions.some((s) => s.id === id)) return this.get()
-    this.cache.activeId = id
-    await this.persist()
-    return this.get()
+    return this.enqueueWrite(async () => {
+      if (!this.cache.sessions.some((s) => s.id === id)) return this.get()
+      this.cache.activeId = id
+      await this.persist()
+      return this.get()
+    })
   }
 
   async create(): Promise<ChatStoreSnapshot> {
-    const session = createEmptySession()
-    this.cache.sessions.unshift(session)
-    this.cache.activeId = session.id
-    this.trimSessions()
-    await this.persist()
-    return this.get()
+    return this.enqueueWrite(async () => {
+      const session = createEmptySession()
+      this.cache.sessions.unshift(session)
+      this.cache.activeId = session.id
+      this.trimSessions()
+      await this.persist()
+      return this.get()
+    })
   }
 
   async delete(id: string): Promise<ChatStoreSnapshot> {
-    this.cache.sessions = this.cache.sessions.filter((s) => s.id !== id)
-    if (this.cache.sessions.length === 0) {
-      this.cache.activeId = ''
-    } else if (this.cache.activeId === id) {
-      this.cache.activeId = this.cache.sessions[0]!.id
-    }
-    await this.persist()
-    return this.get()
+    return this.enqueueWrite(async () => {
+      this.cache.sessions = this.cache.sessions.filter((s) => s.id !== id)
+      if (this.cache.sessions.length === 0) {
+        this.cache.activeId = ''
+      } else if (this.cache.activeId === id) {
+        this.cache.activeId = this.cache.sessions[0]!.id
+      }
+      await this.persist()
+      return this.get()
+    })
   }
 
   async updateMessages(
+    id: string,
+    messages: PersistedChatMessage[],
+    title?: string
+  ): Promise<ChatStoreSnapshot> {
+    return this.enqueueWrite(() => this.updateMessagesInner(id, messages, title))
+  }
+
+  private async updateMessagesInner(
     id: string,
     messages: PersistedChatMessage[],
     title?: string

@@ -1,6 +1,7 @@
 import { existsSync, promises as fs } from 'node:fs'
 import { basename, dirname, join, relative } from 'node:path'
 import type { DiscoveredModel } from '../../shared/settings'
+import { scoreMmprojForVision } from '../../shared/visionDetect'
 
 /** Scan a directory tree for .gguf weights (skips mmproj side-cars). */
 export async function scanGgufModels(root: string): Promise<DiscoveredModel[]> {
@@ -75,8 +76,8 @@ export async function scanMmprojFiles(root: string): Promise<DiscoveredModel[]> 
 }
 
 /**
- * Prefer an explicit path; otherwise pick a *mmproj*.gguf in the same folder
- * as the vision model (first match by name).
+ * Prefer an explicit path; otherwise pick the *mmproj*.gguf in the same folder
+ * that best matches the vision GGUF name (not localeCompare-first).
  */
 export async function findMmprojForModel(
   visionModelPath: string,
@@ -91,10 +92,16 @@ export async function findMmprojForModel(
   const dir = dirname(model)
   try {
     const entries = await fs.readdir(dir)
-    const mmprojs = entries
-      .filter((n) => n.toLowerCase().endsWith('.gguf') && /mmproj/i.test(n))
-      .sort((a, b) => a.localeCompare(b))
-    if (mmprojs[0]) return join(dir, mmprojs[0])
+    const mmprojs = entries.filter(
+      (n) => n.toLowerCase().endsWith('.gguf') && /mmproj/i.test(n)
+    )
+    let best: { path: string; score: number } | null = null
+    for (const n of mmprojs) {
+      const full = join(dir, n)
+      const score = scoreMmprojForVision(full, model)
+      if (!best || score > best.score) best = { path: full, score }
+    }
+    if (best) return best.path
   } catch {
     /* ignore */
   }

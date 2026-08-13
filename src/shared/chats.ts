@@ -91,8 +91,7 @@ export function sanitizePersistedMessages(
   for (const m of msgs.slice(-CHAT_MAX_MESSAGES)) {
     if (!m || typeof m !== 'object') continue
     if (!m.id || !m.role || typeof m.content !== 'string') continue
-    if (m.id === 'agent-checklist') continue
-    // agent-plan is kept (persisted plan bubble with _Status: …_)
+    // agent-checklist / agent-todo / agent-plan are kept (live plan stages)
     const cleaned: PersistedChatMessage = {
       id: String(m.id),
       role: m.role,

@@ -15,7 +15,6 @@ interface AgentSidebarProps {
   switchSessionSignal?: { id: string; nonce: number } | null
   hideSessionChrome?: boolean
   onSessionsChange?: (sessions: SessionMeta[], activeId: string | null) => void
-  planModeSignal?: number
   headerActions?: React.ReactNode
   workspaceKey?: string | null
   gitBranch?: string | null

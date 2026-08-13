@@ -122,7 +122,6 @@ export default function App(): React.JSX.Element {
     Record<string, AgentSessionMeta[]>
   >({})
   const [railActiveSessionId, setRailActiveSessionId] = useState<string | null>(null)
-  const [planModeSignal, setPlanModeSignal] = useState(0)
   const [projectRoot, setProjectRoot] = useState<string | null>(null)
   const [recentRoots, setRecentRoots] = useState<string[]>([])
   const [outlineOpen, setOutlineOpen] = useState(true)
@@ -423,8 +422,10 @@ export default function App(): React.JSX.Element {
         prev.map((t) => (t.path === tab.path ? { ...t, content, dirty: false } : t))
       )
       setGitRefreshKey((n) => n + 1)
+      return
     }
-  }, [tabs, activePath])
+    showBusyBlockHint(res.error || t('editor.saveFailed'))
+  }, [tabs, activePath, showBusyBlockHint, t])
 
   saveRef.current = () => {
     void saveActive()
@@ -823,11 +824,6 @@ export default function App(): React.JSX.Element {
       return
     }
     await switchRoot(root)
-    try {
-      await window.api.chats.create()
-    } catch (e) {
-      console.error('Failed to create chat after folder pick', e)
-    }
     setPendingSendSignal({ text: pending.text, nonce: Date.now() })
   }, [pickFolderForSend, switchRoot])
 
@@ -858,6 +854,7 @@ export default function App(): React.JSX.Element {
     setTabs((prev) => {
       const existing = prev.find((t) => t.path === rel)
       if (existing) {
+        if (existing.dirty) return prev
         return prev.map((t) =>
           t.path === rel ? { ...t, content: res.content, dirty: false } : t
         )
@@ -1120,11 +1117,6 @@ export default function App(): React.JSX.Element {
           if (projectRoot) newAgentInRoot(projectRoot)
           else void openFolder()
         }
-      },
-      {
-        id: 'agent.planMode',
-        label: 'Toggle Plan Mode',
-        run: () => setPlanModeSignal((n) => n + 1)
       },
       {
         id: 'folder.open',
@@ -1446,7 +1438,6 @@ export default function App(): React.JSX.Element {
                 switchSessionSignal={switchSessionSignal}
                 hideSessionChrome
                 onSessionsChange={onSessionsChange}
-                planModeSignal={planModeSignal}
                 headerActions={plusMenu}
                 workspaceKey={projectRoot}
                 gitBranch={gitStatus?.available ? gitStatus.branch ?? null : null}

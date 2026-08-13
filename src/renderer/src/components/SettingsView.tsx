@@ -116,12 +116,13 @@ export function SettingsView({
   const patch = <K extends keyof AppSettings>(key: K, value: AppSettings[K]): void => {
     if (key === 'modelPath' && typeof value === 'string') {
       setSettings(switchModelPath(settings, value))
+      void window.api.settings.save({ modelPath: value })
       return
     }
     setSettings({ ...settings, [key]: value })
   }
 
-  const save = async (): Promise<void> => {
+  const save = async (): Promise<boolean> => {
     setBusy(true)
     setMessage(null)
     setSaveOk(false)
@@ -143,12 +144,20 @@ export function SettingsView({
       }
       setSaveOk(true)
       setMessage(t('settings.msg.saved'))
+      return true
     } catch (err) {
       setSaveOk(false)
       setMessage(err instanceof Error ? err.message : String(err))
+      return false
     } finally {
       setBusy(false)
     }
+  }
+
+  const loadAfterSave = async (): Promise<void> => {
+    const ok = await save()
+    if (!ok) return
+    await Promise.resolve(onLoadModel?.())
   }
 
   const applyModelsDir = async (dir: string): Promise<void> => {
@@ -250,7 +259,7 @@ export function SettingsView({
                     busy={busy}
                     modelActionBusy={modelActionBusy}
                     setModelActionBusy={setModelActionBusy}
-                    onLoadModel={onLoadModel}
+                    onLoadModel={loadAfterSave}
                     onUnloadModel={onUnloadModel}
                     onModelsDirChange={applyModelsDir}
                     onOpenStore={(target: StoreDownloadTarget = 'chat') => {

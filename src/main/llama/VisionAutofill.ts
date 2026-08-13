@@ -1,12 +1,8 @@
-import { basename, dirname, join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { existsSync, promises as fs } from 'node:fs'
 import { DEFAULT_MODELS_DIR, type AppSettings } from '../../shared/settings'
-import { isLikelyVisionGguf, scoreVisionGguf } from '../../shared/visionDetect'
+import { isLikelyVisionGguf, scoreMmprojForVision, scoreVisionGguf } from '../../shared/visionDetect'
 import { scanGgufModels, scanMmprojFiles } from './ModelScanner'
-
-function baseName(p: string): string {
-  return basename(p).toLowerCase()
-}
 
 function isEmptyOrMissing(path: string | undefined): boolean {
   const t = path?.trim() ?? ''
@@ -14,20 +10,7 @@ function isEmptyOrMissing(path: string | undefined): boolean {
   return !existsSync(t)
 }
 
-export { scoreVisionGguf, isLikelyVisionGguf }
-
-function scoreMmprojForVision(mmprojPath: string, visionPath: string): number {
-  const m = baseName(mmprojPath)
-  const v = baseName(visionPath)
-  if (!/mmproj/.test(m)) return -1
-  let score = 10
-  if (/qwen3?vl|qwen3-vl/.test(m) && /qwen3?vl|qwen3-vl/.test(v)) score += 80
-  if (/minicpm/.test(m) && /minicpm/.test(v)) score += 80
-  if (/gemma/.test(m) && /gemma/.test(v)) score += 70
-  if (/llava/.test(m) && /llava/.test(v)) score += 70
-  if (/f16|fp16/.test(m)) score += 5
-  return score
-}
+export { scoreVisionGguf, isLikelyVisionGguf, scoreMmprojForVision }
 
 export function visionPathsNeedAutofill(settings: AppSettings): boolean {
   return isEmptyOrMissing(settings.visionModelPath)

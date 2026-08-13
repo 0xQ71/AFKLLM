@@ -1,3 +1,5 @@
+import { isBlackwellGpuName, looksLikeNvfp4Gguf } from './llamaSpec'
+
 /** Curated AFKLLM recommendations + HF Hub store types. */
 
 export interface GpuInfo {
@@ -86,6 +88,30 @@ export const HF_RECOMMENDED_MODELS: HfRecommendedModel[] = [
     sizeGb: 4.7,
     minVramGb: 6,
     tags: ['coding', 'popular']
+  },
+  {
+    repoId: 'protoLabsAI/Ornith-1.0-9B-MTP-GGUF',
+    title: 'Ornith 9B MTP',
+    description:
+      'Qwen3.5 hybrid 9B with baked-in MTP — Q4_K_M (~5.8 GB). Fast speculative decode; top pick on 8–16 GB (Ampere/Ada).',
+    descriptionRu:
+      'Гибрид Qwen3.5 9B с MTP в GGUF — Q4_K_M (~5.8 ГБ). Быстрый speculative decode; топ на 8–16 ГБ (Ampere/Ada).',
+    preferredFile: 'Ornith-1.0-9B-MTP-Q4_K_M.gguf',
+    sizeGb: 5.8,
+    minVramGb: 8,
+    tags: ['coding', 'agent', 'popular']
+  },
+  {
+    repoId: 'protoLabsAI/Ornith-1.0-9B-MTP-GGUF',
+    title: 'Ornith 9B MTP NVFP4',
+    description:
+      'Same Ornith 9B MTP in NVFP4 (~6.6 GB). Fastest on Blackwell (RTX 50xx / PRO 6000). Skip on Ampere/Ada — use Q4_K_M.',
+    descriptionRu:
+      'Тот же Ornith 9B MTP в NVFP4 (~6.6 ГБ). Самый быстрый на Blackwell (RTX 50xx / PRO 6000). Не для Ampere/Ada — берите Q4_K_M.',
+    preferredFile: 'Ornith-1.0-9B-MTP-NVFP4.gguf',
+    sizeGb: 6.6,
+    minVramGb: 10,
+    tags: ['coding', 'agent']
   },
   {
     repoId: 'bartowski/gemma-2-9b-it-GGUF',
@@ -398,29 +424,42 @@ export const HF_IMAGE_GEN_LLM_MODELS: HfRecommendedModel[] = [
 
 /**
  * Top-3 staff order per VRAM tier (by preferredFile).
- * 16+: Devstral → Gemma → GPT-OSS; 12: Gemma → Qwen14 → GPT-OSS; 8: Qwen7 → Gemma9 → Llama3B
+ * 8/12: Ornith MTP Q4 first; 16+: Devstral then Ornith. Blackwell swaps Ornith → NVFP4.
  */
 export const HF_TIER_STAFF_FILES: Record<'8' | '12' | '16' | '24', string[]> = {
   '8': [
+    'Ornith-1.0-9B-MTP-Q4_K_M.gguf',
     'Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf',
-    'gemma-2-9b-it-Q4_K_M.gguf',
     'Llama-3.2-3B-Instruct-Q4_K_M.gguf'
   ],
   '12': [
+    'Ornith-1.0-9B-MTP-Q4_K_M.gguf',
     'gemma4-v2-Q6_K.gguf',
-    'Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf',
-    'gpt-oss-20b-Q4_K_M.gguf'
+    'Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf'
   ],
   '16': [
     'Devstral-Small-2-24B-Instruct-2512-IQ4_XS.gguf',
-    'gemma4-v2-Q6_K.gguf',
-    'gpt-oss-20b-Q4_K_M.gguf'
+    'Ornith-1.0-9B-MTP-Q4_K_M.gguf',
+    'gemma4-v2-Q6_K.gguf'
   ],
   '24': [
     'Devstral-Small-2-24B-Instruct-2512-IQ4_XS.gguf',
-    'gemma4-v2-Q6_K.gguf',
-    'gpt-oss-20b-Q4_K_M.gguf'
+    'Ornith-1.0-9B-MTP-Q4_K_M.gguf',
+    'gemma4-v2-Q6_K.gguf'
   ]
+}
+
+const ORNITH_MTP_Q4 = 'Ornith-1.0-9B-MTP-Q4_K_M.gguf'
+const ORNITH_MTP_NVFP4 = 'Ornith-1.0-9B-MTP-NVFP4.gguf'
+
+export function staffFilesForGpu(
+  vramGb: number,
+  gpuName?: string | null
+): string[] {
+  const tier = vramTier(vramGb)
+  const files = [...HF_TIER_STAFF_FILES[tier]]
+  if (!isBlackwellGpuName(gpuName) || tier === '8') return files
+  return files.map((f) => (f === ORNITH_MTP_Q4 ? ORNITH_MTP_NVFP4 : f))
 }
 
 export function vramTier(vramGb: number): keyof typeof HF_TIER_STAFF_FILES {
@@ -468,11 +507,13 @@ export function classifyVramFit(
 /** Curated picks for VRAM: tier staff pins first, then hardware score. */
 export function selectRecommendedForVram(
   vramGb: number | null | undefined,
-  limit = 6
+  limit = 6,
+  gpuName?: string | null
 ): Array<HfRecommendedModel & { fit: HfRecommendFit; score: number }> {
   const vram = vramGb && vramGb > 0 ? vramGb : 12
   const budget = Math.max(1, vram - HF_VRAM_HEADROOM_GB)
-  const tier = vramTier(vram)
+  const blackwell = isBlackwellGpuName(gpuName)
+  const staffFiles = staffFilesForGpu(vram, gpuName)
 
   const withFit = (m: HfRecommendedModel): HfRecommendedModel & {
     fit: HfRecommendFit
@@ -491,6 +532,11 @@ export function selectRecommendedForVram(
     if (m.tags.includes('coding')) score += 18
     if (m.tags.includes('agent')) score += 14
     if (m.tags.includes('popular')) score += 8
+    if (/ornith/i.test(`${m.title} ${m.repoId}`)) score += 12
+
+    const nvfp4 = looksLikeNvfp4Gguf(m.preferredFile)
+    if (nvfp4 && blackwell) score += 28
+    if (nvfp4 && !blackwell) score -= 220
 
     if (vram < m.minVramGb) score -= (m.minVramGb - vram) * 12
 
@@ -507,6 +553,7 @@ export function selectRecommendedForVram(
     opts: { allowHeavy?: boolean; allowSameRepo?: boolean } = {}
   ): void => {
     if (picked.length >= limit) return
+    if (looksLikeNvfp4Gguf(m.preferredFile) && !blackwell) return
     if (m.fit === 'heavy' && !opts.allowHeavy) {
       // Staff pin OK if file roughly fits raw VRAM
       if (m.sizeGb > vram) return
@@ -519,8 +566,8 @@ export function selectRecommendedForVram(
     picked.push(m)
   }
 
-  // Tier staff order
-  for (const file of HF_TIER_STAFF_FILES[tier]) {
+  // Tier staff order (Blackwell swaps Ornith Q4 → NVFP4)
+  for (const file of staffFiles) {
     const hit = HF_RECOMMENDED_MODELS.find((m) => m.preferredFile === file)
     if (hit) tryAdd(withFit(hit), { allowSameRepo: true })
   }
@@ -541,7 +588,7 @@ export function selectRecommendedForVram(
         const lastIdx = [...picked]
           .map((p, i) => ({ p, i }))
           .reverse()
-          .find((x) => !HF_TIER_STAFF_FILES[tier].includes(x.p.preferredFile))?.i
+          .find((x) => !staffFiles.includes(x.p.preferredFile))?.i
         if (lastIdx != null) {
           const removed = picked[lastIdx]
           seenFiles.delete(`${removed.repoId}::${removed.preferredFile}`)

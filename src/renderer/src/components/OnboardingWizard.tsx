@@ -48,7 +48,10 @@ export function OnboardingWizard({
     'solarized-dark': 'settings.theme.solarizedDark'
   }
 
-  const refreshModels = async (modelsDir?: string): Promise<void> => {
+  const refreshModels = async (
+    modelsDir?: string,
+    keepModelPath?: string
+  ): Promise<void> => {
     if (modelsDir) {
       await window.api.settings.save({ modelsDir })
     }
@@ -56,7 +59,9 @@ export function OnboardingWizard({
     setModels(list)
     const s = await window.api.settings.get()
     let next = { ...s }
-    if (list.length > 0 && (!s.modelPath || !list.some((m) => m.path === s.modelPath))) {
+    if (keepModelPath) {
+      next = { ...next, modelPath: keepModelPath }
+    } else if (list.length > 0 && (!s.modelPath || !list.some((m) => m.path === s.modelPath))) {
       next = { ...next, modelPath: list[0]!.path }
     }
     // Suggest best VL GGUF when vision path empty (optional — user can clear).
@@ -574,7 +579,11 @@ export function OnboardingWizard({
         onDownloaded={(localPath) => {
           if (storeTarget === 'chat') {
             patch('modelPath', localPath)
-          } else if (storeTarget === 'vision') {
+            void window.api.settings.save({ modelPath: localPath })
+            void refreshModels(settings.modelsDir, localPath)
+            return
+          }
+          if (storeTarget === 'vision') {
             patch('visionModelPath', localPath)
             void window.api.settings.save({ visionModelPath: localPath })
           } else if (storeTarget === 'imageGen') {

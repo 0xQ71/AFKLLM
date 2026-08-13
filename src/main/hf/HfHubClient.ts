@@ -284,7 +284,7 @@ export async function listRecommendedModels(
   localModels: Array<{ path: string; id: string }> = []
 ): Promise<HfModelListItem[]> {
   const info = gpu === undefined ? await detectGpuInfo() : gpu
-  const picks = selectRecommendedForVram(info?.vramGb ?? null, 6)
+  const picks = selectRecommendedForVram(info?.vramGb ?? null, 6, info?.name)
   return Promise.all(
     picks.map(async (r) => {
       const [avatarUrl, readme] = await Promise.all([

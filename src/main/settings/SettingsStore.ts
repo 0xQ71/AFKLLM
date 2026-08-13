@@ -33,6 +33,7 @@ import {
 export class SettingsStore {
   private path: string
   private cache: AppSettings
+  private saveChain: Promise<void> = Promise.resolve()
 
   constructor() {
     this.path = join(app.getPath('userData'), 'settings.json')
@@ -130,6 +131,15 @@ export class SettingsStore {
   }
 
   async save(patch: Partial<AppSettings>): Promise<AppSettings> {
+    const run = this.saveChain.then(() => this.saveInner(patch))
+    this.saveChain = run.then(
+      () => undefined,
+      () => undefined
+    )
+    return run
+  }
+
+  private async saveInner(patch: Partial<AppSettings>): Promise<AppSettings> {
     const prevPath = this.cache.modelPath
     let merged: AppSettings
     if (
@@ -146,7 +156,12 @@ export class SettingsStore {
     await this.persist()
     // Fill any still-empty image-gen slots from modelsDir (e.g. after download / clear).
     await this.autofillImageGenIfNeeded()
-    await this.autofillVisionIfNeeded()
+    const visionExplicitlyCleared =
+      Object.prototype.hasOwnProperty.call(patch, 'visionModelPath') &&
+      !String(patch.visionModelPath ?? '').trim()
+    if (!visionExplicitlyCleared) {
+      await this.autofillVisionIfNeeded()
+    }
     return this.get()
   }
 

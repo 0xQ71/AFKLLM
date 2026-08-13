@@ -25,6 +25,7 @@ export type LlamaOptsFactory = (
 export class ModelSlotOrchestrator extends EventEmitter {
   private status: ModelSlotStatus = defaultSlotStatus()
   private switchChain: Promise<void> = Promise.resolve()
+  private switchGen = 0
   private getLlama: () => LlamaProcessManager | null
   private setLlama: (mgr: LlamaProcessManager | null) => void
   private createLlama: (opts: LlamaProcessOptions) => LlamaProcessManager
@@ -73,8 +74,14 @@ export class ModelSlotOrchestrator extends EventEmitter {
     target: ModelSlot,
     switchOpts?: { cancelPending?: boolean }
   ): Promise<ModelSlotStatus> {
+    // Unload must interrupt an in-flight spawn; otherwise the queue waits
+    // until waitUntilReady finishes (up to ~10 min) before idle runs.
+    if (target === 'idle' || target === 'imageGen') {
+      void this.getLlama()?.stop()
+    }
+    const gen = ++this.switchGen
     const run = this.switchChain.then(() =>
-      this.ensureSlotInner(target, switchOpts)
+      this.ensureSlotInner(target, switchOpts, gen)
     )
     this.switchChain = run.then(
       () => undefined,
@@ -85,8 +92,11 @@ export class ModelSlotOrchestrator extends EventEmitter {
 
   private async ensureSlotInner(
     target: ModelSlot,
-    switchOpts?: { cancelPending?: boolean }
+    switchOpts: { cancelPending?: boolean } | undefined,
+    gen: number
   ): Promise<ModelSlotStatus> {
+    if (gen !== this.switchGen) return this.getStatus()
+
     if (this.status.slot === target && this.status.phase === 'ready') {
       if (target === 'idle' || target === 'imageGen') {
         // Never trust a stale "imageGen ready" while llama-server still holds VRAM.
@@ -94,7 +104,13 @@ export class ModelSlotOrchestrator extends EventEmitter {
         return this.getStatus()
       }
       const llama = this.getLlama()
-      if (llama?.currentState === 'ready') return this.getStatus()
+      const opts = await this.optsFor(target)
+      const sameModel =
+        llama?.currentState === 'ready' &&
+        llama.modelPath === opts.modelPath &&
+        (target !== 'vision' ||
+          (llama.mmprojPath || '') === (opts.mmprojPath || ''))
+      if (sameModel) return this.getStatus()
     }
 
     this.setStatus({
@@ -110,6 +126,7 @@ export class ModelSlotOrchestrator extends EventEmitter {
 
       // Always drop the live llama-server first — never keep weights in RAM/VRAM.
       await this.disposeLlama()
+      if (gen !== this.switchGen) return this.getStatus()
 
       if (target === 'idle' || target === 'imageGen') {
         this.setStatus({
@@ -147,6 +164,10 @@ export class ModelSlotOrchestrator extends EventEmitter {
       const llama = this.createLlama(opts)
       this.setLlama(llama)
       await llama.start({ force: true })
+      if (gen !== this.switchGen) {
+        await this.disposeLlama()
+        return this.getStatus()
+      }
 
       this.setStatus({
         slot: target,
@@ -159,6 +180,7 @@ export class ModelSlotOrchestrator extends EventEmitter {
       })
       return this.getStatus()
     } catch (err) {
+      if (gen !== this.switchGen) return this.getStatus()
       const msg = err instanceof Error ? err.message : String(err)
       this.setStatus({
         slot: this.status.slot,

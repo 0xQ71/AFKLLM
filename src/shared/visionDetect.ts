@@ -20,3 +20,17 @@ export function scoreVisionGguf(pathOrName: string): number {
 export function isLikelyVisionGguf(pathOrName: string): boolean {
   return scoreVisionGguf(pathOrName) >= 0
 }
+
+/** Score a *mmproj*.gguf against a vision GGUF in the same folder. */
+export function scoreMmprojForVision(mmprojPath: string, visionPath: string): number {
+  const m = mmprojPath.replace(/^.*[/\\]/, '').toLowerCase()
+  const v = visionPath.replace(/^.*[/\\]/, '').toLowerCase()
+  if (!/mmproj/.test(m)) return -1
+  let score = 10
+  if (/qwen3?vl|qwen3-vl/.test(m) && /qwen3?vl|qwen3-vl/.test(v)) score += 80
+  if (/minicpm/.test(m) && /minicpm/.test(v)) score += 80
+  if (/gemma/.test(m) && /gemma/.test(v)) score += 70
+  if (/llava/.test(m) && /llava/.test(v)) score += 70
+  if (/f16|fp16/.test(m)) score += 5
+  return score
+}

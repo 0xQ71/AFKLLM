@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   HF_IMAGE_GEN_CLIP_G_MODELS,
   HF_IMAGE_GEN_CLIP_L_MODELS,
@@ -128,6 +128,18 @@ function fitBadgeClass(fit?: HfRecommendFit): string {
 
 function fitLabelKey(fit: HfRecommendFit): MessageKey {
   return `store.fit.${fit}` as MessageKey
+}
+
+function fileLeaf(name: string): string {
+  return name.replace(/\\/g, '/').split('/').pop()?.toLowerCase() ?? name.toLowerCase()
+}
+
+function sameStoreFile(
+  a: { repoId?: string; filename?: string },
+  b: { repoId?: string; filename?: string }
+): boolean {
+  if (!a.repoId || !b.repoId || a.repoId !== b.repoId) return false
+  return fileLeaf(a.filename ?? '') === fileLeaf(b.filename ?? '')
 }
 
 function asBrand(v?: string | null): ModelBrand | undefined {
@@ -417,6 +429,7 @@ export function ModelStorePanel({
   const [downloadsOpen, setDownloadsOpen] = useState(false)
   const [downloads, setDownloads] = useState<HfDownloadProgress[]>([])
   const [gpu, setGpu] = useState<GpuInfo | null>(null)
+  const claimedRef = useRef<{ repoId: string; filename: string } | null>(null)
 
   const refreshDownloads = (): void => {
     void window.api.hf.listDownloads().then(setDownloads).catch(() => setDownloads([]))
@@ -570,7 +583,13 @@ export function ModelStorePanel({
         }
         return [p, ...prev]
       })
-      if (p.status === 'done' && p.destPath) onDownloaded(p.destPath)
+      if (p.status === 'done' && p.destPath) {
+        const claimed = claimedRef.current
+        if (claimed && sameStoreFile(p, claimed)) {
+          claimedRef.current = null
+          onDownloaded(p.destPath)
+        }
+      }
       if (p.status !== 'downloading') setDownloading(false)
     })
   }, [open, onDownloaded])
@@ -590,9 +609,6 @@ export function ModelStorePanel({
   )
   const selectedInstalled = Boolean(selectedFile?.installed)
 
-  const fileLeaf = (name: string): string =>
-    name.replace(/\\/g, '/').split('/').pop()?.toLowerCase() ?? name.toLowerCase()
-
   /** Progress UI only for the model/quant currently open in the store. */
   const visibleProgress = useMemo(() => {
     if (!progress || !detail) return null
@@ -611,13 +627,20 @@ export function ModelStorePanel({
     if (!detail || !filePath || downloading || selectedInstalled) return
     setDownloading(true)
     setProgress(null)
+    claimedRef.current = { repoId: detail.id, filename: filePath }
     try {
       const result = await window.api.hf.download({
         repoId: detail.id,
         filename: filePath
       })
       setProgress(result)
-      if (result.status === 'done' && result.destPath) {
+      if (
+        result.status === 'done' &&
+        result.destPath &&
+        claimedRef.current &&
+        sameStoreFile(result, claimedRef.current)
+      ) {
+        claimedRef.current = null
         onDownloaded(result.destPath)
       }
     } catch (e) {
@@ -1000,11 +1023,22 @@ export function ModelStorePanel({
                           type="button"
                           onClick={() => {
                             setDownloading(true)
+                            claimedRef.current = {
+                              repoId: visibleProgress.repoId,
+                              filename: visibleProgress.filename
+                            }
                             void window.api.hf
                               .resumeDownload(visibleProgress.id)
                               .then((r) => {
                                 setProgress(r)
-                                if (r.status === 'done' && r.destPath) onDownloaded(r.destPath)
+                                if (
+                                  r.status === 'done' &&
+                                  r.destPath &&
+                                  sameStoreFile(r, claimedRef.current ?? {})
+                                ) {
+                                  claimedRef.current = null
+                                  onDownloaded(r.destPath)
+                                }
                               })
                               .finally(() => {
                                 setDownloading(false)

@@ -9,17 +9,23 @@ import type { QueueManager } from '../llm/queueManager'
 import { translate } from '../i18n/messages'
 import {
   AGENT_CHECKLIST_MSG_ID,
+  AGENT_TODO_MSG_ID,
   applyToolToChecklist,
+  advanceTodosOnTool,
   buildChecklistFromHistory,
   emptyChecklist,
   formatChecklist,
+  formatTodoUiContent,
+  hasThinkBlock,
   normalizeApiMessages,
   parseComposerMentions,
+  parsePlanBlock,
   parseThinkBlocks,
   promoteThinkOnlyAnswer,
   formatNowForAgent,
   stripChecklistBlock,
   stripCompactBlocks,
+  stripPlanBlock,
   evaluateAcceptanceGate,
   fingerprintToolCall,
   looksLikeToolMarkupLeak,
@@ -27,7 +33,9 @@ import {
   resolveWriteFilePath,
   inferWritePathFromContent,
   apiContentText,
+  mergeChecklistIntoSystem,
   type AgentChecklist,
+  type AgentTodoStep,
   type ApiMessage
 } from './agentPure'
 import { runExploreSubagent } from './runExploreSubagent'
@@ -42,6 +50,10 @@ const RECENT_TURNS_WITH_SUMMARY = 12
 
 function normPath(p: string): string {
   return p.replace(/\\/g, '/').replace(/^\.\//, '').trim()
+}
+
+function loopPathKey(p: string): string {
+  return normPath(p).toLowerCase()
 }
 
 function clearPlanningRows(messages: ChatMessage[]): void {
@@ -96,13 +108,19 @@ function pushUnique(list: string[], item: string, max = 80): void {
 export type { AgentChecklist }
 export {
   AGENT_CHECKLIST_MSG_ID,
+  AGENT_TODO_MSG_ID,
   applyToolToChecklist,
+  advanceTodosOnTool,
   buildChecklistFromHistory,
   formatChecklist,
+  formatTodoUiContent,
+  hasThinkBlock,
   normalizeApiMessages,
   parseComposerMentions,
+  parsePlanBlock,
   parseThinkBlocks,
-  promoteThinkOnlyAnswer
+  promoteThinkOnlyAnswer,
+  stripPlanBlock
 }
 
 export const AGENT_PLAN_MSG_ID = 'agent-plan'
@@ -273,7 +291,7 @@ async function describeImagesWithVision(params: {
 const AGENT_RULES = `
 Rules for multi-file work (critical):
 - Paths MUST be relative to the project root (e.g. engineering_calc/main.py). Never use absolute paths like D:\\...
-- Finish ONE file completely before starting another. If a write returns INCOMPLETE_WRITE or FILE_EXISTS, fix THAT path first (append=true) — never invent a sibling filename.
+- Finish ONE file completely before starting another. INCOMPLETE_WRITE → append=true on the SAME path. FILE_EXISTS on a small file → overwrite=true with the full file; on a large file → apply_patch / append=true. Never invent a sibling filename.
 - Small files (< ~150 lines / ~6KB, e.g. index.html, styles.css, short scripts): prefer write_file with overwrite=true for edits — full rewrite is cheaper and more reliable than patch.
 - Large files: write_file on an existing non-empty file is REJECTED unless append=true (or rare overwrite=true). Prefer apply_patch for edits (multi-hunk / multi-file); apply_diff for a single unique replace.
 - Corrections / bugfixes / "это не так" / pointing out mistakes (critical):
@@ -286,9 +304,9 @@ Rules for multi-file work (critical):
 - If apply_patch / apply_diff fails twice on the same path: switch to write_file overwrite=true (especially for small HTML/CSS). Do NOT keep retrying the same broken hunk.
 - Unclear repo layout or “where is X?”: call explore_subagent with a clear goal before large edits (read-only research report).
 - NEVER invent duplicate modules (thermodynamic.py vs thermodynamics.py). list_directory / read_file first.
-- Keep each write_file chunk modest (~1200–1500 chars of code). Large files = stub + several append=true calls until the file is syntactically complete.
+- Small HTML/CSS/scripts: one full write_file (overwrite=true if the file already exists). Large files only: modest chunks (~1200–1500 chars) then append=true until syntactically complete.
 - Do not say the task is done while required files from the user's structure are still missing — create the next missing file.
-- Terminal (Windows): shell is PowerShell. NEVER use bash && or ||. Prefer ONE command + cwd="subdir" (e.g. command="javac Calculator.java", cwd="Calculator/src"). Chain only with "; " if needed. Do NOT pass unquoted globs like *.java to javac/java — PowerShell does not expand them for native exes; list files explicitly or use Get-ChildItem. Never run interactive stdin programs (Scanner/input()) via execute_terminal_command — they hang with no TTY; for CLI demos pass argv, or build a Swing/JavaFX UI when the user wants to type interactively.
+- Terminal (Windows): shell is PowerShell in a real PTY (visible IDE Terminal). NEVER use bash && or ||. Prefer ONE command + cwd="subdir" (e.g. command="javac Calculator.java", cwd="Calculator/src"). Chain only with "; " if needed. Do NOT pass unquoted globs like *.java to javac/java — PowerShell does not expand them for native exes; list files explicitly or use Get-ChildItem. Interactive CLI prompts (y/n): the user can type in the Terminal; when Auto-approve is ON, AFKLLM may auto-confirm yes. Prefer non-interactive flags when available (npm --yes, CI=1). Avoid hanging forever on password prompts.
 - Terminal errors (critical): when execute_terminal_command fails with TERMINAL_ERROR / ERROR_FOCUS, READ that focus, fix the exact file/line with read_file + apply_patch (or apply_diff), then re-run the SAME command. Never claim "environment forbids &&" — use cwd/; instead. Never drop JavaFX/GUI mid-task without explaining; for simple Java GUI prefer javax.swing (no modules) first, get javac/java working, then discuss .exe (jpackage) as a later step.
 - PROCESS_ENDED (critical): if the tool result says PROCESS_ENDED, the user closed the window or the program finished — this is NOT a bug. Do NOT rewrite code, do NOT relaunch, do NOT "fix" anything. Briefly acknowledge and wait for the next user message.
 - Tests / shell honesty (critical): NEVER say "tests pass", "Task completed" for a test task, or claim green unless the latest execute_terminal_command for that test returned ok (exit 0). If you see TERMINAL_ERROR / fail ✖ / exit_code≠0 with an error traceback, fix and re-run first — do not summarize success from an earlier run.
@@ -336,6 +354,7 @@ const IMAGE_GEN_RULES_ON = `
   4) If generate_image FAILS, times out, or returns a blank/white image: do NOT call generate_image again this turn. Finish HTML/CSS with a CSS gradient / placeholder and say the image step failed.
   5) NEVER generate_image or write_file for favicon.ico / favicon.png — skip favicon or use a tiny inline SVG in HTML.
   6) Keep image prompts focused — do not dump file contents or long plans into the prompt unless the user asked.
+  7) Wiring an image into HTML/CSS: if the file already contains that src/path (or a duplicate <img>), do NOT patch again — one write_file overwrite=true to leave a single correct <img>, then STOP. Never stack multiple identical <img> tags. Max one verify read_file after the edit.
 `
 
 const IMAGE_GEN_RULES_OFF = `
@@ -348,7 +367,8 @@ export { AGENT_RULES, IMAGE_GEN_RULES_ON, IMAGE_GEN_RULES_OFF }
 const SYSTEM_CORE = `You are AFKLLM, a local coding agent inside a desktop IDE.
 You can read/write/delete files, create directories, search code, search the web (web_search: DuckDuckGo + Bing + Brave + Wikipedia + SO + HN), run shell commands, and call connected MCP tools (names starting with mcp__). Prefer built-in filesystem/shell tools over MCP equivalents.
 - Small files (< ~150 lines / HTML, CSS, short scripts): prefer write_file overwrite=true for edits. apply_patch / apply_diff only for large files.
-- Prefer apply_patch for large-file edits (apply_diff for one small replace). Be concise. When done, summarize what changed.
+- Prefer apply_patch for large-file edits (apply_diff for one small replace). Be concise.
+- When done (after tools or Q&A), always write a short closing summary for the user: what changed, key paths, how to verify. Match their language.
 - Existing files (critical): if index.html / styles.css / the requested page already exists and roughly matches the task, FIX it (small file → overwrite; large → apply_patch) — do NOT invent extra pages (pricing.html, contact.html) unless the user asked.
 - Match the user's language in replies (Russian ↔ Russian, English ↔ English).
 IMPORTANT: Do NOT ask the user for permission to use tools. Call tools immediately when needed.`
@@ -356,7 +376,8 @@ IMPORTANT: Do NOT ask the user for permission to use tools. Call tools immediate
 const SYSTEM_CONFIRM_CORE = `You are AFKLLM, a local coding agent inside a desktop IDE.
 You can read/write/delete files, create folders, search code, search the web (web_search: DuckDuckGo + Bing + Brave + Wikipedia + SO + HN), run shell commands, and call connected MCP tools (names starting with mcp__). Prefer built-in filesystem/shell tools over MCP equivalents.
 Shell commands open the IDE Terminal panel (visible). They may need a one-click confirm unless auto-approve is ON.
-Small files (< ~150 lines): prefer write_file overwrite=true. Large files: prefer apply_patch (apply_diff for one small replace). Be concise. When done, summarize what changed.
+Small files (< ~150 lines): prefer write_file overwrite=true. Large files: prefer apply_patch (apply_diff for one small replace). Be concise.
+When done, always write a short closing summary (what changed, paths, how to verify) in the user's language.
 - Existing files (critical): if the target files already exist, patch or overwrite them — do not add unrequested pages.
 Match the user's language in replies (Russian ↔ Russian, English ↔ English).
 Do not ask in chat for permission to read or edit files — use tools directly.`
@@ -381,19 +402,24 @@ Rules:
 
 const THINK_THROUGH = `
 Think-through protocol (mandatory while enabled):
-1) Before the first tool call (and after any failure), write a short reasoning block:
+1) BEFORE any tool call, you MUST open with a real reasoning block (not empty):
    <think>
-   - Goal / what changed
-   - Hypothesis or next step
-   - If an error: root cause, options, chosen fix
+   - Goal
+   - Complexity: simple one-step vs multi-step
+   - Next action
    </think>
+   If you call tools without a <think>…</think> block first, the tools are REJECTED and you must retry.
 2) Keep each <think> under ~120 words. Prefer concrete paths and commands.
-3) Then call tools or give the final user-facing answer (outside <think>).
-   CRITICAL: Never put the only answer inside <think>. Q&A, image descriptions, and summaries
-   must appear as normal text after </think>. If no tools are needed, a short <think> then the answer.
-4) Do not ask the user for permission inside <think> — decide and act.
-5) Intermediate conclusions are good: "build failed because X → try Y".
-6) Numbered lists: use real sequential numbers (1. 2. 3. …). Never restart every item at "1.".
+3) After </think>, if the task has 2+ distinct work items (e.g. create page + verify, several files, research then edit), emit a short plan the UI will show:
+   <plan>
+   - [ ] First concrete step
+   - [ ] Second concrete step
+   </plan>
+   Skip <plan> for pure Q&A or a single trivial tool. Never dump shell commands into the plan — steps are human goals.
+4) Then call tools or give the final user-facing answer (outside <think> / <plan>).
+   CRITICAL: Never put the only answer inside <think>. Summaries must appear as normal text after </think>.
+5) Do not ask the user for permission inside <think> — decide and act.
+6) Landing / HTML: prefer ONE write_file overwrite=true with the full file (not many tiny appends).
 `
 
 export {
@@ -442,13 +468,18 @@ const CHARS_PER_TOKEN = 3.2
 const CTX_COMPACT_RATIO = 0.9
 const CTX_RESERVE_TOKENS = 900
 /** Cap forced append loops on the same path when stream was truncated. */
-const MAX_INCOMPLETE_APPENDS_PER_PATH = 6
-/** Identical tool+args repeats before TOOL_LOOP. */
+const MAX_INCOMPLETE_APPENDS_PER_PATH = 4
+/** Identical tool+args repeats before TOOL_LOOP nudge (turn continues). */
 const MAX_IDENTICAL_TOOL_CALLS = 2
+/** read_file same path — nudge re-verify loops (Think + edit). */
+const MAX_READS_PER_PATH = 2
+/** Soft recovery threshold — never hard-stop the turn for the user. */
 const MAX_TOOL_LOOP_HITS = 2
+/** Successful apply_patch/apply_diff on one path before forcing overwrite finish. */
+const MAX_PATCH_OK_PER_PATH = 2
 const MAX_MARKUP_REPAIR_ATTEMPTS = 2
 /** Absolute safety cap for a single tool-arguments JSON blob. */
-const MAX_TOOL_ARG_CHARS = 48_000
+const MAX_TOOL_ARG_CHARS = 96_000
 const MAX_MISSING_PATH_HITS = 3
 /** Stop overflow compact/retry loops that inflate context. */
 const MAX_OVERFLOW_REPAIRS = 2
@@ -456,6 +487,16 @@ const MAX_OVERFLOW_REPAIRS = 2
 const MAX_FETCH_REPAIRS = 3
 /** Small-file overwrite is allowed even on correction turns. */
 const SMALL_FILE_OVERWRITE_CHARS = 6000
+/** Landing HTML often exceeds 6KB; still treat as a small-file overwrite. */
+const LANDING_OVERWRITE_CHARS = 40_000
+
+function allowsLandingOverwrite(relativePath: string, contentChars: number): boolean {
+  if (contentChars < SMALL_FILE_OVERWRITE_CHARS) return true
+  return (
+    /\.(html?|css|md|svg|js|ts|tsx|jsx)$/i.test(relativePath) &&
+    contentChars < LANDING_OVERWRITE_CHARS
+  )
+}
 /** Failed apply_patch/apply_diff on one path before suggesting overwrite. */
 const MAX_PATCH_FAILS_BEFORE_OVERWRITE = 2
 /** Hard cap for system prompt after compact. */
@@ -682,7 +723,43 @@ export interface TurnFileChange {
 
 function removeChecklistBubbles(messages: ChatMessage[]): void {
   for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i]?.id === AGENT_CHECKLIST_MSG_ID) messages.splice(i, 1)
+    const id = messages[i]?.id
+    if (id === AGENT_CHECKLIST_MSG_ID || id === AGENT_TODO_MSG_ID) messages.splice(i, 1)
+  }
+}
+
+/** Live Cursor-style plan card (model-authored <plan>). */
+function upsertTodoBubble(messages: ChatMessage[], steps: AgentTodoStep[]): void {
+  if (steps.length === 0) return
+  const msg: ChatMessage = {
+    id: AGENT_TODO_MSG_ID,
+    role: 'assistant',
+    content: formatTodoUiContent(steps)
+  }
+  const idx = messages.findIndex((m) => m.id === AGENT_TODO_MSG_ID)
+  if (idx >= 0) messages[idx] = msg
+  else {
+    let insertAt = messages.length
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i]?.role === 'user') {
+        insertAt = i + 1
+        break
+      }
+    }
+    messages.splice(insertAt, 0, msg)
+  }
+}
+
+function logAgentToolEvent(message: string, extra?: Record<string, string | number | boolean | null>): void {
+  try {
+    void window.api.telemetry.report({
+      kind: 'info',
+      message,
+      source: 'agent:tool',
+      ...(extra ? { extra } : {})
+    })
+  } catch {
+    /* ignore */
   }
 }
 
@@ -760,8 +837,10 @@ function upsertPlanBubble(
 function injectChecklistIntoSystem(apiMessages: ApiMessage[], cl: AgentChecklist): void {
   if (apiMessages[0]?.role !== 'system') return
   const block = formatChecklist(cl)
-  const base = stripCompactBlocks(stripChecklistBlock(apiContentText(apiMessages[0].content)))
-  apiMessages[0] = { ...apiMessages[0], content: block ? base + block : base }
+  apiMessages[0] = {
+    ...apiMessages[0],
+    content: mergeChecklistIntoSystem(apiContentText(apiMessages[0].content), block)
+  }
 }
 
 function uid(): string {
@@ -1181,7 +1260,7 @@ async function compactApiMessages(
     memoryBody +
     checklistBlock +
     tree.slice(0, 2_000) +
-    '\n\nCRITICAL: Continue from EXISTING files only. Never rewrite a file that already exists; use append=true or apply_patch. Do not create alternate filenames. Never read .png/.jpg/.webp/.gif as text.'
+    '\n\nCRITICAL: Continue from EXISTING files. Small HTML/CSS → write_file overwrite=true with the full file. Large files → apply_patch. Do not invent duplicate filenames. Never read .png/.jpg/.webp/.gif as text.'
 
   // Drop orphan tool rows from tail (must follow an assistant tool_calls)
   let tail = rawTail
@@ -1359,6 +1438,7 @@ async function buildApiMessages(
     if (
       m.id === 'welcome' ||
       m.id === AGENT_CHECKLIST_MSG_ID ||
+      m.id === AGENT_TODO_MSG_ID ||
       m.id === THREAD_SUMMARY_MSG_ID
     ) {
       continue
@@ -1776,7 +1856,10 @@ export async function runAgentTurn(params: {
     return msgs
   }
 
-  const finishStopped = (note = '⏹ Stopped.'): ChatMessage[] => {
+  const finishStopped = (note?: string): ChatMessage[] => {
+    const stopNote =
+      note ??
+      (uiLang === 'ru' ? '⏹ Остановлено пользователем.' : '⏹ Stopped by user.')
     for (let i = 0; i < messages.length; i++) {
       if (messages[i]?.streaming) {
         messages[i] = {
@@ -1786,7 +1869,7 @@ export async function runAgentTurn(params: {
         }
       }
     }
-    messages.push({ id: uid(), role: 'assistant', content: note })
+    messages.push({ id: uid(), role: 'assistant', content: stopNote })
     return finishWithTiming(messages)
   }
 
@@ -1797,6 +1880,7 @@ export async function runAgentTurn(params: {
   const ctxSize = appSettings.ctxSize > 0 ? appSettings.ctxSize : 8192
 
   let checklist = buildChecklistFromHistory(params.history)
+  let todoSteps: AgentTodoStep[] = []
   removeChecklistBubbles(messages)
   if (!isPlan) {
     params.onUpdate([...messages])
@@ -1918,6 +2002,11 @@ export async function runAgentTurn(params: {
   let markupRepairAttempts = 0
   let toolLoopHits = 0
   let missingPathHits = 0
+  let loopRecoveryWarned = false
+  let concludeAsked = false
+  let thinkGateHits = 0
+  /** Once the model emits <think> this turn, later tool rounds may skip re-thinking. */
+  let thinkSatisfied = false
   let usedWebSearch = false
   /** null until a test command runs */
   let lastNodeTestOk: boolean | null = null
@@ -1926,6 +2015,10 @@ export async function runAgentTurn(params: {
   const identicalToolCounts = new Map<string, number>()
   /** Failed apply_patch / apply_diff counts per path — unlock overwrite after 2. */
   const patchFailsByPath = new Map<string, number>()
+  /** Successful patches per path — stop endless "add img again" loops. */
+  const patchOkByPath = new Map<string, number>()
+  /** read_file counts per path — stop Think re-verify loops. */
+  const readCountsByPath = new Map<string, number>()
   /** Hard cap — model must not restart image gen mid-turn (even with a tweaked prompt). */
   let generateImageCalls = 0
   const thinkThrough = !isPlan && appSettings.agentThinkThrough !== false
@@ -2040,10 +2133,20 @@ export async function runAgentTurn(params: {
         ensureStreamBubble()
         const idx = messages.findIndex((m) => m.id === streamId)
         if (idx === -1) return
+        const nextContent = messages[idx].content + token
         messages[idx] = {
           ...messages[idx],
-          content: messages[idx].content + token,
+          content: nextContent,
           streaming: true
+        }
+        if (thinkThrough && hasThinkBlock(nextContent)) thinkSatisfied = true
+        // Live plan card while streaming (Cursor-style todos).
+        if (!isPlan) {
+          const livePlan = parsePlanBlock(nextContent)
+          if (livePlan?.length) {
+            todoSteps = livePlan
+            upsertTodoBubble(messages, todoSteps)
+          }
         }
         params.onUpdate([...messages])
       },
@@ -2069,6 +2172,11 @@ export async function runAgentTurn(params: {
               abortStream('tool_args_too_large')
               return
             }
+            // Think ON: do not flash tool rows until <think> appeared (or already satisfied).
+            const streamBubble = messages.find((m) => m.id === streamId)
+            const mayShowTools =
+              !thinkThrough || thinkSatisfied || hasThinkBlock(streamBubble?.content)
+            if (!mayShowTools) return
             if (!prev.name && !parsed.label.replace(/^[▸▹✎]+\s*/, '').trim()) return
 
             let draftArgs: Record<string, unknown> = {}
@@ -2193,8 +2301,8 @@ export async function runAgentTurn(params: {
           : prevStats
         messages[sIdx] = {
           ...messages[sIdx],
-          content: promoteThinkOnlyAnswer(
-            result.text || messages[sIdx].content || '(empty)'
+          content: stripPlanBlock(
+            promoteThinkOnlyAnswer(result.text || messages[sIdx].content || '(empty)')
           ),
           streaming: false,
           stats: mergedStats
@@ -2331,7 +2439,7 @@ export async function runAgentTurn(params: {
         : isOverflow
           ? 'Context was compacted to fit. Answer from the compressed document/notes still in this prompt. Do not dump a table of contents. Never read .png/.jpg/.webp as text.'
           : `Previous model response failed: ${errText.slice(0, 240)}\n` +
-            'Continue the unfinished task. Prefer smaller write_file chunks and relative paths only. Never overwrite existing files — append=true or apply_diff.'
+            'Continue the unfinished task. Small HTML/CSS → write_file overwrite=true with the full file. Large files → apply_patch / apply_diff or append=true. Keep relative_path set.'
       if (last?.role === 'tool') {
         appendToolHint(apiMessages, repairHint)
       } else {
@@ -2409,6 +2517,58 @@ export async function runAgentTurn(params: {
     }
 
     if (toolCalls?.length) {
+      // Think gate: refuse first tools until the model opens a <think> block this turn.
+      if (
+        thinkThrough &&
+        !thinkSatisfied &&
+        !hasThinkBlock(result.text) &&
+        thinkGateHits < 3
+      ) {
+        thinkGateHits++
+        for (const id of toolMsgByIndex.values()) {
+          const i = messages.findIndex((m) => m.id === id)
+          if (i !== -1) messages.splice(i, 1)
+        }
+        const si = messages.findIndex((m) => m.id === streamId)
+        if (si !== -1) {
+          messages[si] = {
+            ...messages[si]!,
+            streaming: false,
+            content:
+              messages[si]!.content?.trim() ||
+              (uiLang === 'ru' ? '↻ Нужен блок <think> перед tools…' : '↻ Need a <think> block before tools…')
+          }
+        } else {
+          messages.push({
+            id: uid(),
+            role: 'assistant',
+            content:
+              uiLang === 'ru'
+                ? '↻ Сначала <think>…</think>, потом tools.'
+                : '↻ Write <think>…</think> first, then tools.'
+          })
+        }
+        params.onUpdate([...messages])
+        // Do not push tool_calls into API history — model must redo with think.
+        pushUserMessage(
+          apiMessages,
+          'THINK_REQUIRED: Your previous reply called tools without a <think>…</think> block. ' +
+            'Reply again: (1) <think>…</think> with goal + whether a multi-step <plan> is needed, ' +
+            '(2) optional <plan>- [ ] steps -</plan> if 2+ work items, (3) then the same tool calls. ' +
+            'Do not skip <think>.'
+        )
+        apiMessages = normalizeApiMessages(apiMessages)
+        continue
+      }
+      if (thinkThrough && hasThinkBlock(result.text)) thinkSatisfied = true
+
+      const parsedPlan = parsePlanBlock(result.text)
+      if (parsedPlan?.length) {
+        todoSteps = parsedPlan
+        upsertTodoBubble(messages, todoSteps)
+        params.onUpdate([...messages])
+      }
+
       apiMessages.push({
         role: 'assistant',
         content: result.text?.trim() ? result.text : null,
@@ -2496,12 +2656,24 @@ export async function runAgentTurn(params: {
         const identicalCount = (identicalToolCounts.get(fp) ?? 0) + 1
         identicalToolCounts.set(fp, identicalCount)
         if (name === 'generate_image') generateImageCalls++
+        const pathKeyForLoop = loopPathKey(filePath || '')
+        if (name === 'read_file' && pathKeyForLoop) {
+          readCountsByPath.set(
+            pathKeyForLoop,
+            (readCountsByPath.get(pathKeyForLoop) ?? 0) + 1
+          )
+        }
         const identicalLimit =
           name === 'generate_image'
             ? 1
-            : name === 'create_directory'
-              ? MAX_IDENTICAL_TOOL_CALLS
-              : MAX_IDENTICAL_TOOL_CALLS + 1
+            : name === 'read_file'
+              ? MAX_READS_PER_PATH
+              : name === 'create_directory'
+                ? MAX_IDENTICAL_TOOL_CALLS
+                : MAX_IDENTICAL_TOOL_CALLS + 1
+        const readsOnPath = pathKeyForLoop
+          ? (readCountsByPath.get(pathKeyForLoop) ?? 0)
+          : 0
         if (name === 'generate_image' && generateImageCalls > 1) {
           toolLoopHits++
           toolResult = {
@@ -2511,6 +2683,21 @@ export async function runAgentTurn(params: {
             content: '',
             error:
               'TOOL_LOOP: generate_image already ran this turn (including any internal retry). Do NOT call it again — finish HTML/CSS with a CSS/placeholder visual.'
+          }
+        } else if (
+          name === 'read_file' &&
+          pathKeyForLoop &&
+          readsOnPath > MAX_READS_PER_PATH
+        ) {
+          toolLoopHits++
+          toolResult = {
+            id: call.id,
+            name,
+            ok: false,
+            content: '',
+            error:
+              `TOOL_LOOP: read_file on "${filePath}" already ${MAX_READS_PER_PATH} times this turn. ` +
+              'Do NOT re-read. If the last edit looked wrong, write_file overwrite=true once with the full corrected file, then finish — no more verify loops.'
           }
         } else if (identicalCount > identicalLimit) {
           toolLoopHits++
@@ -2525,6 +2712,21 @@ export async function runAgentTurn(params: {
                 : `TOOL_LOOP: identical ${name} repeated ${identicalCount} times` +
                   (filePath ? ` on "${filePath}"` : '') +
                   '. Stop repeating. Continue with a different file/step or finish the task.'
+          }
+        } else if (
+          (name === 'apply_patch' || name === 'apply_diff') &&
+          pathKeyForLoop &&
+          (patchOkByPath.get(pathKeyForLoop) ?? 0) >= MAX_PATCH_OK_PER_PATH
+        ) {
+          toolLoopHits++
+          toolResult = {
+            id: call.id,
+            name,
+            ok: false,
+            content: '',
+            error:
+              `PATCH_OK_LIMIT: already applied ${MAX_PATCH_OK_PER_PATH} successful patches to "${filePath}". ` +
+              'Stop patching. If still wrong, one write_file overwrite=true with the full file, then finish (no more read/patch loops).'
           }
         } else if (name === 'explore_subagent') {
           const explore = await runExploreSubagent({
@@ -2565,7 +2767,7 @@ export async function runAgentTurn(params: {
           typeof args.content === 'string' ? args.content : ''
         const pathStr =
           typeof args.relative_path === 'string' ? args.relative_path : ''
-        const pathKey = pathStr.replace(/\\/g, '/')
+        const pathKey = loopPathKey(pathStr)
         const codeIncomplete =
           name === 'write_file' &&
           Boolean(pathStr) &&
@@ -2657,8 +2859,9 @@ export async function runAgentTurn(params: {
           !args.append &&
           looksLikeCorrection(params.userText) &&
           !looksLikeExplicitRewrite(params.userText) &&
-          contentStr.length >= SMALL_FILE_OVERWRITE_CHARS &&
-          (patchFailsByPath.get(pathKey) ?? 0) < MAX_PATCH_FAILS_BEFORE_OVERWRITE
+          !allowsLandingOverwrite(pathStr, contentStr.length) &&
+          (patchFailsByPath.get(pathKey) ?? 0) < MAX_PATCH_FAILS_BEFORE_OVERWRITE &&
+          (patchOkByPath.get(pathKey) ?? 0) < MAX_PATCH_OK_PER_PATH
         ) {
           toolResult = {
             id: call.id,
@@ -2672,13 +2875,14 @@ export async function runAgentTurn(params: {
         } else if (name === 'write_file' && codeIncomplete && pathStr && contentStr) {
           const appendN = (incompleteAppendsByPath.get(pathKey) ?? 0) + 1
           incompleteAppendsByPath.set(pathKey, appendN)
-          // Always try to persist — never fail the UI when bytes landed on disk.
+          const landing = allowsLandingOverwrite(pathStr, contentStr.length)
+          // Landing HTML: persist bytes, then force next step to overwrite with full file.
           const partial = await window.api.agent.invoke({
             id: call.id,
             name,
             arguments: {
               ...args,
-              append: Boolean(args.append)
+              append: Boolean(args.append) && !landing
             }
           })
           let saved = partial
@@ -2689,7 +2893,10 @@ export async function runAgentTurn(params: {
             saved = await window.api.agent.invoke({
               id: call.id,
               name,
-              arguments: { ...args, append: true }
+              arguments: {
+                ...args,
+                ...(landing ? { overwrite: true, append: false } : { append: true })
+              }
             })
           }
           const tail = contentStr.slice(-200)
@@ -2701,19 +2908,20 @@ export async function runAgentTurn(params: {
               content: saved.content || '',
               error: saved.error ?? 'incomplete write failed'
             }
-          } else if (appendN > MAX_INCOMPLETE_APPENDS_PER_PATH) {
-            toolLoopHits++
+          } else if (landing || appendN > MAX_INCOMPLETE_APPENDS_PER_PATH) {
+            if (!landing) toolLoopHits++
             toolResult = {
               id: call.id,
               name,
               ok: true,
               content:
                 `Wrote ${contentStr.length} chars to ${pathStr} (file on disk). ` +
-                `INCOMPLETE_WRITE_LIMIT: stop tiny appends — finish with one larger append (≥200 chars) or move on.`,
+                (landing
+                  ? `INCOMPLETE_WRITE: next call write_file overwrite=true on "${pathStr}" with the COMPLETE file in one shot (do not tiny-append).`
+                  : `INCOMPLETE_WRITE_LIMIT: stop tiny appends — finish with one larger write_file overwrite=true or move on.`),
               editReview: saved.editReview
             }
           } else {
-            // ok:true so explorer updates and UI is not "Edited · failed"
             toolResult = {
               id: call.id,
               name,
@@ -2740,9 +2948,7 @@ export async function runAgentTurn(params: {
           ) {
             const pathInFlight =
               incompleteAppendsByPath.has(pathKey) ||
-              checklist.incomplete.some(
-                (p) => p.replace(/\\/g, '/') === pathKey
-              )
+              checklist.incomplete.some((p) => loopPathKey(p) === pathKey)
             if (pathInFlight) {
               const appended = await window.api.agent.invoke({
                 id: call.id,
@@ -2817,8 +3023,8 @@ export async function runAgentTurn(params: {
             .replace(/\\/g, '/')
             .trim()
           if (failPath) {
-            const n = (patchFailsByPath.get(failPath) ?? 0) + 1
-            patchFailsByPath.set(failPath, n)
+            const n = (patchFailsByPath.get(loopPathKey(failPath)) ?? 0) + 1
+            patchFailsByPath.set(loopPathKey(failPath), n)
             if (n >= MAX_PATCH_FAILS_BEFORE_OVERWRITE) {
               const hint =
                 `PATCH_FAIL_LIMIT: apply_patch/apply_diff failed ${n} times on "${failPath}". ` +
@@ -2832,9 +3038,47 @@ export async function runAgentTurn(params: {
               }
             }
           }
+        } else if (
+          (name === 'apply_patch' || name === 'apply_diff') &&
+          toolResult.ok
+        ) {
+          const okPath = (
+            toolResult.editReview?.path ||
+            (typeof args.relative_path === 'string' ? args.relative_path : '') ||
+            filePath ||
+            ''
+          )
+            .replace(/\\/g, '/')
+            .trim()
+          if (okPath) {
+            const key = loopPathKey(okPath)
+            patchOkByPath.set(key, (patchOkByPath.get(key) ?? 0) + 1)
+          }
         }
 
         applyToolToChecklist(checklist, name, args, toolResult)
+        if (todoSteps.length > 0) {
+          todoSteps = advanceTodosOnTool(todoSteps, name, toolResult.ok)
+          upsertTodoBubble(messages, todoSteps)
+        }
+        if (
+          !toolResult.ok ||
+          /TOOL_LOOP|INCOMPLETE_WRITE_LIMIT|FILE_EXISTS|PATCH_OK_LIMIT|PATCH_FAIL_LIMIT|THINK_REQUIRED/i.test(
+            toolResult.error ?? toolResult.content ?? ''
+          )
+        ) {
+          logAgentToolEvent(
+            `${name}: ${toolResult.error || toolResult.content || (toolResult.ok ? 'ok' : 'fail')}`.slice(
+              0,
+              500
+            ),
+            {
+              tool: name,
+              ok: toolResult.ok,
+              path: filePath || null
+            }
+          )
+        }
 
         let content = toolResult.ok
           ? toolResult.content.slice(0, TOOL_RESULT_CHARS)
@@ -3118,12 +3362,17 @@ export async function runAgentTurn(params: {
         } else if (/FILE_EXISTS/i.test(tc)) {
           appendToolHint(
             apiMessages,
-            'FILE_EXISTS: use append=true to continue or apply_patch / apply_diff to edit. Do not overwrite or invent a duplicate filename.'
+            'FILE_EXISTS: small HTML/CSS/scripts → write_file overwrite=true with the full file. Large files → apply_patch / apply_diff, or append=true to continue. Do not invent a duplicate filename.'
           )
         } else if (/OVERWRITE_BLOCKED/i.test(tc)) {
           appendToolHint(
             apiMessages,
             'OVERWRITE_BLOCKED: for small files (<6KB / HTML/CSS) use write_file overwrite=true. For large files use apply_patch/apply_diff; after two failed patches, overwrite is allowed.'
+          )
+        } else if (/PATCH_OK_LIMIT/i.test(tc)) {
+          appendToolHint(
+            apiMessages,
+            'PATCH_OK_LIMIT: stop apply_patch/apply_diff on that path. One write_file overwrite=true with the full corrected file if needed, then finish — no more read/verify loops.'
           )
         } else if (/PATCH_FAIL_LIMIT/i.test(tc)) {
           appendToolHint(
@@ -3146,26 +3395,40 @@ export async function runAgentTurn(params: {
         } else if (
           thinkThrough &&
           /✗|ERROR|failed|INCOMPLETE/i.test(tc) &&
-          !/✓/.test(tc)
+          !/✓/.test(tc) &&
+          !/TOOL_LOOP|PATCH_OK_LIMIT|PATCH_FAIL_LIMIT|IMAGE_/i.test(tc)
         ) {
           appendToolHint(
             apiMessages,
-            'Tool failed: write a short <think> with what went wrong, options, and the next concrete step — then act.'
+            'Tool failed: one short <think> with the cause and next step, then ONE corrective tool call (prefer write_file overwrite for small HTML/CSS). Do not re-read the same file in a loop.'
           )
         }
       }
       apiMessages = normalizeApiMessages(apiMessages)
       if (params.signal?.aborted) return finishStopped()
+      // Soft recovery only — never hard-stop for tool loops; user Stop aborts.
       if (toolLoopHits >= MAX_TOOL_LOOP_HITS || missingPathHits >= MAX_MISSING_PATH_HITS) {
-        messages.push({
-          id: uid(),
-          role: 'assistant',
-          content:
-            missingPathHits >= MAX_MISSING_PATH_HITS
-              ? '⚠ Stopped: write_file/create_directory without relative_path (nothing was saved). Send a follow-up asking to write index.html / styles.css / app.js with paths first.'
-              : '⚠ Stopped: agent repeated the same tool calls (or tiny incomplete writes). Check the files in the explorer, then send a follow-up.'
-        })
-        return finishWithTiming(messages)
+        const missing = missingPathHits >= MAX_MISSING_PATH_HITS
+        if (missing) missingPathHits = 0
+        else toolLoopHits = 0
+        if (!loopRecoveryWarned) {
+          loopRecoveryWarned = true
+          messages.push({
+            id: uid(),
+            role: 'assistant',
+            content: missing
+              ? '↻ Recovering: set relative_path on write_file / create_directory and continue…'
+              : '↻ Recovering from repeated tools — trying a different approach…'
+          })
+          params.onUpdate([...messages])
+        }
+        appendToolHint(
+          apiMessages,
+          missing
+            ? 'CRITICAL: previous writes had no relative_path. Call write_file/create_directory WITH relative_path (e.g. index.html). Then continue the task.'
+            : 'CRITICAL recovery: do NOT repeat the same tool+args. Prefer write_file overwrite=true for HTML/CSS/MD under ~40KB with the FULL file. Or apply_patch once. Then finish with a short user-facing summary. Do not stop.'
+        )
+        apiMessages = normalizeApiMessages(apiMessages)
       }
       upsertPlanningNextMoves(messages)
       params.onUpdate([...messages])
@@ -3173,15 +3436,59 @@ export async function runAgentTurn(params: {
     }
 
     // Final assistant text must enter apiMessages before any follow-up user nudge
-    const finalText = promoteThinkOnlyAnswer((result.text ?? '').trim())
-    if (finalText) {
+    const rawFinal = (result.text ?? '').trim()
+    const planOnly = parsePlanBlock(rawFinal)
+    if (planOnly?.length && todoSteps.length === 0) {
+      todoSteps = planOnly
+      upsertTodoBubble(messages, todoSteps)
+    }
+    const finalText = stripPlanBlock(promoteThinkOnlyAnswer(rawFinal))
+    if (finalText || rawFinal) {
       const lastApi = apiMessages[apiMessages.length - 1]
       if (lastApi?.role === 'assistant' && !lastApi.tool_calls?.length) {
-        lastApi.content = `${apiContentText(lastApi.content)}\n\n${finalText}`
-      } else {
-        apiMessages.push({ role: 'assistant', content: finalText })
+        lastApi.content = `${apiContentText(lastApi.content)}\n\n${rawFinal}`
+      } else if (rawFinal) {
+        apiMessages.push({ role: 'assistant', content: rawFinal })
       }
       apiMessages = normalizeApiMessages(apiMessages)
+      // Keep UI message without <plan> tags (card shows steps).
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const m = messages[i]
+        if (
+          m?.role === 'assistant' &&
+          !m.toolName &&
+          m.id !== AGENT_TODO_MSG_ID &&
+          m.id !== AGENT_CHECKLIST_MSG_ID &&
+          m.id !== AGENT_PLAN_MSG_ID &&
+          /<\s*plan\s*>/i.test(m.content ?? '')
+        ) {
+          messages[i] = { ...m, content: stripPlanBlock(m.content ?? '') }
+          break
+        }
+      }
+    }
+
+    // After tools ran with no visible closing summary — force one conclude round.
+    if (
+      completedTools > 0 &&
+      !finalText.trim() &&
+      !concludeAsked &&
+      round < maxRounds - 1
+    ) {
+      concludeAsked = true
+      const concludeHint =
+        uiLang === 'ru'
+          ? 'Инструменты уже выполнены. Напиши краткое заключение для пользователя: что сделано, ключевые пути файлов, как проверить. Без новых tool calls, если задача завершена; иначе один следующий tool, затем заключение.'
+          : 'Tools already ran. Write a short closing summary for the user: what changed, key file paths, how to verify. No new tool calls if the task is done; otherwise one next tool, then the summary.'
+      pushUserMessage(apiMessages, concludeHint)
+      apiMessages = normalizeApiMessages(apiMessages)
+      messages.push({
+        id: uid(),
+        role: 'assistant',
+        content: uiLang === 'ru' ? '↻ Пишу заключение…' : '↻ Writing closing summary…'
+      })
+      params.onUpdate([...messages])
+      continue
     }
 
     const {

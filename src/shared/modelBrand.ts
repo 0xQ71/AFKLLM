@@ -17,7 +17,7 @@ export function detectModelBrand(
   const s = `${repoId} ${extra ?? ''}`.toLowerCase()
   if (/mistral|devstral|mixtral|ministral/.test(s)) return 'mistral'
   if (/gemma/.test(s)) return 'gemma'
-  if (/qwen|qwq/.test(s)) return 'qwen'
+  if (/qwen|qwq|ornith/.test(s)) return 'qwen'
   if (/gpt-oss|openai\//.test(s)) return 'openai'
   if (/llama|meta-llama|codellama/.test(s)) return 'llama'
   if (/deepseek/.test(s)) return 'deepseek'

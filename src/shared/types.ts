@@ -163,7 +163,11 @@ export const AGENT_TOOL_SCHEMAS = [
     function: {
       name: 'write_file',
       description:
-        'Create a NEW file, or append to an existing one (append=true). ALWAYS set relative_path FIRST (e.g. "index.html", "styles.css") then content. Will REFUSE to overwrite a non-empty existing file — use append=true to continue writing, or apply_patch / apply_diff to edit. Prefer ≤1500 chars of code per call. Paths relative to project root only. Do NOT use overwrite=true to "fix" or answer a correction — patch instead.',
+        'Create or update a file. ALWAYS set relative_path FIRST (e.g. "index.html", "styles.css") then content. ' +
+        'NEW file: write the full body (small HTML/CSS/scripts <6KB in one call). ' +
+        'EXISTING small file (<6KB / HTML, CSS, short scripts): set overwrite=true with the full corrected file. ' +
+        'EXISTING large file: do not overwrite — use apply_patch / apply_diff, or append=true to continue a truncated write. ' +
+        'Paths relative to project root only.',
       parameters: {
         type: 'object',
         properties: {
@@ -174,12 +178,12 @@ export const AGENT_TOOL_SCHEMAS = [
           content: { type: 'string' },
           append: {
             type: 'boolean',
-            description: 'If true, append content instead of overwriting. Required to continue a truncated/incomplete file.'
+            description: 'If true, append content instead of overwriting. Use to continue a truncated/incomplete file.'
           },
           overwrite: {
             type: 'boolean',
             description:
-              'Only when the user explicitly asked to replace the entire file. Never for bugfixes/corrections — use apply_patch. Default false.'
+              'Replace the entire existing file. Required for small HTML/CSS/script edits. For large files prefer apply_patch unless two patches already failed. Default false.'
           }
         },
         required: ['relative_path', 'content']
@@ -191,7 +195,7 @@ export const AGENT_TOOL_SCHEMAS = [
     function: {
       name: 'apply_patch',
       description:
-        'Preferred edit tool for one or many file changes. Pass a Codex-style patch: *** Begin Patch / *** Add File: path / *** Update File: path with @@ hunks (-/+/space lines) / *** Delete File: path / *** End Patch. Use apply_diff only for a single unique search→replace. Prefer apply_patch over rewriting whole files.',
+        'Edit LARGE files (or many files at once) with a Codex-style patch: *** Begin Patch / *** Add File: path / *** Update File: path with @@ hunks (-/+/space lines) / *** Delete File: path / *** End Patch. For small HTML/CSS/scripts prefer write_file overwrite=true. Use apply_diff for one unique search→replace.',
       parameters: {
         type: 'object',
         properties: {
@@ -209,7 +213,7 @@ export const AGENT_TOOL_SCHEMAS = [
     function: {
       name: 'apply_diff',
       description:
-        'Simple fallback edit: replace one exact unique search_block with replace_block. Prefer apply_patch for multi-hunk or multi-file edits. On failure: read_file, copy a shorter unique substring, retry.',
+        'Simple fallback edit on a LARGE file: replace one exact unique search_block with replace_block. For small HTML/CSS prefer write_file overwrite=true. Prefer apply_patch for multi-hunk or multi-file edits. On failure: read_file, copy a shorter unique substring, retry — or overwrite if the file is small.',
       parameters: {
         type: 'object',
         properties: {

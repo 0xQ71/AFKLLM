@@ -7,7 +7,8 @@ import {
   type DragEvent,
   type FormEvent,
   type KeyboardEvent,
-  type MouseEvent
+  type MouseEvent,
+  type WheelEvent
 } from 'react'
 import type {
   ChatFileRef,
@@ -22,16 +23,16 @@ import type {
 import {
   AGENT_CHECKLIST_MSG_ID,
   AGENT_PLAN_MSG_ID,
+  AGENT_TODO_MSG_ID,
   FILES_CHANGED_TOOL,
-  formatPlanExecutePrompt,
-  getPlanStatus,
   parseThinkBlocks,
   promoteThinkOnlyAnswer,
   runAgentTurn,
-  setPlanStatus,
+  stripPlanBlock,
   stripPlanStatus,
   type TurnFileChange
 } from '../agent/runAgentTurn'
+import { parseChecklistUiContent, parseTodoUiContent } from '../agent/agentPure'
 import type { QueueManager } from '../llm/queueManager'
 import type { ChatSession, PersistedChatMessage } from '../../../shared/chats'
 import {
@@ -84,7 +85,6 @@ interface ChatPanelProps {
     sessions: SessionMeta[],
     activeId: string | null
   ) => void
-  planModeSignal?: number
   headerActions?: React.ReactNode
   workspaceKey?: string | null
   gitBranch?: string | null
@@ -115,7 +115,6 @@ export function ChatPanel({
   switchSessionSignal = null,
   hideSessionChrome = false,
   onSessionsChange,
-  planModeSignal = 0,
   headerActions,
   workspaceKey = null,
   gitBranch = null,
@@ -320,13 +319,14 @@ export function ChatPanel({
   const sendLockRef = useRef<Promise<void>>(Promise.resolve())
   const [lastStats, setLastStats] = useState<ChatMessageStats | null>(null)
   const [autoApprove, setAutoApprove] = useState(false)
-  const [planMode, setPlanMode] = useState(false)
   const [thinkThrough, setThinkThrough] = useState(true)
   const [imageMode, setImageMode] = useState(false)
   const [projectRulesText, setProjectRulesText] = useState('')
   const [mcpToolsJson, setMcpToolsJson] = useState('')
   const [systemPromptExtra, setSystemPromptExtra] = useState('')
   const bottomRef = useRef<HTMLDivElement>(null)
+  const feedScrollRef = useRef<HTMLDivElement>(null)
+  const stickToBottomRef = useRef(true)
   const codeEndRefs = useRef<Map<string, HTMLPreElement>>(new Map())
   const abortRef = useRef<AbortController | null>(null)
   const persistTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -460,14 +460,37 @@ export function ChatPanel({
   }, [workspaceKey])
 
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'auto' })
+    if (!stickToBottomRef.current) return
+    const el = feedScrollRef.current
+    if (el) {
+      el.scrollTop = el.scrollHeight
+    } else {
+      bottomRef.current?.scrollIntoView({ behavior: 'auto', block: 'end' })
+    }
     for (const m of messages) {
       if (m.streaming && m.codePreview) {
-        const el = codeEndRefs.current.get(m.id)
-        if (el) el.scrollTop = el.scrollHeight
+        const codeEl = codeEndRefs.current.get(m.id)
+        if (codeEl) codeEl.scrollTop = codeEl.scrollHeight
       }
     }
   }, [messages])
+
+  const onFeedScroll = (): void => {
+    const el = feedScrollRef.current
+    if (!el) return
+    const dist = el.scrollHeight - el.scrollTop - el.clientHeight
+    stickToBottomRef.current = dist < 80
+  }
+
+  const onFeedWheel = (e: WheelEvent<HTMLDivElement>): void => {
+    if (e.deltaY < 0) stickToBottomRef.current = false
+    else {
+      const el = feedScrollRef.current
+      if (!el) return
+      const dist = el.scrollHeight - el.scrollTop - el.clientHeight
+      if (dist < 80) stickToBottomRef.current = true
+    }
+  }
 
   useEffect(() => {
     if (!sessionId) return
@@ -479,23 +502,23 @@ export function ChatPanel({
       void window.api.chats
         .updateMessages(id, messages.map(toPersisted))
         .then((snap) => {
-          setSessionList(
-            snap.sessions
-              .map(({ id: sid, title, createdAt, updatedAt }) => ({
-                id: sid,
-                title,
-                createdAt,
-                updatedAt
-              }))
-              .sort((a, b) => b.updatedAt - a.updatedAt)
-          )
+          const list = snap.sessions
+            .map(({ id: sid, title, createdAt, updatedAt }) => ({
+              id: sid,
+              title,
+              createdAt,
+              updatedAt
+            }))
+            .sort((a, b) => b.updatedAt - a.updatedAt)
+          setSessionList(list)
+          onSessionsChange?.(list, id)
         })
         .catch(console.error)
     }, 400)
     return () => {
       if (persistTimer.current) clearTimeout(persistTimer.current)
     }
-  }, [messages, sessionId])
+  }, [messages, sessionId, onSessionsChange])
 
   const toggleAutoApprove = async (): Promise<void> => {
     const next = !autoApprove
@@ -646,11 +669,6 @@ export function ChatPanel({
     // eslint-disable-next-line react-hooks/exhaustive-deps -- signal edge only
   }, [switchSessionSignal?.nonce])
 
-  useEffect(() => {
-    if (!planModeSignal) return
-    setPlanMode((v) => !v)
-  }, [planModeSignal])
-
   const deleteSession = async (id: string, e: MouseEvent): Promise<void> => {
     e.stopPropagation()
     if (busy && id === sessionId) stop({ drain: false })
@@ -738,7 +756,6 @@ export function ChatPanel({
       }
       if (!activeSession) return
     }
-    const usePlan = planMode && !opts?.reverb
     // Implicit-accept leftover edit reviews so they don't stale forever
     try {
       await window.api.agent.acceptAllEdits()
@@ -777,6 +794,7 @@ export function ChatPanel({
       return next
     })
     if (!opts?.fromQueue && !opts?.reverb) setInput('')
+    stickToBottomRef.current = true
     const turnId = ++turnGenRef.current
     setBusy(true)
     busyRef.current = true
@@ -839,15 +857,12 @@ export function ChatPanel({
         onStats: (stats) => applyTurnStats(stats, turnId, activeSession),
         onOpenPath,
         signal: ac.signal,
-        mode: usePlan ? 'plan' : 'agent',
+        mode: 'agent',
         sessionId: activeSession,
         onUserMessageCreated: (id) => setActiveUserMsgId(id),
         reverbContinue: opts?.reverb,
         uiLanguage: lang
       })
-      if (turnGenRef.current === turnId) {
-        if (usePlan) setPlanMode(false)
-      }
     } finally {
       if (turnGenRef.current === turnId) {
         abortRef.current = null
@@ -916,59 +931,6 @@ export function ChatPanel({
     void send(text)
     // eslint-disable-next-line react-hooks/exhaustive-deps -- drain queue after folder bind
   }, [needsFolderToChat, workspaceKey, llmReady, sessionId])
-
-  const approvePlan = async (): Promise<void> => {
-    const plan = messages.find((m) => m.id === AGENT_PLAN_MSG_ID)
-    if (!plan || getPlanStatus(plan.content) !== 'pending' || busy || !sessionId) return
-    const approvedContent = setPlanStatus(plan.content, 'approved')
-    const history = messages.map((m) =>
-      m.id === AGENT_PLAN_MSG_ID ? { ...m, content: approvedContent } : m
-    )
-    setMessages(history)
-    setBusy(true)
-    const turnId = ++turnGenRef.current
-    const ac = new AbortController()
-    abortRef.current = ac
-    try {
-      await runAgentTurn({
-        queue,
-        history,
-        userText: formatPlanExecutePrompt(approvedContent),
-        openFile,
-        selection,
-        attachments: [],
-        onUpdate: setMessages,
-        onStats: (stats) => applyTurnStats(stats, turnId, sessionId),
-        onOpenPath,
-        signal: ac.signal,
-        mode: 'agent',
-        sessionId,
-        uiLanguage: lang
-      })
-    } finally {
-      if (turnGenRef.current === turnId) {
-        abortRef.current = null
-        setBusy(false)
-      }
-    }
-  }
-
-  const rejectPlan = (): void => {
-    setMessages((prev) =>
-      prev.map((m) =>
-        m.id === AGENT_PLAN_MSG_ID && getPlanStatus(m.content) === 'pending'
-          ? { ...m, content: setPlanStatus(m.content, 'rejected') }
-          : m
-      )
-    )
-  }
-
-  const editPlan = (): void => {
-    const plan = messages.find((m) => m.id === AGENT_PLAN_MSG_ID)
-    if (!plan) return
-    setInput(stripPlanStatus(plan.content))
-    setPlanMode(true)
-  }
 
   const reviewEdit = async (
     messageId: string,
@@ -1055,7 +1017,7 @@ export function ChatPanel({
       agentAutoApprove: autoApprove,
       agentThinkThrough: thinkThrough,
       agentImageGenEnabled: imageMode,
-      planMode,
+      planMode: false,
       systemPromptExtra,
       projectRules: projectRulesText,
       mcpToolsJson
@@ -1067,7 +1029,6 @@ export function ChatPanel({
       autoApprove,
       thinkThrough,
       imageMode,
-      planMode,
       systemPromptExtra,
       projectRulesText,
       mcpToolsJson
@@ -1134,23 +1095,6 @@ export function ChatPanel({
             </div>
           </button>
         )}
-        <button
-          type="button"
-          onClick={() => setPlanMode((v) => !v)}
-          title={
-            planMode
-              ? 'Plan Mode ON — next send drafts a plan (no tools)'
-              : 'Plan Mode OFF — click to plan before execute'
-          }
-          className={
-            'shrink-0 rounded-md px-2 py-0.5 text-[11px] ' +
-            (planMode
-              ? 'bg-signal/15 text-signal'
-              : 'text-ink-mute hover:bg-ink-900 hover:text-ink-bright')
-          }
-        >
-          {planMode ? t('chat.plan') : t('chat.agent')}
-        </button>
         {headerActions}
 
         {!hideSessionChrome && pickerOpen && (
@@ -1187,7 +1131,12 @@ export function ChatPanel({
         )}
       </div>
 
-      <div className="min-h-0 flex-1 space-y-0.5 overflow-auto px-4 py-3">
+      <div
+        ref={feedScrollRef}
+        onScroll={onFeedScroll}
+        onWheel={onFeedWheel}
+        className="min-h-0 flex-1 space-y-0.5 overflow-auto px-4 py-3"
+      >
         {!sessionId ? (
           <div className="flex h-full flex-col items-center justify-center gap-3 px-4 text-center">
             {needsFolderToChat || !workspaceKey ? (
@@ -1243,11 +1192,15 @@ export function ChatPanel({
                 onOpenImage={(path, name) => void openChatImage(path, name)}
               />
             ) : null}
-            {!m.toolName && m.id === AGENT_PLAN_MSG_ID && m.content?.trim() ? (
+            {!m.toolName && m.id === AGENT_TODO_MSG_ID && m.content?.trim() ? (
+              <AgentTodoCard content={m.content} />
+            ) : !m.toolName && m.id === AGENT_CHECKLIST_MSG_ID && m.content?.trim() ? (
+              <AgentChecklistCard content={m.content} />
+            ) : !m.toolName && m.id === AGENT_PLAN_MSG_ID && m.content?.trim() ? (
               <div className="space-y-2">
                 <div className="rounded-xl border border-ink-line/80 bg-ink-900/40 px-3 py-2.5 text-[13px] text-ink-soft">
                   <div className="mb-1.5 text-[11px] font-medium tracking-wide text-ink-mute">
-                    Plan
+                    {t('chat.plan')}
                   </div>
                   <div className="whitespace-pre-wrap break-words">
                     {stripPlanStatus(m.content)}
@@ -1395,45 +1348,6 @@ export function ChatPanel({
                 </div>
               )
             ) : null}
-            {m.id === AGENT_PLAN_MSG_ID &&
-              getPlanStatus(m.content) === 'pending' &&
-              !m.streaming && (
-                <div className="mt-2 flex flex-wrap items-center gap-2">
-                  <button
-                    type="button"
-                    disabled={busy}
-                    onClick={() => void approvePlan()}
-                    className="rounded-md bg-signal/20 px-2 py-0.5 font-mono text-[10px] text-signal hover:bg-signal/30 disabled:opacity-40"
-                  >
-                    Approve
-                  </button>
-                  <button
-                    type="button"
-                    disabled={busy}
-                    onClick={rejectPlan}
-                    className="rounded-md border border-rose-500/40 px-2 py-0.5 font-mono text-[10px] text-rose-300 hover:bg-rose-500/15 disabled:opacity-40"
-                  >
-                    Reject
-                  </button>
-                  <button
-                    type="button"
-                    disabled={busy}
-                    onClick={editPlan}
-                    className="rounded-md border border-ink-line px-2 py-0.5 font-mono text-[10px] text-ink-soft hover:bg-ink-800 disabled:opacity-40"
-                  >
-                    Edit
-                  </button>
-                  <span className="font-mono text-[9px] text-ink-mute">
-                    approve runs tools
-                  </span>
-                </div>
-              )}
-            {m.id === AGENT_PLAN_MSG_ID && getPlanStatus(m.content) === 'approved' && (
-              <div className="mt-1 font-mono text-[9px] text-ink-mute">Approved · executing</div>
-            )}
-            {m.id === AGENT_PLAN_MSG_ID && getPlanStatus(m.content) === 'rejected' && (
-              <div className="mt-1 font-mono text-[9px] text-rose-300/80">Rejected</div>
-            )}
             {m.codePreview != null &&
               m.codePreview.length > 0 &&
               !(m.editReview?.status === 'pending') && (
@@ -1799,7 +1713,7 @@ export function ChatPanel({
                   ) : null}
                   <button
                     type="button"
-                    onClick={() => stop()}
+                    onClick={() => stop({ drain: false })}
                     title={t('chat.stop')}
                     className="flex h-7 w-7 items-center justify-center rounded-md text-ink-bright hover:bg-ink-800"
                   >
@@ -2022,7 +1936,10 @@ function ThinkThroughBody({
   durationLabel?: string
 }): React.JSX.Element {
   const { t } = useI18n()
-  const parts = parseThinkBlocks(promoteThinkOnlyAnswer(content))
+  // Parse raw content so <think> stays foldable; only promote when there is no think fold.
+  const parts = parseThinkBlocks(content).map((p) =>
+    p.kind === 'text' ? { ...p, text: stripPlanBlock(p.text) } : p
+  )
   const hasThink = parts.some((p) => p.kind === 'think')
   if (!hasThink) {
     return (
@@ -2075,6 +1992,81 @@ function ThinkThroughBody({
           />
         )
       )}
+    </div>
+  )
+}
+
+function AgentTodoCard({ content }: { content: string }): React.JSX.Element | null {
+  const { t } = useI18n()
+  const steps = parseTodoUiContent(content)
+  if (!steps?.length) return null
+  const allDone = steps.every((s) => s.status === 'done')
+  const statusLabel = allDone
+    ? t('chat.plan.statusDone')
+    : t('chat.plan.statusActive')
+  return (
+    <div className="rounded-xl border border-ink-line/80 bg-ink-900/35 px-3 py-2.5">
+      <div className="mb-2 flex items-baseline justify-between gap-2">
+        <div className="text-[12px] font-medium text-ink-bright">{t('chat.checklist.title')}</div>
+        <div
+          className={
+            'text-[11px] ' + (allDone ? 'text-signal' : 'text-ink-mute')
+          }
+        >
+          {allDone ? `✓ ${statusLabel}` : statusLabel}
+        </div>
+      </div>
+      <ul className="space-y-1.5">
+        {steps.map((s) => {
+          const done = s.status === 'done'
+          const active = s.status === 'in_progress'
+          return (
+            <li key={s.id} className="flex items-start gap-2 text-[12px] leading-snug">
+              <span
+                className={
+                  'mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full border text-[10px] ' +
+                  (done
+                    ? 'border-signal bg-signal/20 text-signal'
+                    : active
+                      ? 'border-amber-400/70 text-amber-400'
+                      : 'border-ink-line text-ink-mute')
+                }
+                aria-hidden
+              >
+                {done ? '✓' : active ? '·' : ''}
+              </span>
+              <span
+                className={
+                  done ? 'text-ink-mute line-through decoration-ink-line' : 'text-ink-soft'
+                }
+              >
+                {s.text}
+              </span>
+            </li>
+          )
+        })}
+      </ul>
+    </div>
+  )
+}
+
+function AgentChecklistCard({ content }: { content: string }): React.JSX.Element | null {
+  // Legacy progress dump — keep minimal, do not look like Cursor plan.
+  const { t } = useI18n()
+  const cl = parseChecklistUiContent(content)
+  if (!cl) return null
+  const items = [...cl.done.map((x) => ({ mark: '✓', text: x, tone: 'text-signal' }))]
+  if (items.length === 0) return null
+  return (
+    <div className="rounded-lg border border-ink-line/50 px-2.5 py-1.5 text-[11px] text-ink-mute">
+      <div className="mb-1 text-[10px] uppercase tracking-wide">{t('chat.checklist.done')}</div>
+      <div className="flex flex-wrap gap-1">
+        {items.map((it) => (
+          <span key={it.text} className={'font-mono ' + it.tone}>
+            {it.mark} {it.text}
+          </span>
+        ))}
+      </div>
     </div>
   )
 }
@@ -2421,7 +2413,8 @@ function fileExtLabel(name: string): string {
 }
 
 function isVisibleChatMessage(m: ChatMessage): boolean {
-  if (m.id === AGENT_CHECKLIST_MSG_ID) return false
+  if (m.id === AGENT_TODO_MSG_ID) return Boolean(m.content?.trim())
+  if (m.id === AGENT_CHECKLIST_MSG_ID) return Boolean(m.content?.trim())
   if (m.id === 'welcome') return true
   const hasText = Boolean(m.content?.trim())
   const hasCode = Boolean(m.codePreview && m.codePreview.length > 0)
@@ -2442,7 +2435,13 @@ function formatDuration(ms: number): string {
 }
 
 function messageRowClass(m: ChatMessage): string {
-  if (m.id === AGENT_PLAN_MSG_ID) return 'py-1'
+  if (
+    m.id === AGENT_TODO_MSG_ID ||
+    m.id === AGENT_CHECKLIST_MSG_ID ||
+    m.id === AGENT_PLAN_MSG_ID
+  ) {
+    return 'py-1'
+  }
   if (m.toolName === FILES_CHANGED_TOOL) return 'py-1.5'
   if (m.toolName) return 'py-0.5'
   if (m.role === 'user') return 'flex justify-end py-1'

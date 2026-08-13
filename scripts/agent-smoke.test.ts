@@ -8,6 +8,9 @@ import {
   buildChecklistFromHistory,
   emptyChecklist,
   formatChecklist,
+  formatChecklistUiContent,
+  parseChecklistUiContent,
+  checklistHasItems,
   fingerprintToolCall,
   looksLikeToolMarkupLeak,
   coerceToolRelativePath,
@@ -16,7 +19,15 @@ import {
   normalizeApiMessages,
   parseComposerMentions,
   parseThinkBlocks,
+  promoteThinkOnlyAnswer,
+  mergeChecklistIntoSystem,
   formatNowForAgent,
+  parsePlanBlock,
+  hasThinkBlock,
+  stripPlanBlock,
+  advanceTodosOnTool,
+  formatTodoUiContent,
+  parseTodoUiContent,
   type ApiMessage
 } from '../src/renderer/src/agent/agentPure'
 import { AgentToolRegistry } from '../src/main/agent/AgentToolRegistry'
@@ -72,6 +83,11 @@ describe('looksLikeToolMarkupLeak', () => {
     assert.equal(coerceToolRelativePath({ file: 'styles.css' }), 'styles.css')
     assert.equal(coerceToolRelativePath({ filename: 'app.js' }), 'app.js')
     assert.equal(coerceToolRelativePath({ content: 'hi' }), null)
+    assert.equal(
+      coerceToolRelativePath({ path: 'D:\\proj\\index.html' }),
+      'D:/proj/index.html'
+    )
+    assert.equal(coerceToolRelativePath({ path: './styles.css' }), './styles.css')
   })
 
   it('infers write path from content', () => {
@@ -284,13 +300,23 @@ describe('sanitizePersistedMessages', () => {
     assert.equal(out[0]!.id, 'welcome')
   })
 
-  it('strips agent-checklist bubble', () => {
+  it('keeps agent-checklist bubble', () => {
     const out = sanitizePersistedMessages([
       { id: 'welcome', role: 'assistant', content: 'hi' },
-      { id: 'agent-checklist', role: 'assistant', content: 'Checklist' },
+      {
+        id: 'agent-checklist',
+        role: 'assistant',
+        content: JSON.stringify({
+          kind: 'agent-checklist',
+          done: ['index.html'],
+          incomplete: [],
+          failed: [],
+          shells: []
+        })
+      },
       { id: 'u1', role: 'user', content: 'do it' }
     ])
-    assert.ok(!out.some((m) => m.id === 'agent-checklist'))
+    assert.ok(out.some((m) => m.id === 'agent-checklist'))
     assert.ok(out.some((m) => m.id === 'u1'))
   })
 
@@ -335,7 +361,7 @@ describe('sanitizePersistedMessages', () => {
     assert.equal(ids.indexOf(THREAD_SUMMARY_MSG_ID), ids.indexOf('welcome') + 1)
   })
 
-  it('keeps agent-plan bubble', () => {
+  it('keeps agent-plan and agent-checklist bubbles', () => {
     const out = sanitizePersistedMessages([
       { id: 'welcome', role: 'assistant', content: 'hi' },
       {
@@ -343,10 +369,20 @@ describe('sanitizePersistedMessages', () => {
         role: 'assistant',
         content: '1. Do thing\n\n_Status: pending_'
       },
-      { id: 'agent-checklist', role: 'assistant', content: 'Checklist' }
+      {
+        id: 'agent-checklist',
+        role: 'assistant',
+        content: JSON.stringify({
+          kind: 'agent-checklist',
+          done: [],
+          incomplete: ['a.ts'],
+          failed: [],
+          shells: []
+        })
+      }
     ])
     assert.ok(out.some((m) => m.id === AGENT_PLAN_MSG_ID))
-    assert.ok(!out.some((m) => m.id === 'agent-checklist'))
+    assert.ok(out.some((m) => m.id === 'agent-checklist'))
   })
 })
 
@@ -441,6 +477,78 @@ describe('parseThinkBlocks', () => {
     const parts = parseThinkBlocks('just answer')
     assert.deepEqual(parts, [{ kind: 'text', text: 'just answer' }])
   })
+
+  it('treats unclosed think as think, not visible text', () => {
+    const parts = parseThinkBlocks('<think>\nGoal: wire hero.png\nthen patch HTML')
+    assert.equal(parts.length, 1)
+    assert.equal(parts[0]!.kind, 'think')
+    assert.match(parts[0]!.text, /hero\.png/)
+    const promoted = promoteThinkOnlyAnswer('<think>\nThe page is a landing hero.')
+    assert.match(promoted, /landing hero/)
+    assert.ok(!/<think>/i.test(promoted))
+  })
+})
+
+describe('mergeChecklistIntoSystem', () => {
+  it('keeps compact memory when injecting a fresh checklist', () => {
+    const sys =
+      'You are AFKLLM.\n\n[Context compacted due to context-window pressure]\n' +
+      'Already wrote index.html and generated/hero.png.\n' +
+      '\n\n[Agent checklist]\n✓ done: old.html\n[/Agent checklist]'
+    const next = mergeChecklistIntoSystem(
+      sys,
+      '\n\n[Agent checklist]\n✓ done: index.html\n[/Agent checklist]'
+    )
+    assert.match(next, /generated\/hero\.png/)
+    assert.match(next, /index\.html/)
+    assert.ok(!/old\.html/.test(next))
+  })
+})
+
+describe('checklist UI payload', () => {
+  it('round-trips checklist JSON for the chat bubble', () => {
+    const cl = {
+      done: ['index.html'],
+      incomplete: ['styles.css'],
+      failed: [] as string[],
+      shells: ['npm run build']
+    }
+    assert.equal(checklistHasItems(cl), true)
+    const raw = formatChecklistUiContent(cl)
+    const parsed = parseChecklistUiContent(raw)
+    assert.deepEqual(parsed, cl)
+  })
+
+  it('parseThinkBlocks keeps think foldable even when promote unwraps for API', () => {
+    const raw = '<think>\nGoal: landing\n</think>'
+    const parts = parseThinkBlocks(raw)
+    assert.equal(parts[0]!.kind, 'think')
+    const promoted = promoteThinkOnlyAnswer(raw)
+    assert.match(promoted, /Goal: landing/)
+    assert.ok(!/<think>/i.test(promoted))
+  })
+})
+
+describe('agent todo plan', () => {
+  it('parses <plan> into steps and advances on tools', () => {
+    assert.equal(hasThinkBlock('<think>x</think>'), true)
+    assert.equal(hasThinkBlock('nope'), false)
+    const steps = parsePlanBlock(
+      '<think>multi</think>\n<plan>\n- [ ] Write index.html\n- [ ] Verify in browser\n</plan>'
+    )
+    assert.equal(steps?.length, 2)
+    assert.equal(steps![0]!.status, 'in_progress')
+    assert.equal(steps![1]!.status, 'pending')
+    const advanced = advanceTodosOnTool(steps!, 'write_file', true)
+    assert.equal(advanced[0]!.status, 'done')
+    assert.equal(advanced[1]!.status, 'in_progress')
+    const ui = formatTodoUiContent(advanced)
+    assert.deepEqual(parseTodoUiContent(ui)?.map((s) => s.text), [
+      'Write index.html',
+      'Verify in browser'
+    ])
+    assert.equal(stripPlanBlock('hi\n<plan>\n- a\n</plan>\nbye'), 'hi\n\nbye')
+  })
 })
 
 describe('formatNowForAgent', () => {
@@ -505,6 +613,39 @@ describe('AgentToolRegistry edit review', () => {
       assert.ok(wrote.editReview)
       await reg.rejectEdit(rel)
       await assert.rejects(() => fs.access(path.join(root, rel)))
+    } finally {
+      await fs.rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('FILE_EXISTS on small files tells the model to overwrite=true', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'afkllm-exists-'))
+    try {
+      const reg = new AgentToolRegistry({ projectRoot: root })
+      const rel = 'index.html'
+      await fs.writeFile(
+        path.join(root, rel),
+        '<!DOCTYPE html><html><body><h1>landing</h1><p>hello world page</p></body></html>\n',
+        'utf8'
+      )
+      const blocked = await reg.invoke({
+        id: '1',
+        name: 'write_file',
+        arguments: { relative_path: rel, content: '<html><body>bye</body></html>\n' }
+      })
+      assert.equal(blocked.ok, false)
+      assert.match(blocked.error ?? '', /overwrite=true/)
+      const ok = await reg.invoke({
+        id: '2',
+        name: 'write_file',
+        arguments: {
+          relative_path: rel,
+          content: '<html><body>bye</body></html>\n',
+          overwrite: true
+        }
+      })
+      assert.equal(ok.ok, true)
+      assert.match(await fs.readFile(path.join(root, rel), 'utf8'), /bye/)
     } finally {
       await fs.rm(root, { recursive: true, force: true })
     }

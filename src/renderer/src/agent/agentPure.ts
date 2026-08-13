@@ -40,6 +40,16 @@ export function apiContentText(content: ApiMessage['content']): string {
 }
 
 export const AGENT_CHECKLIST_MSG_ID = 'agent-checklist'
+/** Cursor-style todo plan authored by the model via <plan>…</plan>. */
+export const AGENT_TODO_MSG_ID = 'agent-todo'
+
+export type AgentTodoStatus = 'pending' | 'in_progress' | 'done'
+
+export type AgentTodoStep = {
+  id: string
+  text: string
+  status: AgentTodoStatus
+}
 
 export type AgentChecklist = {
   done: string[]
@@ -96,14 +106,136 @@ function removeFrom(list: string[], item: string): void {
   }
 }
 
+export function checklistHasItems(cl: AgentChecklist): boolean {
+  return (
+    cl.done.length + cl.incomplete.length + cl.failed.length + cl.shells.length >
+    0
+  )
+}
+
+/** JSON payload for the visible checklist bubble in chat. */
+export function formatChecklistUiContent(cl: AgentChecklist): string {
+  return JSON.stringify({
+    kind: 'agent-checklist',
+    done: cl.done,
+    incomplete: cl.incomplete,
+    failed: cl.failed,
+    shells: cl.shells.slice(-8)
+  })
+}
+
+export function parseChecklistUiContent(content: string): AgentChecklist | null {
+  try {
+    const o = JSON.parse(content) as Record<string, unknown>
+    if (o.kind !== 'agent-checklist') return null
+    return {
+      done: Array.isArray(o.done) ? o.done.map(String) : [],
+      incomplete: Array.isArray(o.incomplete) ? o.incomplete.map(String) : [],
+      failed: Array.isArray(o.failed) ? o.failed.map(String) : [],
+      shells: Array.isArray(o.shells) ? o.shells.map(String) : []
+    }
+  } catch {
+    return null
+  }
+}
+
+export function formatTodoUiContent(steps: AgentTodoStep[]): string {
+  return JSON.stringify({ kind: 'agent-todo', steps })
+}
+
+export function parseTodoUiContent(content: string): AgentTodoStep[] | null {
+  try {
+    const o = JSON.parse(content) as Record<string, unknown>
+    if (o.kind !== 'agent-todo' || !Array.isArray(o.steps)) return null
+    return o.steps
+      .map((s, i) => {
+        const row = s as Record<string, unknown>
+        const status =
+          row.status === 'done' || row.status === 'in_progress' || row.status === 'pending'
+            ? row.status
+            : 'pending'
+        const text = String(row.text ?? '').trim()
+        if (!text) return null
+        return {
+          id: String(row.id ?? `s${i + 1}`),
+          text,
+          status
+        } satisfies AgentTodoStep
+      })
+      .filter((x): x is AgentTodoStep => Boolean(x))
+  } catch {
+    return null
+  }
+}
+
+/** True if assistant text opened a think/thinking block. */
+export function hasThinkBlock(text: string | null | undefined): boolean {
+  return /<\s*(?:think|thinking)\s*>/i.test(text ?? '')
+}
+
+/** Parse <plan>…</plan> into Cursor-style todo steps. */
+export function parsePlanBlock(text: string | null | undefined): AgentTodoStep[] | null {
+  const raw = text ?? ''
+  const m = raw.match(/<\s*plan\s*>([\s\S]*?)<\s*\/\s*plan\s*>/i)
+  if (!m) return null
+  const body = m[1] ?? ''
+  const steps: AgentTodoStep[] = []
+  for (const line of body.split(/\r?\n/)) {
+    let t = line.trim()
+    if (!t) continue
+    t = t
+      .replace(/^[-*•]\s*/, '')
+      .replace(/^\d+[.)]\s*/, '')
+      .replace(/^\[[ xX]?\]\s*/, '')
+      .trim()
+    if (t.length < 2) continue
+    if (/^#{1,6}\s/.test(t)) continue
+    steps.push({
+      id: `s${steps.length + 1}`,
+      text: t.slice(0, 200),
+      status: steps.length === 0 ? 'in_progress' : 'pending'
+    })
+  }
+  return steps.length > 0 ? steps : null
+}
+
+export function stripPlanBlock(text: string): string {
+  return text
+    .replace(/<\s*plan\s*>[\s\S]*?<\s*\/\s*plan\s*>/gi, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+}
+
+/** Advance one plan step after a successful mutating / shell tool. */
+export function advanceTodosOnTool(
+  steps: AgentTodoStep[],
+  name: string,
+  ok: boolean
+): AgentTodoStep[] {
+  if (!ok || steps.length === 0) return steps
+  if (
+    !/^(write_file|apply_patch|apply_diff|create_directory|delete_file|execute_terminal_command|generate_image|rename_file)$/.test(
+      name
+    )
+  ) {
+    return steps
+  }
+  const next = steps.map((s) => ({ ...s }))
+  let cur = next.find((s) => s.status === 'in_progress')
+  if (!cur) {
+    cur = next.find((s) => s.status === 'pending')
+    if (cur) cur.status = 'in_progress'
+  }
+  if (!cur) return next
+  cur.status = 'done'
+  const nxt = next.find((s) => s.status === 'pending')
+  if (nxt) nxt.status = 'in_progress'
+  return next
+}
+
 /** Model-facing checklist block. */
 export function formatChecklist(cl: AgentChecklist): string {
-  if (
-    cl.done.length + cl.incomplete.length + cl.failed.length + cl.shells.length ===
-    0
-  ) {
-    return ''
-  }
+  if (!checklistHasItems(cl)) return ''
   const lines = [
     '[Agent checklist]',
     ...(cl.done.length ? [`✓ done: ${cl.done.join(', ')}`] : []),
@@ -112,7 +244,7 @@ export function formatChecklist(cl: AgentChecklist): string {
       : []),
     ...(cl.failed.length ? [`✗ failed: ${cl.failed.join(', ')}`] : []),
     ...(cl.shells.length ? [`shell: ${cl.shells.slice(-5).join(' | ')}`] : []),
-    'Use append/apply_patch for existing paths. Do not recreate done files.',
+    'Use overwrite=true for small HTML/CSS; apply_patch for large existing files. Do not invent duplicate filenames.',
     '[/Agent checklist]'
   ]
   return '\n\n' + lines.join('\n')
@@ -127,8 +259,27 @@ export function stripChecklistBlock(text: string): string {
 /** Remove prior compaction digests so each compact replaces, never stacks. */
 export function stripCompactBlocks(text: string): string {
   return text
-    .replace(/\n\n\[Context compacted due to context-window pressure\][\s\S]*$/g, '')
-    .replace(/\n\n\[Context compacted due to context-window pressure\][\s\S]*?(?=\n\n\[Context compacted|\n\n\[Agent checklist\]|$)/g, '')
+    .replace(
+      /\n\n\[Context compacted due to context-window pressure\][\s\S]*?(?=\n\n\[Agent checklist\]|$)/g,
+      ''
+    )
+}
+
+/** Keep the compact memory blob so checklist refresh does not wipe it. */
+export function extractCompactBlock(text: string): string {
+  const m = text.match(
+    /\n\n\[Context compacted due to context-window pressure\][\s\S]*?(?=\n\n\[Agent checklist\]|$)/
+  )
+  return m?.[0] ?? ''
+}
+
+export function mergeChecklistIntoSystem(
+  systemText: string,
+  checklistBlock: string
+): string {
+  const memory = extractCompactBlock(systemText)
+  const base = stripCompactBlocks(stripChecklistBlock(systemText))
+  return base + memory + (checklistBlock || '')
 }
 
 export function buildChecklistFromHistory(history: ChatMessageLite[]): AgentChecklist {
@@ -397,8 +548,14 @@ export function parseThinkBlocks(content: string): ThinkBlockPart[] {
     last = m.index + m[0].length
   }
   if (last < content.length) {
-    const text = content.slice(last)
-    if (text.trim() || parts.length === 0) parts.push({ kind: 'text', text })
+    const rest = content.slice(last)
+    const open = rest.match(/^\s*<\s*(think|thinking)\s*>([\s\S]*)$/i)
+    if (open) {
+      const think = (open[2] ?? '').trim()
+      if (think) parts.push({ kind: 'think', text: think })
+    } else if (rest.trim() || parts.length === 0) {
+      parts.push({ kind: 'text', text: rest })
+    }
   }
   if (parts.length === 0) parts.push({ kind: 'text', text: content })
   return parts
@@ -406,7 +563,9 @@ export function parseThinkBlocks(content: string): ThinkBlockPart[] {
 
 /**
  * If the model put the entire reply inside `<think>` with no visible text,
- * unwrap it so the user still gets an answer.
+ * unwrap it so API / final answer still gets text.
+ * UI should call parseThinkBlocks on the raw content (do not promote first)
+ * so the Think fold stays visible.
  */
 export function promoteThinkOnlyAnswer(content: string): string {
   const raw = content ?? ''
@@ -420,6 +579,11 @@ export function promoteThinkOnlyAnswer(content: string): string {
     .filter(Boolean)
   if (thinks.length === 0) return raw
   return thinks.join('\n\n')
+}
+
+/** Visible text for UI: keep think tags so ThinkThroughBody can fold them. */
+export function displayAssistantContent(content: string): string {
+  return content ?? ''
 }
 
 /** Local clock for system prompt (recomputed each turn). */
@@ -565,8 +729,9 @@ export function coerceToolRelativePath(
     if (typeof v !== 'string') continue
     const t = v.trim().replace(/\\/g, '/')
     if (!t || t === '.' || t === './') continue
-    // Strip absolute drive prefix leftovers for Windows-style leaks
-    const cleaned = t.replace(/^[a-zA-Z]:\//, '').replace(/^\/+/, '')
+    // Keep Windows/UNC absolutes — main-process safeResolve rebases into the project.
+    if (/^[a-zA-Z]:\//.test(t) || t.startsWith('//')) return t
+    const cleaned = t.replace(/^\/+/, '')
     if (cleaned) return cleaned
   }
   return null

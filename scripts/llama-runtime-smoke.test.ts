@@ -110,3 +110,48 @@ describe('llama.cpp GitHub releases (live)', () => {
     }
   })
 })
+
+describe('llamaSpec MTP auto', () => {
+  it('detects Ornith MTP filenames and skips ordinary GGUFs', async () => {
+    const {
+      looksLikeMtpGguf,
+      looksLikeNvfp4Gguf,
+      isBlackwellGpuName,
+      shouldEnableDraftMtp,
+      speculativeMtpUnsupported
+    } = await import('../src/shared/llamaSpec.ts')
+    assert.equal(looksLikeMtpGguf('C:\\Models\\Ornith-1.0-9B-MTP-Q4_K_M.gguf'), true)
+    assert.equal(looksLikeMtpGguf('Ornith-1.0-9B-MTP-NVFP4.gguf'), true)
+    assert.equal(looksLikeMtpGguf('Devstral-Small-2-24B-Instruct-2512-IQ4_XS.gguf'), false)
+    assert.equal(looksLikeNvfp4Gguf('Ornith-1.0-9B-MTP-NVFP4.gguf'), true)
+    assert.equal(isBlackwellGpuName('NVIDIA GeForce RTX 5060 Ti'), true)
+    assert.equal(isBlackwellGpuName('NVIDIA GeForce RTX 5090'), true)
+    assert.equal(isBlackwellGpuName('NVIDIA RTX 5000 Ada Generation'), false)
+    assert.equal(isBlackwellGpuName('NVIDIA RTX A5000'), false)
+    assert.equal(isBlackwellGpuName('NVIDIA GeForce RTX 4070'), false)
+    assert.equal(isBlackwellGpuName('NVIDIA RTX PRO 6000 Blackwell'), true)
+    assert.equal(
+      shouldEnableDraftMtp({ modelPath: 'Ornith-1.0-9B-MTP-Q4_K_M.gguf' }),
+      true
+    )
+    assert.equal(
+      shouldEnableDraftMtp({
+        modelPath: 'Ornith-1.0-9B-MTP-Q4_K_M.gguf',
+        mmprojPath: 'mmproj.gguf'
+      }),
+      false
+    )
+    assert.equal(
+      speculativeMtpUnsupported(
+        'error: unknown argument: --spec-type\nfailed to parse CLI'
+      ),
+      true
+    )
+    assert.equal(
+      speculativeMtpUnsupported(
+        'ggml_cuda_init: CUDA error: out of memory\nloading --spec-type draft-mtp'
+      ),
+      false
+    )
+  })
+})

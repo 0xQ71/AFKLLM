@@ -313,8 +313,7 @@ function settingsToLlamaOpts(
     ? custom
     : llamaRuntime.resolveStatus(undefined, settings.llamaRuntimeVariant).binaryPath ||
       undefined
-  const modelPath =
-    slot === 'vision' ? settings.visionModelPath || settings.modelPath : settings.modelPath
+  const modelPath = slot === 'vision' ? settings.visionModelPath : settings.modelPath
   return {
     binaryPath: resolved,
     modelPath,
@@ -558,7 +557,13 @@ function registerIpc(): void {
       payload: { id: string; messages: PersistedChatMessage[]; title?: string }
     ) => {
       if (!chatStore) throw new Error('Chats not ready')
-      return chatStore.updateMessages(payload.id, payload.messages, payload.title)
+      const snap = await chatStore.updateMessages(
+        payload.id,
+        payload.messages,
+        payload.title
+      )
+      mainWindow?.webContents.send('chats:changed', snap)
+      return snap
     }
   )
 
@@ -753,7 +758,7 @@ function registerIpc(): void {
       return tools.invoke({
         id: 'ws-write',
         name: 'write_file',
-        arguments: { relative_path: relativePath, content }
+        arguments: { relative_path: relativePath, content, overwrite: true }
       })
     }
   )
@@ -1515,6 +1520,7 @@ app.whenReady().then(async () => {
   await settingsStore.load()
   initSlotOrchestrator()
   setCollectLogsToFile(() => settingsStore?.get().collectLogsToFile !== false)
+  terminals.setAutoConfirm(() => settingsStore?.get().agentAutoApprove === true)
   applyQueueSettings(settingsStore.get())
 
   chatStore = new ChatStore()
@@ -1655,8 +1661,7 @@ app.whenReady().then(async () => {
         }
       }
       const relRaw =
-        String(args.relative_path ?? '').trim() ||
-        `generated/img-${Date.now()}.png`
+        String(args.relative_path ?? '').trim() || 'generated/hero.png'
       const rel = relRaw.replace(/\\/g, '/').replace(/^\/+/, '')
       if (!rel || rel.includes('..')) {
         return {
@@ -1886,7 +1891,9 @@ app.whenReady().then(async () => {
             name: 'generate_image',
             ok: true,
             content:
-              `OK: image saved to ${posix}${note}. IMAGE_DONE: do not read_file or edit this file — the UI already shows it. Continue other requested work if any; if the request was image-only, one short confirmation is enough.`,
+              `OK: image saved to ${posix}${note}. ` +
+              `HTML: use exactly one tag <img src="${posix}"> (relative to the page). ` +
+              `Do not duplicate <img> tags, do not read_file this PNG. IMAGE_DONE: continue other requested work if any; if the request was image-only, one short confirmation is enough.`,
             filePath: posix
           }
         }
