@@ -677,11 +677,6 @@ function AgentPage({
           onChange={(v) => patch('agentAutoApprove', v)}
         />
         <Toggle
-          title={t('settings.agent.thinkThrough')}
-          checked={settings.agentThinkThrough !== false}
-          onChange={(v) => patch('agentThinkThrough', v)}
-        />
-        <Toggle
           title={t('settings.agent.imageGen')}
           checked={settings.agentImageGenEnabled === true}
           onChange={(v) => {

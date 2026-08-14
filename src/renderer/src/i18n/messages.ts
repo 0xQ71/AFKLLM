@@ -657,6 +657,7 @@ const en = {
   'chat.thought.thinking': 'Thinking:',
   'chat.thought.briefly': 'Thought:',
   'chat.thought.forDuration': 'Thought:',
+  'chat.thought.waiting': 'Gathering thoughts…',
   'chat.newAgentTitle': 'New agent',
 
   'activity.verb.reading': 'Reading',
@@ -1374,6 +1375,7 @@ const ru: Record<MessageKey, string> = {
   'chat.thought.thinking': 'Думаю:',
   'chat.thought.briefly': 'Думал:',
   'chat.thought.forDuration': 'Думал:',
+  'chat.thought.waiting': 'Набираю мысль…',
   'chat.newAgentTitle': 'Новый агент',
 
   'activity.verb.reading': 'Читаю',

@@ -33,11 +33,26 @@ import {
   sanitizeThinkProse,
   wrapThinkForUi,
   formatLiveThinkContent,
+  liveThinkProse,
   packReadFileForAgent,
   contentLooksStructurallyComplete,
   parseReadFileMeta,
+  reconcileTodosWithContent,
+  displayThinkProse,
+  extractThinkInner,
+  pendingPlanWork,
+  isBrowserPlanStep,
+  isJunkPlanStep,
+  stripCodeLeakFromThink,
+  extractAssistantHtmlDump,
+  looksLikeAssistantHtmlDump,
+  isEllipsisOnly,
   type ApiMessage
 } from '../src/renderer/src/agent/agentPure'
+import {
+  estimateContextUsage,
+  estimateLocalContextSum
+} from '../src/renderer/src/agent/contextUsage'
 import { AgentToolRegistry } from '../src/main/agent/AgentToolRegistry'
 import {
   CHAT_MAX_CONTENT_CHARS,
@@ -84,6 +99,21 @@ describe('looksLikeToolMarkupLeak', () => {
       content: 'y'
     })
     assert.notEqual(w1, w2)
+  })
+
+  it('fingerprints open-html shells as one action regardless of cwd/path', () => {
+    const a = fingerprintToolCall('execute_terminal_command', {
+      command: 'Start-Process "index.html" -WorkingDirectory "C:\\Users\\afkllm\\Desktop\\Northline"'
+    })
+    const b = fingerprintToolCall('execute_terminal_command', {
+      command: 'Start-Process "index.html" -WorkingDirectory "D:\\testMode"'
+    })
+    const c = fingerprintToolCall('execute_terminal_command', {
+      command: 'Start-Process (Resolve-Path .\\index.html)'
+    })
+    assert.equal(a, b)
+    assert.equal(b, c)
+    assert.equal(a, 'execute_terminal_command|open_html_preview')
   })
 
   it('coerces path aliases to relative_path', () => {
@@ -575,7 +605,7 @@ describe('agent todo plan', () => {
     )
     assert.ok((mega?.length ?? 0) >= 6)
     assert.equal(sanitizeThinkProse('<think>\n<!DOCTYPE html><html></html>\n</think>'), '')
-    assert.match(wrapThinkForUi('<!DOCTYPE html>'), /…/)
+    assert.match(wrapThinkForUi('<!DOCTYPE html>'), /<\s*think\s*>\s*<\s*\/\s*think\s*>/i)
     assert.match(wrapThinkForUi('Цель: лендинг. Дальше write_file.'), /Цель: лендинг/)
     assert.equal(
       sanitizeThinkProse(
@@ -584,15 +614,173 @@ describe('agent todo plan', () => {
       ''
     )
     assert.equal(thinkLooksLikeChecklist('1. Write\n2. Open\n3. Summarize'), true)
+    assert.equal(displayThinkProse('<think>\n…\n</think>'), '')
+    assert.match(
+      displayThinkProse('<think>\nЦель: лендинг Northline без AI-градиентов.\n</think>'),
+      /Northline/
+    )
+    const deep =
+      'Пользователь хочет лендинг. '.repeat(80) +
+      'Ограничения: без AI-градиентов, один index.html, Bootstrap 5, спокойная палитра.'
+    const shown = displayThinkProse(`<think>\n${deep}\n</think>`)
+    assert.ok(shown.length > 800, 'DeepThink-length prose must not be capped at 800')
+    assert.match(shown, /Bootstrap 5/)
   })
 
   it('streams live think prose without waiting for sanitize', () => {
     const live = formatLiveThinkContent('<think>\nЦель: лендинг Northline без AI-градиентов. Дальше разложу секции')
     assert.match(live, /Цель: лендинг Northline/)
     assert.match(live, /<\s*think\s*>/i)
-    // Partial stream must stay visible (sanitize would often empty incomplete dumps)
     const partial = formatLiveThinkContent('Сначала пойму аудиторию B2B, потом hero')
     assert.match(partial, /аудиторию B2B/)
+    assert.equal(liveThinkProse('<'), '')
+    assert.equal(liveThinkProse('<plan'), '')
+    assert.match(liveThinkProse('Цель: лендинг\n<plan\n- navbar'), /Цель: лендинг/)
+    assert.match(liveThinkProse('<think>Пользователь хочет лендинг без AI-градиентов'), /Пользователь хочет/)
+  })
+
+  it('keeps plan tags out of think UI and drops fluff plan steps', () => {
+    const leaked = formatLiveThinkContent('</think>\n<plan')
+    assert.equal(extractThinkInner(leaked), '')
+    const mid = formatLiveThinkContent(
+      '<think>\nЦель: лендинг без AI-градиентов.\n</think>\n<plan\n- navbar'
+    )
+    assert.match(extractThinkInner(mid), /Цель: лендинг/)
+    assert.doesNotMatch(extractThinkInner(mid), /<\s*plan/i)
+    const mdLeak = liveThinkProse(
+      'Сделаю качественный лендинг в одном файле.\n[Plan]'
+    )
+    assert.match(mdLeak, /Сделаю качественный/)
+    assert.doesNotMatch(mdLeak, /\[Plan\]/i)
+    const steps = parsePlanBlock(
+      '<plan>\n- Секция: navbar\n- Секция: hero\n- Отредактировать при необходимости.\n- Открыть в браузере\n</plan>'
+    )
+    assert.ok(steps)
+    assert.ok(!steps!.some((s) => /необходимост/i.test(s.text)))
+    assert.ok(steps!.some((s) => /navbar/i.test(s.text)))
+    assert.ok(steps!.some((s) => /браузер|browser|открыть/i.test(s.text)))
+    const mdPlan = parsePlanBlock('[Plan]\n- Navbar\n- Hero\n- Features\n- Open in browser')
+    assert.ok((mdPlan?.length ?? 0) >= 3)
+  })
+
+  it('strips code dumps from think and junk from plan steps', () => {
+    const dirty =
+      'Создаю index.html — полный лендинг для Northline. Темная тема.\n```html\n<!DOCTYPE html>\n<html>'
+    assert.equal(thinkBodyLooksLikeCodeDump(`<think>${dirty}</think>`), true)
+    const clean = stripCodeLeakFromThink(dirty)
+    assert.match(clean, /Northline/)
+    assert.doesNotMatch(clean, /```|DOCTYPE|<html/i)
+    assert.match(liveThinkProse(`<think>\n${dirty}`), /Northline/)
+    assert.doesNotMatch(liveThinkProse(`<think>\n${dirty}`), /```/)
+    const junkPlan = parsePlanBlock(
+      '<plan>\n- ...\n- ```html\n- <!DOCTYPE html>\n- Секция: Navbar\n- Секция: Hero\n- Секция: Footer\n</plan>'
+    )
+    assert.ok(junkPlan)
+    assert.ok(!junkPlan!.some((s) => isJunkPlanStep(s.text) || isEllipsisOnly(s.text) || /```|DOCTYPE/i.test(s.text)))
+    assert.ok(junkPlan!.some((s) => /Navbar/i.test(s.text)))
+    const dump = extractAssistantHtmlDump(
+      'Here you go:\n```html\n<!DOCTYPE html>\n<html><body><nav>x</nav></body></html>\n```'
+    )
+    assert.ok(dump && /<!DOCTYPE/i.test(dump))
+    assert.equal(looksLikeAssistantHtmlDump('just prose about a landing'), false)
+  })
+
+  it('marks multiple plan sections done from one HTML write', () => {
+    const steps = parsePlanBlock(
+      '<plan>\n- Секция: navbar\n- Секция: hero\n- Секция: features\n- Секция: trust\n- Секция: FAQ\n- Секция: footer\n- Открыть index.html в браузере\n</plan>'
+    )
+    assert.ok(steps)
+    const html = `
+<!DOCTYPE html><html><body>
+<nav class="navbar">n</nav>
+<section id="hero">h</section>
+<section id="features"><div class="feature-card">f</div></section>
+<section id="trust">t</section>
+<section id="faq">q</section>
+<footer id="footer">f</footer>
+</body></html>`
+    const advanced = advanceTodosOnTool(steps!, 'write_file', true, { content: html })
+    const done = advanced.filter((s) => s.status === 'done').map((s) => s.text)
+    assert.ok(done.some((t) => /navbar/i.test(t)))
+    assert.ok(done.some((t) => /hero/i.test(t)))
+    assert.ok(done.some((t) => /features/i.test(t)))
+    assert.ok(done.some((t) => /trust/i.test(t)))
+    assert.ok(done.some((t) => /faq/i.test(t)))
+    assert.ok(done.some((t) => /footer/i.test(t)))
+    assert.ok(advanced.some((s) => /браузер/i.test(s.text) && s.status !== 'done'))
+    const afterShell = advanceTodosOnTool(advanced, 'execute_terminal_command', true, {
+      command: 'Start-Process (Resolve-Path .\\index.html)'
+    })
+    assert.ok(afterShell.filter((s) => /браузер/i.test(s.text)).every((s) => s.status === 'done'))
+    assert.equal(pendingPlanWork(advanced).length, 0)
+    const reconciled = reconcileTodosWithContent(steps!, html)
+    assert.ok(reconciled.filter((s) => s.status === 'done').length >= 6)
+  })
+
+  it('closes mega write plan step after complete HTML write', () => {
+    const steps = parsePlanBlock(
+      '<plan>\n- Написать полный single-file index.html (Navbar + Hero + Features + How it works + Social proof + FAQ + Footer) с Bootstrap 5 CDN\n- Открыть index.html в браузере\n</plan>'
+    )
+    assert.ok(steps)
+    const html = `<!DOCTYPE html><html><body>
+<nav class="navbar"></nav>
+<section id="hero"></section>
+<section id="features"></section>
+<section id="how-it-works"></section>
+<section id="trust"></section>
+<section id="faq"></section>
+<footer id="footer"></footer>
+</body></html>`
+    const advanced = advanceTodosOnTool(steps!, 'write_file', true, { content: html })
+    assert.equal(pendingPlanWork(advanced).length, 0)
+    assert.ok(advanced.some((s) => isBrowserPlanStep(s.text) && s.status !== 'done'))
+  })
+
+  it('does not close the whole plan on incomplete HTML (no </html>)', () => {
+    const steps = parsePlanBlock(
+      '<plan>\n- Секция: Navbar\n- Секция: Hero\n- Секция: Features\n- Секция: How it works\n- Секция: FAQ\n- Секция: Footer\n- Открыть в браузере\n</plan>'
+    )
+    assert.ok(steps)
+    const partial = `<!DOCTYPE html><html><body>
+<nav class="navbar"></nav>
+<section id="hero"></section>
+<section id="features"></section>
+<section id="how-it-works">
+  <h2>Как это работает</h2>
+`
+    const reconciled = reconcileTodosWithContent(steps!, partial)
+    assert.ok(
+      pendingPlanWork(reconciled).length > 0,
+      'incomplete HTML must leave plan work open so Start-Process stays blocked'
+    )
+    assert.equal(contentLooksStructurallyComplete(partial), false)
+  })
+
+  it('meta verify/summary steps do not block pendingPlanWork / Start-Process', () => {
+    const steps = parsePlanBlock(
+      '<plan>\n- Секция: Navbar\n- Секция: Hero\n- Подтвердить отсутствие ошибок и корректность отображения.\n- Дать краткую сводку пользователю на русском языке.\n- Открыть в браузере\n</plan>'
+    )
+    assert.ok(steps)
+    // Meta rows should be dropped at parse time.
+    assert.ok(!steps!.some((s) => /подтвердить|сводк/i.test(s.text)))
+    const withMeta = [
+      ...steps!,
+      {
+        id: 'm1',
+        text: 'Подтвердить отсутствие ошибок и корректность отображения.',
+        status: 'pending' as const
+      },
+      {
+        id: 'm2',
+        text: 'Дать краткую сводку пользователю на русском языке.',
+        status: 'pending' as const
+      }
+    ]
+    const html = `<!DOCTYPE html><html><body>
+<nav class="navbar"></nav><section id="hero"></section></body></html>`
+    const reconciled = reconcileTodosWithContent(withMeta, html)
+    assert.equal(pendingPlanWork(reconciled).length, 0)
+    assert.ok(reconciled.some((s) => isBrowserPlanStep(s.text) && s.status !== 'done'))
   })
 })
 
@@ -719,6 +907,30 @@ describe('AgentToolRegistry edit review', () => {
     }
   })
 
+  it('FILE_EXISTS on large landing HTML still suggests overwrite=true', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'afkllm-landing-exists-'))
+    try {
+      const reg = new AgentToolRegistry({ projectRoot: root })
+      const rel = 'index.html'
+      const big =
+        '<!DOCTYPE html><html><head><title>Northline</title></head><body>' +
+        '<nav id="navbar">n</nav><section id="hero">h</section>' +
+        'x'.repeat(8000) +
+        '</body></html>\n'
+      await fs.writeFile(path.join(root, rel), big, 'utf8')
+      const blocked = await reg.invoke({
+        id: '1',
+        name: 'write_file',
+        arguments: { relative_path: rel, content: big + '<!-- v2 -->\n' }
+      })
+      assert.equal(blocked.ok, false)
+      assert.match(blocked.error ?? '', /overwrite=true/)
+      assert.doesNotMatch(blocked.error ?? '', /apply_diff/)
+    } finally {
+      await fs.rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('rename + searchFiles', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'afkllm-ws-'))
     try {
@@ -751,5 +963,78 @@ describe('AgentToolRegistry edit review', () => {
     } finally {
       await fs.rm(root, { recursive: true, force: true })
     }
+  })
+})
+
+describe('contextUsage live gauge', () => {
+  it('stays empty with only welcome, then grows with streaming conversation', () => {
+    const empty = estimateContextUsage({
+      messages: [{ id: 'welcome', role: 'assistant', content: 'hi' }],
+      ctxLimit: 8192
+    })
+    assert.equal(empty.used, 0)
+    assert.equal(empty.measured, false)
+
+    const mid = estimateContextUsage({
+      messages: [
+        { id: 'welcome', role: 'assistant', content: 'hi' },
+        { id: 'u1', role: 'user', content: 'Make a landing page with Bootstrap' },
+        {
+          id: 'a1',
+          role: 'assistant',
+          content: '<think>\n' + 'Reasoning about the landing. '.repeat(20),
+          streaming: true
+        }
+      ],
+      ctxLimit: 8192
+    })
+    assert.ok(mid.used > 0)
+    assert.equal(mid.measured, false)
+
+    const longer = estimateContextUsage({
+      messages: [
+        { id: 'welcome', role: 'assistant', content: 'hi' },
+        { id: 'u1', role: 'user', content: 'Make a landing page with Bootstrap' },
+        {
+          id: 'a1',
+          role: 'assistant',
+          content: '<think>\n' + 'Reasoning about the landing. '.repeat(60),
+          streaming: true
+        }
+      ],
+      ctxLimit: 8192
+    })
+    assert.ok(longer.used > mid.used, 'gauge must rise as streamed text grows')
+  })
+
+  it('grows past last prompt_tokens while anchored', () => {
+    const msgsShort = [
+      { id: 'u1', role: 'user' as const, content: 'Hello' },
+      { id: 'a1', role: 'assistant' as const, content: 'Hi there.' }
+    ]
+    const base = {
+      messages: msgsShort,
+      ctxLimit: 8192,
+      agentAutoApprove: true,
+      agentThinkThrough: true
+    }
+    const localAtMeasure = estimateLocalContextSum(base)
+    const prompt = 1200
+    const after = estimateContextUsage({
+      ...base,
+      messages: [
+        ...msgsShort,
+        {
+          id: 'a2',
+          role: 'assistant',
+          content: 'Streaming more context ' + 'x'.repeat(800),
+          streaming: true
+        }
+      ],
+      promptTokens: prompt,
+      anchorLocalSum: localAtMeasure
+    })
+    assert.ok(after.used > prompt, 'live used must exceed last measured prompt')
+    assert.equal(after.measured, true)
   })
 })

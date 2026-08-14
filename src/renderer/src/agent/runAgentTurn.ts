@@ -29,17 +29,33 @@ import {
   sanitizeThinkProse,
   extractThinkInner,
   formatLiveThinkContent,
+  liveThinkProse,
+  displayThinkProse,
+  isEllipsisOnly,
+  findPlanLeakIndex,
+  findCodeLeakIndex,
+  stripCodeLeakFromThink,
+  defaultLandingPlanSteps,
   thinkBodyLooksLikeCodeDump,
   thinkLooksLikeChecklist,
   packReadFileForAgent,
   contentLooksStructurallyComplete,
   wrapThinkForUi,
+  reconcileTodosWithContent,
+  todosAllDone,
+  pendingPlanWork,
+  looksLikeOpenHtmlCommand,
   evaluateAcceptanceGate,
   fingerprintToolCall,
   looksLikeToolMarkupLeak,
   coerceToolRelativePath,
   resolveWriteFilePath,
   inferWritePathFromContent,
+  extractAssistantHtmlDump,
+  looksLikeAssistantHtmlDump,
+  isMetaOrSummaryPlanStep,
+  isBrowserPlanStep,
+  rebalanceTodoStatuses,
   apiContentText,
   mergeChecklistIntoSystem,
   type AgentChecklist,
@@ -314,7 +330,8 @@ Rules for multi-file work (critical):
 - NEVER invent duplicate modules (thermodynamic.py vs thermodynamics.py). list_directory / read_file first.
 - Small HTML/CSS/scripts: one full write_file (overwrite=true if the file already exists). Large files only: modest chunks (~1200–1500 chars) then append=true until syntactically complete.
 - Do not say the task is done while required files from the user's structure are still missing — create the next missing file.
-- Terminal (Windows): shell is PowerShell in a real PTY (visible IDE Terminal). NEVER use bash && or ||. Prefer ONE command + cwd="subdir" (e.g. command="javac Calculator.java", cwd="Calculator/src"). Chain only with "; " if needed. Do NOT pass unquoted globs like *.java to javac/java — PowerShell does not expand them for native exes; list files explicitly or use Get-ChildItem. Interactive CLI prompts (y/n): the user can type in the Terminal; when Auto-approve is ON, AFKLLM may auto-confirm yes. Prefer non-interactive flags when available (npm --yes, CI=1). Avoid hanging forever on password prompts.
+- Execute the UI plan IN ORDER. Do not skip ahead to Start-Process, opening index.html, or a closing summary while earlier plan steps are still open.
+- Terminal (Windows): shell is PowerShell in a real PTY (visible IDE Terminal). NEVER use bash && or ||. Prefer ONE command + cwd="subdir" (e.g. command="javac Calculator.java", cwd="Calculator/src"). Chain only with "; " if needed. Do NOT pass unquoted globs like *.java to javac/java — PowerShell does not expand them for native exes; list files explicitly or use Get-ChildItem. Interactive CLI prompts (y/n): the user can type in the Terminal; when Auto-approve is ON, AFKLLM may auto-confirm yes. Prefer non-interactive flags when available (npm --yes, CI=1). Avoid hanging forever on password prompts. Preview: static HTML → Start-Process (Resolve-Path .\\index.html) opens the workspace file in AFKLLM Browser (file://). Vite/npm run dev → use the printed Local: URL (e.g. http://localhost:5173) — that localhost is correct. NEVER open the LLM API port (usually :8080) as the site.
 - Terminal errors (critical): when execute_terminal_command fails with TERMINAL_ERROR / ERROR_FOCUS, READ that focus, fix the exact file/line with read_file + apply_patch (or apply_diff), then re-run the SAME command. Never claim "environment forbids &&" — use cwd/; instead. Never drop JavaFX/GUI mid-task without explaining; for simple Java GUI prefer javax.swing (no modules) first, get javac/java working, then discuss .exe (jpackage) as a later step.
 - PROCESS_ENDED (critical): if the tool result says PROCESS_ENDED, the user closed the window or the program finished — this is NOT a bug. Do NOT rewrite code, do NOT relaunch, do NOT "fix" anything. Briefly acknowledge and wait for the next user message.
 - Tests / shell honesty (critical): NEVER say "tests pass", "Task completed" for a test task, or claim green unless the latest execute_terminal_command for that test returned ok (exit 0). If you see TERMINAL_ERROR / fail ✖ / exit_code≠0 with an error traceback, fix and re-run first — do not summarize success from an earlier run.
@@ -409,14 +426,13 @@ Rules:
 `
 
 const THINK_THROUGH = `
-Think-through protocol (mandatory while enabled):
-The app runs a short NO-TOOLS prelude first. Order matters:
-1) <think> — stream your OWN live reasoning about THIS user prompt (goal, audience, constraints, risks, approach).
-   Real first-person analysis as you go — not stock filler, not a summary after the fact, not "Думал / I thought…".
-   FORBIDDEN in think: numbered todo lists (1. 2. 3.), checkbox steps, HTML/CSS/JS, write_file dumps. Steps belong only in <plan>.
-2) THEN <plan> — 4–8 atomic checklist steps (one action each; split sections; no mega-steps).
-Reasoning budget (if enabled) applies PER model completion and resets on the next completion — use only what you need.
-After the prelude you get tools — execute the plan. Do not re-dump code into <think>.
+Think-through protocol (mandatory — always on):
+The app first runs ONE short THINK-ONLY completion, then PLAN_ONLY, then tools.
+1) <think> — ONE compact DeepThink (4–8 sentences, not a novel) about THIS prompt: goal, constraints, approach, risks.
+   FORBIDDEN in think: <plan>, todos, HTML/CSS/JS, write_file.
+2) PLAN_ONLY: <plan> with 4–8 atomic steps.
+After prelude: NEVER open another <think> or <plan>. Call tools immediately (write_file first for landings).
+Do NOT Start-Process / browser / done-summary until non-browser plan steps are done.
 `
 
 export {
@@ -1416,7 +1432,7 @@ async function buildApiMessages(
   if (projectRules) {
     system += `\n\n${projectRules}`
   }
-  if (mode !== 'plan' && settings?.agentThinkThrough !== false) {
+  if (mode !== 'plan') {
     system += THINK_THROUGH
   }
   if (mode !== 'plan') {
@@ -1744,6 +1760,18 @@ function sanitizeStreamAssistantText(raw: string): string {
   return promoteThinkOnlyAnswer(stripped)
 }
 
+/** Remove finished + in-progress <think> so a second «Думал» fold never appears. */
+function stripThinkBlocksLive(text: string): string {
+  let s = text ?? ''
+  s = s.replace(
+    /<\s*(?:think|thinking)\s*>[\s\S]*?(?:<\s*\/\s*(?:think|thinking)\s*>)/gi,
+    ''
+  )
+  const open = s.search(/<\s*(?:think|thinking)\s*>/i)
+  if (open >= 0) s = s.slice(0, open)
+  return s.replace(/\n{3,}/g, '\n\n').trimStart()
+}
+
 function attachStatsToLastVisible(
   messages: ChatMessage[],
   stats: ChatMessageStats
@@ -1918,6 +1946,9 @@ export async function runAgentTurn(params: {
   let checklist = buildChecklistFromHistory(params.history)
   let todoSteps: AgentTodoStep[] = []
   let planFrozen = false
+  let lastHtmlWrite = ''
+  let planFinishNudges = 0
+  let bestLiveProse = ''
   let thinkBubbleId: string | null = null
   removeChecklistBubbles(messages)
   if (!isPlan) {
@@ -2059,7 +2090,9 @@ export async function runAgentTurn(params: {
   const readCountsByPath = new Map<string, number>()
   /** Hard cap — model must not restart image gen mid-turn (even with a tweaked prompt). */
   let generateImageCalls = 0
-  const thinkThrough = !isPlan && appSettings.agentThinkThrough !== false
+  /** After first successful HTML preview open, block further Start-Process / open loops. */
+  let htmlPreviewOpened = false
+  const thinkThrough = !isPlan
   const autoApprove = appSettings.agentAutoApprove === true
   const userWantsWebSearch =
     /web_search|cite\s+1\s+url|under a ["']?Refs|search the web|from search/i.test(
@@ -2096,7 +2129,7 @@ export async function runAgentTurn(params: {
     })
   }
 
-  // Think ON: separate no-tools prelude so the model cannot jump straight into write_file.
+  // Think ON: THINK-ONLY completion first (stream every token), then a separate PLAN completion.
   if (thinkThrough) {
     if (params.signal?.aborted) return finishStopped()
     const preludeId = uid()
@@ -2104,114 +2137,131 @@ export async function runAgentTurn(params: {
     messages.push({
       id: preludeId,
       role: 'assistant',
-      content: formatLiveThinkContent(''),
+      content: '<think>\n</think>',
       streaming: true
     })
     params.onUpdate([...messages])
 
     const thinkBudgetTok = appSettings.reasoningBudgetEnabled
-      ? Math.max(256, appSettings.reasoningBudget ?? 2048)
+      ? Math.min(Math.max(512, appSettings.reasoningBudget ?? 1024), 1536)
       : 1024
-    // Completion max = think budget + small plan headroom. Budget resets on the next model call.
-    const preludeMaxTokens = Math.min(thinkBudgetTok + 512, AGENT_MAX_TOKENS)
+    const thinkMaxTokens = Math.min(thinkBudgetTok, AGENT_MAX_TOKENS)
+    const minThinkChars = 100
+    const enoughThinkChars = 420
 
-    const preludePrompt =
-      'THINK_PRELUDE (tools DISABLED): Reply in this EXACT order:\n' +
-      'A) <think>…</think> — stream your OWN reasoning about THIS user prompt as tokens arrive ' +
-      `(goal, audience, constraints, risks, approach). 4–8 real sentences. ` +
-      `Reasoning budget for THIS completion only: ≤${thinkBudgetTok} tokens — use only what you need; do not pad. ` +
-      'The budget resets on the next model request.\n' +
-      'FORBIDDEN inside think: numbered todo lists (1. 2. 3.), checkbox steps, stock filler, HTML/CSS/JS, code fences, write_file. ' +
-      'Steps are ONLY for <plan>.\n' +
-      'B) THEN <plan> with 4–8 ATOMIC checklist lines (one action each). ' +
-      'Bad: one mega-step. Good: Navbar / Hero / Features / FAQ / Open in browser.\n' +
-      'Stop after </plan>. No tools. No code.'
+    const paintThink = (raw: string): void => {
+      const idx = messages.findIndex((m) => m.id === preludeId)
+      if (idx === -1) return
+      const prose = liveThinkProse(raw)
+      if (prose.length > bestLiveProse.length && !isEllipsisOnly(prose)) {
+        bestLiveProse = prose
+      }
+      // Avoid blanking the fold while opening tags stream in (blink).
+      if (!prose.trim() && bestLiveProse.trim()) {
+        messages[idx] = {
+          ...messages[idx]!,
+          content: formatLiveThinkContent(`<think>\n${bestLiveProse}\n</think>`),
+          streaming: true
+        }
+        params.onUpdate([...messages])
+        return
+      }
+      messages[idx] = {
+        ...messages[idx]!,
+        content: formatLiveThinkContent(raw),
+        streaming: true
+      }
+      params.onUpdate([...messages])
+    }
 
-    pushUserMessage(apiMessages, preludePrompt)
-    apiMessages = normalizeApiMessages(apiMessages)
+    const isStockThink = (prose: string): boolean =>
+      prose.length < minThinkChars &&
+      /разбираю запрос|дальше действую tools|working from the user request|next:\s*tools|acting with tools/i.test(
+        prose
+      )
 
-    const runPreludeOnce = async (): Promise<{ text: string; aborted: boolean }> => {
-      const preludeAc = new AbortController()
-      const onPreludeOuterAbort = (): void => {
-        preludeAc.abort(params.signal?.reason ?? 'aborted')
+    const streamThinkOnce = async (): Promise<{ text: string; aborted: boolean }> => {
+      const ac = new AbortController()
+      const onOuter = (): void => {
+        ac.abort(params.signal?.reason ?? 'aborted')
       }
       if (params.signal?.aborted) {
-        preludeAc.abort(params.signal.reason ?? 'aborted')
+        ac.abort(params.signal.reason ?? 'aborted')
       } else {
-        params.signal?.addEventListener('abort', onPreludeOuterAbort, { once: true })
+        params.signal?.addEventListener('abort', onOuter, { once: true })
       }
       let codeDumpAbort = false
       let budgetAbort = false
       let rawAccum = ''
-      let thinkChars = 0
-      let thinkClosed = false
-      const prelude = await params.queue.chatStream({
+      const streamed = await params.queue.chatStream({
         messages: normalizeApiMessages(apiMessages),
-        maxTokens: preludeMaxTokens,
-        signal: preludeAc.signal,
+        maxTokens: thinkMaxTokens,
+        signal: ac.signal,
         onToken: (token) => {
-          if (preludeAc.signal.aborted) return
-          const idx = messages.findIndex((m) => m.id === preludeId)
-          if (idx === -1) return
+          if (ac.signal.aborted) return
           rawAccum += token
-          // Count only tokens inside <think>…</think> toward the reasoning budget.
-          if (!thinkClosed) {
-            if (/<\s*\/\s*(?:think|thinking)\s*>/i.test(rawAccum)) {
-              thinkClosed = true
-            } else if (/<\s*(?:think|thinking)\s*>/i.test(rawAccum)) {
-              thinkChars += token.length
-            }
-          }
-          // Live stream into the fold — do not wait for sanitize / final wrap.
-          messages[idx] = {
-            ...messages[idx]!,
-            content: formatLiveThinkContent(rawAccum),
-            streaming: true
-          }
-          if (/<\s*\/\s*(?:think|thinking)\s*>/i.test(rawAccum)) {
-            const livePlan = parsePlanBlock(rawAccum)
-            if (livePlan?.length && !planFrozen) {
-              todoSteps = livePlan
-              upsertTodoBubble(messages, todoSteps, { afterId: preludeId })
-            }
-          }
-          params.onUpdate([...messages])
-          if (thinkBodyLooksLikeCodeDump(rawAccum) && rawAccum.length > 180) {
+          paintThink(rawAccum)
+          // Generation leaked into think — cut immediately (keep prose before the fence).
+          if (findCodeLeakIndex(rawAccum) >= 0) {
             codeDumpAbort = true
-            preludeAc.abort('think_code_dump')
+            ac.abort('think_code_dump')
             return
           }
-          if (!thinkClosed && thinkChars / CHARS_PER_TOKEN >= thinkBudgetTok) {
+          // Model started a plan mid-think — cut think and leave plan for PLAN_ONLY.
+          if (findPlanLeakIndex(rawAccum) >= 0 && liveThinkProse(rawAccum).length >= minThinkChars) {
+            ac.abort('think_plan_leak')
+            return
+          }
+          if (thinkBodyLooksLikeCodeDump(rawAccum) && liveThinkProse(rawAccum).length > 80) {
+            codeDumpAbort = true
+            ac.abort('think_code_dump')
+            return
+          }
+          const proseLen = liveThinkProse(rawAccum).length
+          // Stop once we have a solid DeepThink — don't wait for a novel.
+          if (proseLen >= enoughThinkChars) {
             budgetAbort = true
-            preludeAc.abort('think_budget')
+            ac.abort('think_budget')
+            return
+          }
+          const estTok = proseLen / CHARS_PER_TOKEN
+          if (proseLen >= minThinkChars && estTok >= thinkBudgetTok) {
+            budgetAbort = true
+            ac.abort('think_budget')
           }
         },
         priority: 'NORMAL'
       })
-      params.signal?.removeEventListener('abort', onPreludeOuterAbort)
+      params.signal?.removeEventListener('abort', onOuter)
       if (params.signal?.aborted && /user_stop/i.test(String(params.signal.reason ?? ''))) {
         return { text: '', aborted: true }
       }
-      let text = (rawAccum || prelude.text || '').trim()
-      if (budgetAbort) {
-        if (!hasThinkBlock(text)) {
-          text = `<think>\n${text}\n</think>`
-        } else if (!/<\s*\/\s*(?:think|thinking)\s*>/i.test(text)) {
-          const closeMsg =
-            appSettings.reasoningBudgetMessage?.trim() ||
-            (uiLang === 'ru' ? 'Бюджет рассуждений исчерпан — перехожу к плану.' : 'Reasoning budget reached — moving on.')
-          text = `${text.trim()}\n${closeMsg}\n</think>`
-        }
+      let text = (rawAccum || streamed.text || '').trim()
+      if (budgetAbort && text && !hasThinkBlock(text)) {
+        text = `<think>\n${liveThinkProse(text)}\n</think>`
       }
-      if (prelude.aborted && !codeDumpAbort && !budgetAbort) {
+      if (streamed.aborted && !codeDumpAbort && !budgetAbort) {
         return { text, aborted: false }
       }
       return { text, aborted: false }
     }
 
-    let rawThink = ''
-    let preludeRound = await runPreludeOnce()
-    if (preludeRound.aborted) {
+    const thinkPrompt =
+      'THINK_ONLY (tools DISABLED). Output ONLY a <think>…</think> block — nothing after it.\n' +
+      'Write compact first-person reasoning in the USER\'s language (like Cursor / DeepSeek DeepThink):\n' +
+      '- 4–8 sentences (~80–200 words). Stream immediately — do not stay silent then dump.\n' +
+      '- Cover: goal, hard constraints (what is FORBIDDEN), structure, visuals, one risk, how you verify.\n' +
+      '- Tie points to THIS user message — no filler.\n' +
+      `Budget for THIS completion: ≤${thinkBudgetTok} tokens — stop once the point is clear.\n` +
+      'FORBIDDEN: <plan>, [Plan], todos, HTML/CSS/JS, code fences, write_file, tools.\n' +
+      'Stop right after </think>.'
+
+    pushUserMessage(apiMessages, thinkPrompt)
+    apiMessages = normalizeApiMessages(apiMessages)
+
+    // Visible waiting is handled by the UI fold — do not seed placeholder think text (causes blink).
+    let thinkRound = await streamThinkOnce()
+    if (thinkRound.aborted) {
       const idx = messages.findIndex((m) => m.id === preludeId)
       if (idx !== -1) {
         messages[idx] = {
@@ -2223,39 +2273,38 @@ export async function runAgentTurn(params: {
       }
       return finishStopped()
     }
-    rawThink = preludeRound.text
 
-    if (
-      thinkBodyLooksLikeCodeDump(rawThink) ||
-      looksLikeToolMarkupLeak(rawThink) ||
-      sanitizeThinkProse(rawThink).length < 24 ||
-      thinkLooksLikeChecklist(extractThinkInner(rawThink))
-    ) {
-      const idx = messages.findIndex((m) => m.id === preludeId)
-      if (idx !== -1) {
-        messages[idx] = {
-          ...messages[idx]!,
+    const thinkWeak = (raw: string): boolean => {
+      const prose = liveThinkProse(raw)
+      return (
+        thinkBodyLooksLikeCodeDump(raw) ||
+        looksLikeToolMarkupLeak(raw) ||
+        thinkLooksLikeChecklist(prose) ||
+        prose.length < minThinkChars ||
+        isStockThink(prose)
+      )
+    }
+
+    if (thinkWeak(thinkRound.text)) {
+      // Same bubble stays open — user should see ONE continuous DeepThink, not two folds.
+      const retryIdx = messages.findIndex((m) => m.id === preludeId)
+      if (retryIdx !== -1) {
+        messages[retryIdx] = {
+          ...messages[retryIdx]!,
           streaming: true,
-          content: formatLiveThinkContent(
-            uiLang === 'ru'
-              ? '<think>\nЕщё раз — рассуждаю по промпту, без списка шагов…\n</think>'
-              : '<think>\nRetrying — reasoning about the prompt, no step list…\n</think>'
-          )
+          content: formatLiveThinkContent(bestLiveProse || messages[retryIdx]!.content || '')
         }
         params.onUpdate([...messages])
       }
-      for (let i = messages.length - 1; i >= 0; i--) {
-        if (messages[i]?.id === AGENT_TODO_MSG_ID) messages.splice(i, 1)
-      }
       pushUserMessage(
         apiMessages,
-        'REJECTED: prelude must be SHORT PROSE in <think> (4–8 sentences about the prompt — not a numbered todo list), THEN a granular <plan> ' +
-          'with 5–8 tiny steps (Navbar, Hero, Features, FAQ, Footer, open in browser) — still NO code. ' +
-          'Empty <think></think> or 1. 2. 3. inside think is not allowed.'
+        'REJECTED: think was too short or stock. Continue the SAME <think> with 4–8 real sentences about THIS prompt ' +
+          '(goal, constraints, structure, visuals, risks, verification). Still NO <plan>, NO lists, NO code. ' +
+          'Do not write «Разбираю запрос и дальше действую tools».'
       )
       apiMessages = normalizeApiMessages(apiMessages)
-      preludeRound = await runPreludeOnce()
-      if (preludeRound.aborted) {
+      thinkRound = await streamThinkOnce()
+      if (thinkRound.aborted) {
         const i2 = messages.findIndex((m) => m.id === preludeId)
         if (i2 !== -1) {
           messages[i2] = {
@@ -2267,36 +2316,35 @@ export async function runAgentTurn(params: {
         }
         return finishStopped()
       }
-      rawThink = preludeRound.text
-      // Keep streamed prose if retry still weak — never replace with a canned landing stub.
-      if (
-        thinkBodyLooksLikeCodeDump(rawThink) ||
-        sanitizeThinkProse(rawThink).length < 24 ||
-        thinkLooksLikeChecklist(extractThinkInner(rawThink))
-      ) {
-        const live = formatLiveThinkContent(rawThink)
-        const liveProse = extractThinkInner(live).trim()
-        if (liveProse.length >= 12 && !thinkLooksLikeChecklist(liveProse)) {
-          rawThink = live + (parsePlanBlock(rawThink) ? `\n${rawThink.match(/<\s*plan\s*>[\s\S]*?<\s*\/\s*plan\s*>/i)?.[0] ?? ''}` : '')
-        }
-      }
     }
 
-    if (!rawThink) {
-      rawThink = formatLiveThinkContent(
-        uiLang === 'ru'
-          ? '<think>\nРазбираю запрос и дальше действую tools.\n</think>'
-          : '<think>\nWorking from the user request; next: tools.\n</think>'
-      )
-    } else if (!hasThinkBlock(rawThink)) {
-      const orphanPlan = rawThink.match(/<\s*plan\s*>([\s\S]*?)<\s*\/\s*plan\s*>/i)?.[0] ?? ''
-      rawThink = `${formatLiveThinkContent(rawThink)}${orphanPlan ? `\n${orphanPlan}` : ''}`
-    }
-
-    const planFromPrelude = parsePlanBlock(rawThink)
-    // Prefer live streamed prose; sanitize only strips dumps/checklists.
-    const finalProse = sanitizeThinkProse(rawThink) || extractThinkInner(formatLiveThinkContent(rawThink))
-    const uiThink = formatLiveThinkContent(`<think>\n${finalProse || '…'}\n</think>`)
+    // Prefer the longest real prose we saw while streaming — never keep a one-liner stock stub.
+    const streamedBest =
+      [stripCodeLeakFromThink(liveThinkProse(thinkRound.text)), stripCodeLeakFromThink(bestLiveProse)]
+        .filter(
+          (p) =>
+            p &&
+            !isEllipsisOnly(p) &&
+            !isStockThink(p) &&
+            !thinkBodyLooksLikeCodeDump(p) &&
+            !/^думаю над запросом|^thinking about the request/i.test(p.trim())
+        )
+        .sort((a, b) => b.length - a.length)[0] ?? ''
+    const richFallback =
+      uiLang === 'ru'
+        ? 'Пользователь просит одностраничный лендинг: сначала разберу ограничения (без AI-градиентов, один index.html, Bootstrap 5), ' +
+          'аудиторию и структуру секций, затем соберу чистую вёрстку с спокойной палитрой и лёгким motion, ' +
+          'проверю семантику/a11y и только после записи открою файл в браузере.'
+        : 'The user wants a single-file landing: I will unpack constraints (no AI-gradients, one index.html, Bootstrap 5), ' +
+          'audience and section structure, then build clean layout with a calm palette and light motion, ' +
+          'check semantics/a11y, and only after saving open it in the browser.'
+    const finalProse =
+      streamedBest.length >= minThinkChars
+        ? streamedBest
+        : streamedBest.length >= richFallback.length
+          ? streamedBest
+          : richFallback
+    const uiThink = formatLiveThinkContent(`<think>\n${finalProse}\n</think>`)
     const pIdx = messages.findIndex((m) => m.id === preludeId)
     if (pIdx !== -1) {
       messages[pIdx] = {
@@ -2304,18 +2352,85 @@ export async function runAgentTurn(params: {
         streaming: false,
         content: uiThink
       }
+      params.onUpdate([...messages])
+    }
+
+    apiMessages.push({ role: 'assistant', content: uiThink })
+    pushUserMessage(
+      apiMessages,
+      'PLAN_ONLY (tools still DISABLED). Output ONLY <plan>…</plan> with 4–8 ATOMIC checklist lines ' +
+        '(one action each: Navbar, Hero, Features, FAQ, Footer, open in browser). ' +
+        'FORBIDDEN: "edit if necessary" / «отредактировать при необходимости», mega-steps, code, <think>, tools. ' +
+        'Stop after </plan>.'
+    )
+    apiMessages = normalizeApiMessages(apiMessages)
+
+    let planAccum = ''
+    const planAc = new AbortController()
+    const onPlanOuter = (): void => {
+      planAc.abort(params.signal?.reason ?? 'aborted')
+    }
+    if (params.signal?.aborted) {
+      planAc.abort(params.signal.reason ?? 'aborted')
+    } else {
+      params.signal?.addEventListener('abort', onPlanOuter, { once: true })
+    }
+    await params.queue.chatStream({
+      messages: normalizeApiMessages(apiMessages),
+      maxTokens: 768,
+      signal: planAc.signal,
+      onToken: (token) => {
+        if (planAc.signal.aborted) return
+        planAccum += token
+        if (findCodeLeakIndex(planAccum) >= 0) {
+          planAc.abort('plan_code_leak')
+          return
+        }
+        const bounded = /<\s*\/\s*plan\s*>/i.test(planAccum)
+          ? planAccum
+          : /<\s*plan\b|\[\s*plan\s*\]/i.test(planAccum)
+            ? `${planAccum}\n</plan>`
+            : planAccum
+        const livePlan = parsePlanBlock(bounded)
+        if (livePlan?.length && !planFrozen) {
+          todoSteps = livePlan
+          upsertTodoBubble(messages, todoSteps, { afterId: preludeId })
+          params.onUpdate([...messages])
+        }
+      },
+      priority: 'NORMAL'
+    })
+    params.signal?.removeEventListener('abort', onPlanOuter)
+    if (params.signal?.aborted && /user_stop/i.test(String(params.signal.reason ?? ''))) {
+      return finishStopped()
+    }
+    let planFromPrelude =
+      parsePlanBlock(planAccum) ||
+      parsePlanBlock(`${planAccum}\n</plan>`) ||
+      parsePlanBlock(`<plan>\n${planAccum}\n</plan>`)
+    // Always show a plan card — never leave think-only with a leaked "[Plan]".
+    if (!planFromPrelude?.length) {
+      planFromPrelude = defaultLandingPlanSteps()
     }
     if (planFromPrelude?.length) {
       todoSteps = planFromPrelude
       planFrozen = true
       upsertTodoBubble(messages, todoSteps, { afterId: preludeId })
+      params.onUpdate([...messages])
     }
-    params.onUpdate([...messages])
 
-    apiMessages.push({ role: 'assistant', content: rawThink })
+    apiMessages.push({
+      role: 'assistant',
+      content: planFromPrelude?.length
+        ? `${uiThink}\n<plan>\n${planFromPrelude.map((s) => `- [ ] ${s.text}`).join('\n')}\n</plan>`
+        : uiThink
+    })
     pushUserMessage(
       apiMessages,
-      'Think/plan recorded. Now use tools to execute step by step. Do not put file bodies inside <think>.'
+      'Think/plan already recorded. Do NOT output another <think> or <plan>. ' +
+        'FIRST tool call NOW: write_file relative_path=index.html overwrite=true with the FULL landing HTML. ' +
+        'Then continue remaining plan steps IN ORDER. ' +
+        'Do not Start-Process / open a browser / write a done summary until every non-browser plan step is done.'
     )
     apiMessages = normalizeApiMessages(apiMessages)
     thinkSatisfied = true
@@ -2358,11 +2473,14 @@ export async function runAgentTurn(params: {
       messages.push({
         id: streamId,
         role: 'assistant',
-        content: '',
+        content:
+          uiLang === 'ru' ? '↻ Пишу по плану…' : '↻ Writing from the plan…',
         streaming: true
       })
       params.onUpdate([...messages])
     }
+    // Show progress immediately — do not wait for first token (long TTFT looks stuck).
+    if (!isPlan && thinkSatisfied) ensureStreamBubble()
 
     const toolDraft = new Map<number, { name: string; arguments: string }>()
     const toolMsgByIndex = new Map<number, string>()
@@ -2397,9 +2515,67 @@ export async function runAgentTurn(params: {
         const idx = messages.findIndex((m) => m.id === streamId)
         if (idx === -1) return
         const prevContent = messages[idx].content ?? ''
-        // Drop think-wait status line once real tokens arrive.
-        const base = /^↻ (Tools|Генерация|Generating)\b/i.test(prevContent) ? '' : prevContent
+        // Drop status / think-wait lines once real tokens arrive.
+        const base = /^↻ /i.test(prevContent.trim()) ? '' : prevContent
+        // If this bubble was already promoted to a write preview, append into codePreview.
+        if (messages[idx].toolName === 'write_file' && messages[idx].codePreview != null) {
+          const nextCode = (messages[idx].codePreview ?? '') + token
+          const path =
+            messages[idx].filePath ||
+            inferWritePathFromContent(nextCode) ||
+            'index.html'
+          messages[idx] = {
+            ...messages[idx],
+            content: `✎ writing ${path}`,
+            toolName: 'write_file',
+            filePath: path,
+            codePreview: nextCode,
+            streaming: true
+          }
+          params.onUpdate([...messages])
+          return
+        }
         const nextContent = base + token
+        // Prelude DeepThink is immutable — never absorb late <think> into it; strip & abort.
+        if (thinkThrough && thinkSatisfied && hasThinkBlock(nextContent)) {
+          const extra = liveThinkProse(nextContent)
+          if (extra.length >= 100 || nextContent.length >= 220) {
+            messages[idx] = {
+              ...messages[idx],
+              content:
+                uiLang === 'ru'
+                  ? '↻ Think уже был — перехожу к write_file…'
+                  : '↻ Think already done — switching to write_file…',
+              streaming: true
+            }
+            params.onUpdate([...messages])
+            abortStream('redundant_think')
+            return
+          }
+          messages[idx] = {
+            ...messages[idx],
+            content:
+              uiLang === 'ru' ? '↻ Выполняю план…' : '↻ Executing the plan…',
+            streaming: true
+          }
+          params.onUpdate([...messages])
+          return
+        }
+        // Model dumped HTML as plain text instead of write_file — show live code stream.
+        if (!isPlan && looksLikeAssistantHtmlDump(nextContent)) {
+          const code = extractAssistantHtmlDump(nextContent) || nextContent
+          const path = inferWritePathFromContent(code) || 'index.html'
+          messages[idx] = {
+            ...messages[idx],
+            content: `✎ writing ${path}`,
+            toolName: 'write_file',
+            filePath: path,
+            codePreview: code,
+            streaming: true
+          }
+          params.onUpdate([...messages])
+          return
+        }
         messages[idx] = {
           ...messages[idx],
           content: nextContent,
@@ -2470,6 +2646,19 @@ export async function runAgentTurn(params: {
             }
             if (!prev.name && !parsed.label.replace(/^[▸▹✎]+\s*/, '').trim()) return
 
+            // Drop the temporary «Пишу по плану…» status bubble once real tools stream.
+            {
+              const sIdx = messages.findIndex((m) => m.id === streamId)
+              if (
+                sIdx !== -1 &&
+                !messages[sIdx]!.toolName &&
+                /^↻ /.test((messages[sIdx]!.content ?? '').trim())
+              ) {
+                messages.splice(sIdx, 1)
+                streamBubbleCreated = false
+              }
+            }
+
             let draftArgs: Record<string, unknown> = {}
             try {
               draftArgs = JSON.parse(prev.arguments || '{}') as Record<string, unknown>
@@ -2525,11 +2714,42 @@ export async function runAgentTurn(params: {
     // Soft stream guards: size runaway OR early think cut (discard partial tools).
     const softAbort =
       streamAbortReason === 'tool_args_too_large' ||
-      streamAbortReason === 'think_required_early'
+      streamAbortReason === 'think_required_early' ||
+      streamAbortReason === 'redundant_think'
 
     if (softAbort) {
       result.aborted = false
       result.error = undefined
+    }
+
+    if (streamAbortReason === 'redundant_think') {
+      for (const id of toolMsgByIndex.values()) {
+        const i = messages.findIndex((m) => m.id === id)
+        if (i !== -1) messages.splice(i, 1)
+      }
+      toolDraft.clear()
+      toolMsgByIndex.clear()
+      result.toolCalls = undefined
+      const si = messages.findIndex((m) => m.id === streamId)
+      if (si !== -1) {
+        messages[si] = {
+          ...messages[si]!,
+          streaming: false,
+          content:
+            uiLang === 'ru'
+              ? '↻ Think уже был — сразу write_file…'
+              : '↻ Think already done — write_file next…'
+        }
+      }
+      params.onUpdate([...messages])
+      pushUserMessage(
+        apiMessages,
+        'STOP: do NOT output <think> again — think/plan are already done. ' +
+          'Your FIRST action must be a structured write_file tool call: ' +
+          'relative_path=index.html, overwrite=true, content=<full HTML landing>. No markdown fences.'
+      )
+      apiMessages = normalizeApiMessages(apiMessages)
+      continue
     }
 
     if (streamAbortReason === 'think_required_early') {
@@ -2584,7 +2804,7 @@ export async function runAgentTurn(params: {
         messages[si] = {
           ...messages[si],
           streaming: false,
-          content: wrapThinkForUi(sanitizeThinkProse(messages[si]!.content) || '…')
+          content: wrapThinkForUi(displayThinkProse(messages[si]!.content) || bestLiveProse || '')
         }
       }
       params.onUpdate([...messages])
@@ -2641,6 +2861,45 @@ export async function runAgentTurn(params: {
           ),
           streaming: false,
           stats: mergedStats
+        }
+        // One DeepThink only — prelude bubble stays frozen; strip late <think> from this message.
+        if (thinkThrough && thinkSatisfied) {
+          const stripped = stripThinkBlocksLive(messages[sIdx].content ?? '')
+          if (!stripped.trim() && !messages[sIdx].codePreview) {
+            messages.splice(sIdx, 1)
+          } else {
+            messages[sIdx] = {
+              ...messages[sIdx],
+              content: stripped
+            }
+          }
+        }
+        // Keep plain-text HTML dumps visible as a write preview (don't wipe the stream).
+        const rawFinal = result.text || (sIdx !== -1 ? messages[sIdx]?.content : '') || ''
+        const sIdxNow = messages.findIndex((m) => m.id === streamId)
+        if (
+          sIdxNow !== -1 &&
+          !result.toolCalls?.length &&
+          (looksLikeAssistantHtmlDump(rawFinal) ||
+            (messages[sIdxNow].toolName === 'write_file' && messages[sIdxNow].codePreview))
+        ) {
+          const code =
+            messages[sIdxNow].codePreview ||
+            extractAssistantHtmlDump(rawFinal) ||
+            rawFinal
+          const path =
+            messages[sIdxNow].filePath ||
+            inferWritePathFromContent(code) ||
+            'index.html'
+          messages[sIdxNow] = {
+            ...messages[sIdxNow],
+            content: `✎ writing ${path}`,
+            toolName: 'write_file',
+            filePath: path,
+            codePreview: code,
+            streaming: false,
+            stats: mergedStats
+          }
         }
       }
       params.onUpdate([...messages])
@@ -2852,6 +3111,36 @@ export async function runAgentTurn(params: {
       continue
     }
 
+    // Plain HTML in the assistant stream is visible as a preview — but nothing is saved until write_file.
+    if (
+      !toolCalls?.length &&
+      looksLikeAssistantHtmlDump(
+        result.text ||
+          messages.find((m) => m.id === streamId)?.codePreview ||
+          messages.find((m) => m.id === streamId)?.content ||
+          ''
+      ) &&
+      round < maxRounds - 1
+    ) {
+      messages.push({
+        id: uid(),
+        role: 'assistant',
+        content:
+          uiLang === 'ru'
+            ? '↻ HTML в чате не сохраняет файл — вызываю write_file…'
+            : '↻ HTML in chat does not save the file — calling write_file…'
+      })
+      params.onUpdate([...messages])
+      pushUserMessage(
+        apiMessages,
+        'You dumped HTML as plain text — that does NOT save the file. ' +
+          'Call write_file NOW with relative_path (e.g. index.html), overwrite=true, and the FULL HTML in the content argument. ' +
+          'No markdown fences, no <think>, no plan — just the tool call.'
+      )
+      apiMessages = normalizeApiMessages(apiMessages)
+      continue
+    }
+
     if (toolCalls?.length) {
       // Think gate backup: if a full tool reply still has no think…
       // - first miss: reject once (prefer early-abort path above)
@@ -3021,7 +3310,10 @@ export async function runAgentTurn(params: {
               ? MAX_READS_PER_PATH
               : name === 'create_directory'
                 ? MAX_IDENTICAL_TOOL_CALLS
-                : MAX_IDENTICAL_TOOL_CALLS + 1
+                : name === 'execute_terminal_command' &&
+                    looksLikeOpenHtmlCommand(String(args.command ?? ''))
+                  ? 1
+                  : MAX_IDENTICAL_TOOL_CALLS + 1
         const readsOnPath = pathKeyForLoop
           ? (readCountsByPath.get(pathKeyForLoop) ?? 0)
           : 0
@@ -3050,6 +3342,72 @@ export async function runAgentTurn(params: {
               `TOOL_LOOP: read_file on "${filePath}" already ${MAX_READS_PER_PATH} times this turn. ` +
               'Do NOT re-read and do NOT rewrite the file. The file on disk is the source of truth — ' +
               'write a short user-facing summary and finish. Overwrite only if the user asked to fix specific content.'
+          }
+        } else if (
+          name === 'execute_terminal_command' &&
+          looksLikeOpenHtmlCommand(String(args.command ?? ''))
+        ) {
+          if (htmlPreviewOpened) {
+            toolLoopHits++
+            toolResult = {
+              id: call.id,
+              name,
+              ok: false,
+              content: '',
+              error:
+                'TOOL_LOOP: HTML preview already opened this turn. Do NOT Start-Process again — write a short user summary and finish.'
+            }
+          } else if (todoSteps.length > 0) {
+            // Close verify/summary fluff so it cannot block the browser forever.
+            let metaClosed = 0
+            for (const s of todoSteps) {
+              if (s.status === 'done') continue
+              if (isMetaOrSummaryPlanStep(s.text)) {
+                s.status = 'done'
+                metaClosed++
+              }
+            }
+            if (metaClosed > 0) {
+              todoSteps = rebalanceTodoStatuses(todoSteps.map((s) => ({ ...s })))
+              upsertTodoBubble(messages, todoSteps, {
+                afterId: thinkBubbleId ?? undefined
+              })
+            }
+            // Last chance: if we already have a complete HTML write, close mega/work steps now.
+            if (lastHtmlWrite && contentLooksStructurallyComplete(lastHtmlWrite)) {
+              todoSteps = reconcileTodosWithContent(todoSteps, lastHtmlWrite)
+              upsertTodoBubble(messages, todoSteps, {
+                afterId: thinkBubbleId ?? undefined
+              })
+            }
+            const workLeft = pendingPlanWork(todoSteps)
+            if (workLeft.length > 0) {
+              const left = workLeft.map((s) => `- ${s.text}`).join('\n')
+              toolResult = {
+                id: call.id,
+                name,
+                ok: false,
+                content: '',
+                error:
+                  'PLAN_ORDER: do not open/start the page yet. Finish remaining plan steps IN ORDER first:\n' +
+                  left +
+                  '\nThen open index.html (Start-Process (Resolve-Path .\\index.html)) and write the summary.'
+              }
+            } else {
+              toolResult = await window.api.agent.invoke({
+                id: call.id,
+                name,
+                arguments: args
+              })
+              if (toolResult.ok) htmlPreviewOpened = true
+            }
+          } else {
+            toolResult = await window.api.agent.invoke({
+              id: call.id,
+              name,
+              arguments: args
+            })
+            if (toolResult.ok) htmlPreviewOpened = true
           }
         } else if (identicalCount > identicalLimit) {
           toolLoopHits++
@@ -3291,7 +3649,7 @@ export async function runAgentTurn(params: {
             name,
             arguments: args
           })
-          // Same-turn rewrite of a file we already started → append instead of hard fail
+          // Same-turn rewrite of a file we already started → append / landing overwrite
           if (
             name === 'write_file' &&
             !toolResult.ok &&
@@ -3302,7 +3660,12 @@ export async function runAgentTurn(params: {
             const pathInFlight =
               incompleteAppendsByPath.has(pathKey) ||
               checklist.incomplete.some((p) => loopPathKey(p) === pathKey)
-            if (pathInFlight) {
+            const landingRewrite =
+              allowsLandingOverwrite(pathStr, contentStr.length) &&
+              (/<!DOCTYPE\s+html|<html[\s>]/i.test(contentStr) ||
+                contentLooksStructurallyComplete(contentStr) ||
+                contentStr.length >= 1500)
+            if (pathInFlight && !landingRewrite) {
               const appended = await window.api.agent.invoke({
                 id: call.id,
                 name,
@@ -3330,6 +3693,19 @@ export async function runAgentTurn(params: {
                     ...appended,
                     content: `${appended.content} (auto-appended after FILE_EXISTS)`
                   }
+                }
+              }
+            } else if (landingRewrite || pathInFlight) {
+              // Full landing HTML rewrite without overwrite=true — auto-fix instead of "Правил ошибка".
+              const overwritten = await window.api.agent.invoke({
+                id: call.id,
+                name,
+                arguments: { ...args, overwrite: true, append: false }
+              })
+              if (overwritten.ok) {
+                toolResult = {
+                  ...overwritten,
+                  content: `${overwritten.content} (auto-overwrite after FILE_EXISTS)`
                 }
               }
             }
@@ -3360,6 +3736,9 @@ export async function runAgentTurn(params: {
             toolResult.ok
           ) {
             ranCliSmoke = true
+          }
+          if (looksLikeOpenHtmlCommand(cmd) && toolResult.ok) {
+            htmlPreviewOpened = true
           }
         }
 
@@ -3411,8 +3790,28 @@ export async function runAgentTurn(params: {
         }
 
         applyToolToChecklist(checklist, name, args, toolResult)
+        if (toolResult.ok && name === 'write_file' && typeof args.content === 'string') {
+          const body = args.content
+          if (body.length > (lastHtmlWrite.length || 0) && /<html[\s>]|<!DOCTYPE/i.test(body)) {
+            lastHtmlWrite = body
+          }
+        }
         if (todoSteps.length > 0) {
-          todoSteps = advanceTodosOnTool(todoSteps, name, toolResult.ok)
+          todoSteps = advanceTodosOnTool(todoSteps, name, toolResult.ok, {
+            content:
+              typeof args.content === 'string'
+                ? args.content
+                : typeof args.replace_block === 'string'
+                  ? args.replace_block
+                  : typeof args.patch === 'string'
+                    ? args.patch
+                    : undefined,
+            command: typeof args.command === 'string' ? args.command : undefined,
+            path: filePath
+          })
+          if (lastHtmlWrite && (name === 'write_file' || name === 'apply_patch' || name === 'apply_diff')) {
+            todoSteps = reconcileTodosWithContent(todoSteps, lastHtmlWrite)
+          }
           upsertTodoBubble(messages, todoSteps, { afterId: thinkBubbleId ?? undefined })
         }
         if (
@@ -3728,7 +4127,8 @@ export async function runAgentTurn(params: {
         } else if (/FILE_EXISTS/i.test(tc)) {
           appendToolHint(
             apiMessages,
-            'FILE_EXISTS: small HTML/CSS/scripts → write_file overwrite=true with the full file. Large files → apply_patch / apply_diff, or append=true to continue. Do not invent a duplicate filename.'
+            'FILE_EXISTS: for index.html / landing HTML/CSS under ~40KB call write_file with overwrite=true and the FULL file. ' +
+              'Do not apply_diff with a guessed search_block. Large non-HTML files → apply_patch / append=true.'
           )
         } else if (/OVERWRITE_BLOCKED/i.test(tc)) {
           appendToolHint(
@@ -3835,12 +4235,13 @@ export async function runAgentTurn(params: {
       }
     }
 
-    // After tools ran with no visible closing summary — force one conclude round.
+    // After tools ran with no visible closing summary — only conclude when the plan is done.
     if (
       completedTools > 0 &&
       !finalText.trim() &&
       !concludeAsked &&
-      round < maxRounds - 1
+      round < maxRounds - 1 &&
+      pendingPlanWork(todoSteps).length === 0
     ) {
       concludeAsked = true
       const concludeHint =
@@ -3909,6 +4310,71 @@ export async function runAgentTurn(params: {
       })
       params.onUpdate([...messages])
       continue
+    }
+
+    if (todoSteps.length > 0 && lastHtmlWrite) {
+      todoSteps = reconcileTodosWithContent(todoSteps, lastHtmlWrite)
+      upsertTodoBubble(messages, todoSteps, { afterId: thinkBubbleId ?? undefined })
+    }
+
+    const workLeft = pendingPlanWork(todoSteps)
+    if (
+      workLeft.length > 0 &&
+      completedTools > 0 &&
+      planFinishNudges < 3 &&
+      round < maxRounds - 1
+    ) {
+      planFinishNudges++
+      const pendingList = workLeft.map((s) => `- ${s.text}`).join('\n')
+      pushUserMessage(
+        apiMessages,
+        'PLAN_ORDER: finish the remaining plan steps IN ORDER before opening a browser or writing a summary:\n' +
+          pendingList +
+          '\nDo not Start-Process yet. Keep using tools (write_file / apply_patch) until these steps are done.'
+      )
+      apiMessages = normalizeApiMessages(apiMessages)
+      messages.push({
+        id: uid(),
+        role: 'assistant',
+        content:
+          uiLang === 'ru' ? '↻ Доделываю план по порядку…' : '↻ Finishing the plan in order…'
+      })
+      params.onUpdate([...messages])
+      continue
+    }
+
+    const pendingBrowser = todoSteps.filter(
+      (s) => s.status !== 'done' && isBrowserPlanStep(s.text)
+    )
+    if (
+      !htmlPreviewOpened &&
+      pendingBrowser.length > 0 &&
+      completedTools > 0 &&
+      planFinishNudges < 4 &&
+      round < maxRounds - 1 &&
+      /готов|done|создан|finished|complete/i.test(finalText)
+    ) {
+      planFinishNudges++
+      const pendingList = pendingBrowser.map((s) => `- ${s.text}`).join('\n')
+      pushUserMessage(
+        apiMessages,
+        'PLAN_INCOMPLETE: open/preview is still pending:\n' +
+          pendingList +
+          '\nOpen the page now with Start-Process (Resolve-Path .\\index.html) for static HTML, or the Vite Local: URL if a dev server is running. Do NOT open the LLM API port. Then a one-line summary.'
+      )
+      apiMessages = normalizeApiMessages(apiMessages)
+      messages.push({
+        id: uid(),
+        role: 'assistant',
+        content:
+          uiLang === 'ru' ? '↻ Открываю превью, затем заключение…' : '↻ Opening preview, then summary…'
+      })
+      params.onUpdate([...messages])
+      continue
+    }
+
+    if (todoSteps.length > 0 && todosAllDone(todoSteps)) {
+      upsertTodoBubble(messages, todoSteps, { afterId: thinkBubbleId ?? undefined })
     }
 
     params.onUpdate([...messages])

@@ -1,6 +1,4 @@
 import type { ChatMessageStats } from '../agent/runAgentTurn'
-import { useI18n } from '../i18n/I18nProvider'
-import type { MessageKey } from '../i18n/messages'
 
 function formatDuration(ms: number): string {
   if (ms < 1000) return `${Math.max(1, Math.round(ms))}ms`
@@ -11,8 +9,9 @@ function formatDuration(ms: number): string {
   return `${m}m ${s.toString().padStart(2, '0')}s`
 }
 
-type TFn = (key: MessageKey, vars?: Record<string, string | number>) => string
+type TFn = (key: string, vars?: Record<string, string | number>) => string
 
+/** Compact one-liner for logs / non-chat uses — not shown in the chat UI. */
 export function formatStatsSummary(stats: ChatMessageStats, t?: TFn): string {
   const parts: string[] = []
   const gen = stats.genMs ?? stats.elapsedMs
@@ -34,33 +33,9 @@ export function formatStatsSummary(stats: ChatMessageStats, t?: TFn): string {
   return parts.join(' · ')
 }
 
-function statsLines(stats: ChatMessageStats, t: TFn): string[] {
-  const lines: string[] = []
-  const gen = stats.genMs ?? stats.elapsedMs
-  if (gen != null) lines.push(t('stats.generation', { duration: formatDuration(gen) }))
-  if (stats.tps != null) lines.push(t('stats.tokensPerSec', { n: stats.tps }))
-  if (stats.promptTps != null) lines.push(t('stats.promptEval', { n: stats.promptTps }))
-  if (stats.completionTokens != null)
-    lines.push(t('stats.completion', { n: stats.completionTokens }))
-  if (stats.promptTokens != null) lines.push(t('stats.prompt', { n: stats.promptTokens }))
-  if (stats.totalTokens != null) lines.push(t('stats.total', { n: stats.totalTokens }))
-  if (stats.turnElapsedMs != null)
-    lines.push(t('stats.turn', { duration: formatDuration(stats.turnElapsedMs) }))
-  return lines
-}
-
-export function hasDisplayableStats(stats?: ChatMessageStats | null): boolean {
-  if (!stats) return false
-  return (
-    stats.tps != null ||
-    stats.promptTps != null ||
-    stats.promptTokens != null ||
-    stats.completionTokens != null ||
-    stats.totalTokens != null ||
-    stats.elapsedMs != null ||
-    stats.genMs != null ||
-    stats.turnElapsedMs != null
-  )
+/** Chat UI no longer shows per-message generation stats (multi-line dump was noise). */
+export function hasDisplayableStats(_stats?: ChatMessageStats | null): boolean {
+  return false
 }
 
 interface MessageStatsInfoProps {
@@ -69,34 +44,8 @@ interface MessageStatsInfoProps {
   align?: 'start' | 'end'
 }
 
-export function MessageStatsInfo({
-  stats,
-  align = 'start'
-}: MessageStatsInfoProps): React.JSX.Element | null {
-  const { t } = useI18n()
-  if (!hasDisplayableStats(stats)) return null
-  const summary = formatStatsSummary(stats, t)
-  const lines = statsLines(stats, t)
-  return (
-    <details
-      className={
-        'group mt-0.5 text-[10px] text-ink-mute ' +
-        (align === 'end' ? 'text-right' : 'text-left')
-      }
-    >
-      <summary className="cursor-pointer list-none select-none hover:text-ink-soft [&::-webkit-details-marker]:hidden">
-        {summary}
-      </summary>
-      <div
-        className={
-          'mt-1 space-y-0.5 font-mono leading-relaxed ' +
-          (align === 'end' ? 'text-right' : 'text-left')
-        }
-      >
-        {lines.map((line) => (
-          <div key={line}>{line}</div>
-        ))}
-      </div>
-    </details>
-  )
+export function MessageStatsInfo(
+  _props: MessageStatsInfoProps
+): React.JSX.Element | null {
+  return null
 }

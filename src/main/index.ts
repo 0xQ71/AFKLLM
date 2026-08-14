@@ -301,6 +301,8 @@ function runtimeStatus(): LlmRuntimeStatus {
 
 function applyQueueSettings(settings: AppSettings): void {
   getLLMQueue(settings.baseUrl, 'local')
+  const port = Number(settings.port) || 8080
+  terminals.setDenyPreviewPorts([port, 8080].filter((p, i, a) => a.indexOf(p) === i))
 }
 
 function settingsToLlamaOpts(
@@ -1613,6 +1615,10 @@ app.whenReady().then(async () => {
     },
     onOpenPreview: (url) => {
       mainWindow?.webContents.send('browser:open-url', { url })
+    },
+    getDenyPreviewPorts: () => {
+      const port = Number(settingsStore?.get().port) || 8080
+      return [port, 8080].filter((p, i, a) => a.indexOf(p) === i)
     },
     generateImage: async (args) => {
       let settings = settingsStore?.get()

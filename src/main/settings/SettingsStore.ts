@@ -226,7 +226,7 @@ function sanitize(input: Record<string, unknown> | AppSettings): AppSettings {
   next.stopStrings = next.stopStrings.map(String).filter(Boolean)
 
   next.agentAutoApprove = next.agentAutoApprove === true
-  next.agentThinkThrough = next.agentThinkThrough !== false
+  next.agentThinkThrough = true
   next.agentImageGenEnabled = next.agentImageGenEnabled === true
   next.setupComplete = next.setupComplete === true
   next.localApiEnabled = next.localApiEnabled === true

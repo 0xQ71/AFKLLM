@@ -16,7 +16,13 @@ import {
   parseApplyPatch
 } from '../../shared/applyPatch'
 import { normalizeAgentShellCommand } from '../../shared/shellNormalize'
-import { extractLocalPreviewUrl, looksLikeLocalServerCommand } from '../../shared/localPreview'
+import {
+  classifyBrowserOpenCommand,
+  extractLocalPreviewUrl,
+  extractOpenHtmlRelativePath,
+  looksLikeLocalServerCommand,
+  pathToFileUrl
+} from '../../shared/localPreview'
 
 const IGNORED_DIRS = new Set([
   'node_modules',
@@ -57,6 +63,8 @@ export interface AgentToolRegistryOptions {
   readTerminalScrollback?: (maxChars?: number) => string
   /** Open in-app browser when a local preview URL is known */
   onOpenPreview?: (url: string) => void
+  /** Ports that must never auto-open as site preview (LLM server, default 8080) */
+  getDenyPreviewPorts?: () => number[]
   /** Optional BM25 context index for search_codebase */
   contextIndex?: {
     isReady(): boolean
@@ -85,6 +93,7 @@ export class AgentToolRegistry {
   private runVisibleCommand?: AgentToolRegistryOptions['runVisibleCommand']
   private readTerminalScrollback?: AgentToolRegistryOptions['readTerminalScrollback']
   private onOpenPreview?: AgentToolRegistryOptions['onOpenPreview']
+  private getDenyPreviewPorts?: () => number[]
   private contextIndex?: AgentToolRegistryOptions['contextIndex']
   private generateImageFn?: AgentToolRegistryOptions['generateImage']
   /** First-edit-per-path snapshot for Accept/Reject undo */
@@ -99,6 +108,7 @@ export class AgentToolRegistry {
     this.runVisibleCommand = options.runVisibleCommand
     this.readTerminalScrollback = options.readTerminalScrollback
     this.onOpenPreview = options.onOpenPreview
+    this.getDenyPreviewPorts = options.getDenyPreviewPorts
     this.contextIndex = options.contextIndex
     this.generateImageFn = options.generateImage
     this.handlers = new Map([
@@ -520,7 +530,10 @@ export class AgentToolRegistry {
     // Block silent full rewrites of large files — the #1 cause of "rewrites everything after compact"
     if (!append && !overwrite && existing.trim().length > 40) {
       const tail = existing.slice(-350)
-      const small = existing.length < 6000
+      // Landing HTML often exceeds 6KB — still tell the model to overwrite=true, not apply_diff.
+      const small =
+        existing.length < 6000 ||
+        (/\.html?$/i.test(relativePath) && existing.length < 40_000)
       return {
         id: '',
         name: 'write_file',
@@ -528,7 +541,7 @@ export class AgentToolRegistry {
         content:
           `FILE_EXISTS: "${relativePath}" already has ${existing.length} bytes.\n` +
           (small
-            ? `This is a small file. Call write_file again with overwrite=true and the FULL corrected content.\n`
+            ? `This is a small/landing file. Call write_file again with overwrite=true and the FULL corrected content.\n`
             : `Do NOT rewrite from scratch. Use apply_patch / apply_diff to edit, or append=true to continue.\n`) +
           `File currently ends with:\n<<<\n${tail}\n>>>`,
         error: small
@@ -916,6 +929,26 @@ export class AgentToolRegistry {
     const command = normalized.command
     const cwdRel = normalized.cwdRel
 
+    // Intercept preview opens: workspace .html → file://; Vite localhost → that URL;
+    // LLM API port (e.g. :8080) → never open llama UI, use workspace HTML instead.
+    const openKind =
+      classifyBrowserOpenCommand(command, this.getDenyPreviewPorts?.() ?? [8080]) ||
+      classifyBrowserOpenCommand(rawCommand, this.getDenyPreviewPorts?.() ?? [8080])
+    if (openKind?.kind === 'local_http') {
+      this.onOpenPreview?.(openKind.url)
+      return {
+        id: '',
+        name: 'execute_terminal_command',
+        ok: true,
+        content:
+          `Opened local preview in AFKLLM Browser:\nPREVIEW_URL: ${openKind.url}\n` +
+          'Dev server URL (Vite etc.) — not the LLM API port.'
+      }
+    }
+    if (openKind?.kind === 'llm_mistake' || openKind?.kind === 'workspace_html') {
+      return this.openWorkspaceHtmlPreview(command, cwdRel, openKind.kind === 'llm_mistake')
+    }
+
     const cwd =
       !cwdRel || cwdRel === '.' || cwdRel === './'
         ? this.projectRoot
@@ -952,6 +985,77 @@ export class AgentToolRegistry {
     const output = await this.runShell(command, cwd)
     const merged = [output.stdout, output.stderr].filter((s) => s.trim()).join('\n')
     return this.formatShellResult(command, merged, output.exitCode, normalized.note)
+  }
+
+  /** Resolve a repo HTML file and open it via file:// in the in-app Browser (no temp/shell). */
+  private async openWorkspaceHtmlPreview(
+    command: string,
+    cwdRel: string,
+    llmMistake = false
+  ): Promise<AgentToolResult> {
+    let rel = extractOpenHtmlRelativePath(command, cwdRel)
+      .replace(/\\/g, '/')
+      .replace(/^\.\//, '')
+    // Absolute paths outside the repo → force root index.html
+    if (/^[a-zA-Z]:\//.test(rel) || rel.startsWith('/')) {
+      const normRoot = normalize(this.projectRoot).toLowerCase()
+      const normAbs = normalize(rel).toLowerCase()
+      if (normAbs.startsWith(normRoot + sep.toLowerCase()) || normAbs.startsWith(normRoot + '/')) {
+        rel = normalize(rel)
+          .slice(normalize(this.projectRoot).length)
+          .replace(/^[/\\]+/, '')
+          .replace(/\\/g, '/')
+      } else {
+        rel = 'index.html'
+      }
+    }
+    if (!rel || rel === '.' || !/\.html?$/i.test(rel)) {
+      rel = rel && !/\.[a-z0-9]+$/i.test(rel) ? `${rel.replace(/\/$/, '')}/index.html` : 'index.html'
+    }
+
+    let abs: string
+    try {
+      abs = this.safeResolve(rel)
+    } catch {
+      rel = 'index.html'
+      abs = this.safeResolve(rel)
+    }
+
+    try {
+      await fs.access(abs)
+    } catch {
+      const fallback = this.safeResolve('index.html')
+      try {
+        await fs.access(fallback)
+        rel = 'index.html'
+        abs = fallback
+      } catch {
+        return {
+          id: '',
+          name: 'execute_terminal_command',
+          ok: false,
+          content: '',
+          error:
+            `PREVIEW_MISSING: "${rel}" is not in the workspace. Write the file first (write_file), then open preview. ` +
+            'Do NOT Start-Process Chrome or http://127.0.0.1:8080 (LLM server).'
+        }
+      }
+    }
+
+    const fileUrl = pathToFileUrl(abs)
+    this.onOpenPreview?.(fileUrl)
+    const note = llmMistake
+      ? 'Note: that localhost port is the AFKLLM LLM API — opened workspace HTML instead. For Vite use the Local: URL from npm run dev (e.g. :5173).'
+      : 'Static HTML preview (file://). For Vite/dev servers, open the Local: URL from the serve command instead.'
+    return {
+      id: '',
+      name: 'execute_terminal_command',
+      ok: true,
+      content:
+        `Opened workspace file in AFKLLM Browser: ${rel.replace(/\\/g, '/')}\n` +
+        `PREVIEW_URL: ${fileUrl}\n` +
+        note
+    }
   }
 
   private async readTerminal(args: Record<string, unknown>): Promise<AgentToolResult> {
@@ -1013,7 +1117,8 @@ export class AgentToolRegistry {
   ): AgentToolResult {
     const noteLine = normalizeNote ? `note: ${normalizeNote}\n` : ''
     const body = stripAnsi(output).trim() || '(no output)'
-    const preview = extractLocalPreviewUrl(body)
+    const denyPorts = this.getDenyPreviewPorts?.() ?? [8080]
+    const preview = extractLocalPreviewUrl(body, { denyPorts })
     if (preview) {
       this.onOpenPreview?.(preview)
     } else if (looksLikeLocalServerCommand(command) && exitCode === 0) {

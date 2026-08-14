@@ -34,9 +34,14 @@ export class TerminalManager {
   private previewScanBuf = ''
   private lastPreviewUrl: string | null = null
   private lastPreviewAt = 0
+  private denyPreviewPorts: number[] = [8080]
 
   setWindow(win: BrowserWindow | null): void {
     this.window = win
+  }
+
+  setDenyPreviewPorts(ports: number[]): void {
+    this.denyPreviewPorts = ports.length > 0 ? ports : [8080]
   }
 
   setAutoConfirm(getter: (() => boolean) | null): void {
@@ -54,7 +59,9 @@ export class TerminalManager {
       .replace(/\x1b\][^\x07]*\x07/g, '')
       .replace(/\r/g, '')
     this.previewScanBuf = (this.previewScanBuf + stripped).slice(-6_000)
-    const url = extractLocalPreviewUrl(this.previewScanBuf)
+    const url = extractLocalPreviewUrl(this.previewScanBuf, {
+      denyPorts: this.denyPreviewPorts
+    })
     if (!url) return
     const now = Date.now()
     if (url === this.lastPreviewUrl && now - this.lastPreviewAt < 12_000) return

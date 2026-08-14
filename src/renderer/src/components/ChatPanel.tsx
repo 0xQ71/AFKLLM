@@ -31,7 +31,7 @@ import {
   stripPlanStatus,
   type TurnFileChange
 } from '../agent/runAgentTurn'
-import { parseChecklistUiContent, parseTodoUiContent, formatLiveThinkContent, extractThinkInner, sanitizeThinkProse, stripThinkTags } from '../agent/agentPure'
+import { parseChecklistUiContent, parseTodoUiContent, liveThinkProse, displayThinkProse, stripThinkTags, isJunkPlanStep, isEllipsisOnly } from '../agent/agentPure'
 import type { QueueManager } from '../llm/queueManager'
 import type { ChatSession, PersistedChatMessage } from '../../../shared/chats'
 import {
@@ -47,6 +47,7 @@ import {
   MessageStatsInfo
 } from './MessageStatsInfo'
 import { ContextUsageControl } from './ContextUsagePopover'
+import { estimateLocalContextSum } from '../agent/contextUsage'
 import {
   buildActivityFromTool,
   formatActivityParts,
@@ -317,8 +318,12 @@ export function ChatPanel({
   /** Serializes stop→send so cancelAll cannot abort the next turn. */
   const sendLockRef = useRef<Promise<void>>(Promise.resolve())
   const [lastStats, setLastStats] = useState<ChatMessageStats | null>(null)
+  /** Local context sum when last prompt_tokens was measured — for live gauge growth. */
+  const [contextAnchor, setContextAnchor] = useState<{
+    prompt: number
+    local: number
+  } | null>(null)
   const [autoApprove, setAutoApprove] = useState(false)
-  const [thinkThrough, setThinkThrough] = useState(true)
   const [imageMode, setImageMode] = useState(false)
   const [projectRulesText, setProjectRulesText] = useState('')
   const [mcpToolsJson, setMcpToolsJson] = useState('')
@@ -326,7 +331,6 @@ export function ChatPanel({
   const bottomRef = useRef<HTMLDivElement>(null)
   const feedScrollRef = useRef<HTMLDivElement>(null)
   const stickToBottomRef = useRef(true)
-  const ignoreFeedScrollRef = useRef(false)
   const codeStickRef = useRef(new Map<string, boolean>())
   const codeEndRefs = useRef<Map<string, HTMLPreElement>>(new Map())
   const abortRef = useRef<AbortController | null>(null)
@@ -345,6 +349,7 @@ export function ChatPanel({
       setMessages([])
       setInput('')
       setLastStats(null)
+      setContextAnchor(null)
       setFollowQueue([])
       setEditingQueueId(null)
       setActiveUserMsgId(null)
@@ -368,6 +373,7 @@ export function ChatPanel({
       }
     }
     setLastStats(hydrated)
+    setContextAnchor(null)
     onSessionsChange?.(list, active.id)
   }, [onSessionsChange])
 
@@ -379,6 +385,7 @@ export function ChatPanel({
     setBusy(false)
     busyRef.current = false
     setLastStats(null)
+    setContextAnchor(null)
     setPickerOpen(false)
     setFollowQueue([])
     setEditingQueueId(null)
@@ -423,13 +430,11 @@ export function ChatPanel({
   useEffect(() => {
     void window.api.settings.get().then((s) => {
       setAutoApprove(Boolean(s.agentAutoApprove))
-      setThinkThrough(s.agentThinkThrough !== false)
       setImageMode(s.agentImageGenEnabled === true)
       setSystemPromptExtra(s.systemPrompt?.trim() ?? '')
     })
     return window.api.settings.onChanged((s) => {
       setAutoApprove(Boolean(s.agentAutoApprove))
-      setThinkThrough(s.agentThinkThrough !== false)
       setImageMode(s.agentImageGenEnabled === true)
       setSystemPromptExtra(s.systemPrompt?.trim() ?? '')
     })
@@ -461,56 +466,49 @@ export function ChatPanel({
   }, [workspaceKey])
 
   useEffect(() => {
-    if (!stickToBottomRef.current) {
-      // Still pin streaming code previews only if that preview itself is sticky.
-      for (const m of messages) {
-        if (!(m.streaming && m.codePreview)) continue
-        if (codeStickRef.current.get(m.id) === false) continue
-        const codeEl = codeEndRefs.current.get(m.id)
-        if (!codeEl) continue
+    const el = feedScrollRef.current
+    if (!el) {
+      // Still allow sticky code previews when feed isn't ready.
+    } else if (stickToBottomRef.current) {
+      // Do NOT ignore user scroll events — that re-pinned the feed during token floods.
+      el.scrollTop = el.scrollHeight
+    }
+
+    for (const m of messages) {
+      if (!(m.streaming && m.codePreview)) continue
+      if (codeStickRef.current.get(m.id) === false) continue
+      const codeEl = codeEndRefs.current.get(m.id)
+      if (!codeEl) continue
+      if (!stickToBottomRef.current) {
+        // Feed detached: only follow this preview if it itself is sticky.
         const near =
           codeEl.scrollHeight - codeEl.scrollTop - codeEl.clientHeight < 48
         if (!near && codeEl.scrollTop > 0) {
           codeStickRef.current.set(m.id, false)
           continue
         }
-        codeEl.scrollTop = codeEl.scrollHeight
       }
-      return
-    }
-    const el = feedScrollRef.current
-    if (el) {
-      ignoreFeedScrollRef.current = true
-      el.scrollTop = el.scrollHeight
-      requestAnimationFrame(() => {
-        ignoreFeedScrollRef.current = false
-      })
-    }
-    for (const m of messages) {
-      if (!(m.streaming && m.codePreview)) continue
-      if (codeStickRef.current.get(m.id) === false) continue
-      const codeEl = codeEndRefs.current.get(m.id)
-      if (codeEl) codeEl.scrollTop = codeEl.scrollHeight
+      codeEl.scrollTop = codeEl.scrollHeight
     }
   }, [messages])
 
   const onFeedScroll = (): void => {
-    if (ignoreFeedScrollRef.current) return
     const el = feedScrollRef.current
     if (!el) return
     const dist = el.scrollHeight - el.scrollTop - el.clientHeight
-    stickToBottomRef.current = dist < 80
+    stickToBottomRef.current = dist < 64
   }
 
   const onFeedWheelCapture = (e: WheelEvent<HTMLDivElement>): void => {
-    // Capture even when the wheel is over nested code previews.
-    if (e.deltaY < 0) stickToBottomRef.current = false
-    else {
-      const el = feedScrollRef.current
-      if (!el) return
-      const dist = el.scrollHeight - el.scrollTop - el.clientHeight
-      if (dist < 80) stickToBottomRef.current = true
+    // User intent wins immediately (incl. over nested code previews).
+    if (e.deltaY < 0) {
+      stickToBottomRef.current = false
+      return
     }
+    const el = feedScrollRef.current
+    if (!el) return
+    const dist = el.scrollHeight - el.scrollTop - el.clientHeight
+    if (dist < 64) stickToBottomRef.current = true
   }
 
   useEffect(() => {
@@ -559,12 +557,6 @@ export function ChatPanel({
         )
       )
     }
-  }
-
-  const toggleThinkThrough = async (): Promise<void> => {
-    const next = !thinkThrough
-    setThinkThrough(next)
-    await window.api.settings.save({ agentThinkThrough: next })
   }
 
   const toggleImageMode = async (): Promise<void> => {
@@ -660,6 +652,7 @@ export function ChatPanel({
     applySnapshot(snap)
     setInput('')
     setLastStats(null)
+    setContextAnchor(null)
   }
 
   const switchSession = async (id: string): Promise<void> => {
@@ -676,6 +669,7 @@ export function ChatPanel({
     applySnapshot(snap)
     setInput('')
     setLastStats(null)
+    setContextAnchor(null)
   }
 
   useEffect(() => {
@@ -1030,13 +1024,12 @@ export function ChatPanel({
     return null
   }, [lastStats?.promptTokens, messages])
 
-  const contextEstimateInput = useMemo(
+  const contextEstimateBase = useMemo(
     () => ({
       messages,
       ctxLimit,
-      promptTokens: measuredPromptTokens,
       agentAutoApprove: autoApprove,
-      agentThinkThrough: thinkThrough,
+      agentThinkThrough: true,
       agentImageGenEnabled: imageMode,
       planMode: false,
       systemPromptExtra,
@@ -1046,14 +1039,41 @@ export function ChatPanel({
     [
       messages,
       ctxLimit,
-      measuredPromptTokens,
       autoApprove,
-      thinkThrough,
       imageMode,
       systemPromptExtra,
       projectRulesText,
       mcpToolsJson
     ]
+  )
+
+  const localContextSum = useMemo(
+    () => estimateLocalContextSum(contextEstimateBase),
+    [contextEstimateBase]
+  )
+
+  // Snap local sum when a new server prompt_tokens arrives so the gauge can grow live afterward.
+  useEffect(() => {
+    if (measuredPromptTokens == null || measuredPromptTokens <= 0) return
+    setContextAnchor((prev) => {
+      if (prev?.prompt === measuredPromptTokens) return prev
+      return {
+        prompt: measuredPromptTokens,
+        local: Math.max(1, localContextSum)
+      }
+    })
+  }, [measuredPromptTokens, localContextSum])
+
+  const contextEstimateInput = useMemo(
+    () => ({
+      ...contextEstimateBase,
+      promptTokens: measuredPromptTokens,
+      anchorLocalSum:
+        contextAnchor && contextAnchor.prompt === measuredPromptTokens
+          ? contextAnchor.local
+          : null
+    }),
+    [contextEstimateBase, measuredPromptTokens, contextAnchor]
   )
 
   const visibleMessages = messages.filter((m) => isVisibleChatMessage(m))
@@ -1353,15 +1373,24 @@ export function ChatPanel({
               ) : (
                 <div>
                   <div className="rounded-xl border border-ink-line/70 bg-ink-950/40 px-3.5 py-2.5">
-                    <ThinkThroughBody
-                      content={displayContent(m)}
-                      streaming={!!m.streaming}
-                      durationLabel={
-                        m.stats?.genMs != null || m.stats?.elapsedMs != null
-                          ? formatDuration(m.stats.genMs ?? m.stats.elapsedMs ?? 0)
-                          : undefined
-                      }
-                    />
+                    {m.id === 'welcome' ? (
+                      <MarkdownBody content={displayContent(m)} />
+                    ) : isAgentStatusLine(m) ? (
+                      <div className="text-[12px] leading-relaxed text-ink-mute">
+                        {m.content}
+                        {m.streaming ? <span className="stream-caret" aria-hidden /> : null}
+                      </div>
+                    ) : (
+                      <ThinkThroughBody
+                        content={displayContent(m)}
+                        streaming={!!m.streaming}
+                        durationLabel={
+                          m.stats?.genMs != null || m.stats?.elapsedMs != null
+                            ? formatDuration(m.stats.genMs ?? m.stats.elapsedMs ?? 0)
+                            : undefined
+                        }
+                      />
+                    )}
                   </div>
                   {!m.streaming && hasDisplayableStats(m.stats) ? (
                     <MessageStatsInfo stats={m.stats!} />
@@ -1700,23 +1729,6 @@ export function ChatPanel({
               <button
                 type="button"
                 title={
-                  thinkThrough
-                    ? 'Think-through ON'
-                    : 'Think-through OFF'
-                }
-                onClick={() => void toggleThinkThrough()}
-                className={
-                  'rounded-full px-2 py-1 text-[11px] ' +
-                  (thinkThrough
-                    ? 'text-signal'
-                    : 'text-ink-mute hover:text-ink-soft')
-                }
-              >
-                {t('chat.think')}
-              </button>
-              <button
-                type="button"
-                title={
                   imageMode ? t('chat.imageModeOn') : t('chat.imageModeDisabled')
                 }
                 aria-disabled={!imageMode}
@@ -1965,6 +1977,14 @@ function formatRelativeTime(ts: number): string {
   return `${d}d`
 }
 
+function isAgentStatusLine(m: ChatMessage): boolean {
+  if (m.toolName || m.id === 'welcome') return false
+  const c = (m.content ?? '').trim()
+  if (!c) return false
+  if (/<\s*(?:think|thinking)\s*>/i.test(c)) return false
+  return /^↻ /.test(c)
+}
+
 function ThinkThroughBody({
   content,
   streaming,
@@ -1976,64 +1996,86 @@ function ThinkThroughBody({
 }): React.JSX.Element {
   const { t } = useI18n()
   void durationLabel
-  // While streaming: show live tokens. After: sanitize dumps/checklists.
-  const displaySrc = streaming ? formatLiveThinkContent(content) : content
+  const live = liveThinkProse(content)
+  const hasThinkTags = /<\s*(?:think|thinking)\s*>/i.test(content)
+  const lastGoodRef = useRef('')
+  if (live.trim() && !/^думаю над запросом|^thinking about the request|^набираю мысль/i.test(live.trim())) {
+    lastGoodRef.current = live
+  }
+  // Never flash empty while tags/tokens stream — keep last good prose.
+  const stableLive = live.trim() ? live : lastGoodRef.current
+
+  // Status / plain streaming text must NOT look like a second Think fold.
+  if (streaming && !hasThinkTags) {
+    const plain = stripThinkTags(stripPlanBlock(content)).trim() || content.trim()
+    return (
+      <div className="text-[12px] leading-relaxed text-ink-mute">
+        <MarkdownBody content={plain} streaming />
+      </div>
+    )
+  }
+
+  const displaySrc = content
   const parts = parseThinkBlocks(displaySrc).map((p) => {
     if (p.kind === 'think') {
-      const text = streaming
-        ? extractThinkInner(`<think>${p.text}</think>`) || p.text
-        : sanitizeThinkProse(`<think>${p.text}</think>`) || p.text
+      const text =
+        displayThinkProse(`<think>${p.text}</think>`) ||
+        liveThinkProse(p.text) ||
+        (p.text.trim() && !/^[.….\s·•<]+$/u.test(p.text.trim()) ? p.text : '')
       return { ...p, text }
     }
     return { ...p, text: stripPlanBlock(stripThinkTags(p.text)) }
   })
-  const thinkParts = parts.filter((p) => p.kind === 'think' && (p.text.trim() || streaming))
+  const thinkParts = parts.filter((p) => p.kind === 'think' && p.text.trim())
   const textParts = parts.filter((p) => p.kind === 'text' && p.text.trim())
+  const mergedThink =
+    thinkParts.length > 0
+      ? thinkParts.map((p) => p.text).sort((a, b) => b.length - a.length)[0]!
+      : stableLive
   const showThinkFold =
-    thinkParts.length > 0 || (streaming && /<\s*(?:think|thinking)\s*>/i.test(content || displaySrc))
+    hasThinkTags &&
+    (Boolean(mergedThink.trim()) || Boolean(stableLive.trim()) || Boolean(streaming))
   const thoughtLabel = streaming ? t('chat.thought.thinking') : t('chat.thought.briefly')
+
   if (!showThinkFold) {
     const visible =
       textParts.map((p) => p.text).join('\n\n').trim() || stripThinkTags(stripPlanBlock(content))
-    return <MarkdownBody content={visible} streaming={streaming} />
+    return <MarkdownBody content={visible} />
   }
+
+  const body =
+    mergedThink.trim() ||
+    stableLive.trim() ||
+    (streaming ? t('chat.thought.waiting') : '')
+
   return (
     <div className="space-y-2">
-      {thinkParts.map((p, i) => (
-        <details key={i} open={Boolean(streaming) || i === 0} className="group">
-          <summary className="flex cursor-pointer list-none items-center gap-1.5 select-none text-[12px] text-ink-mute hover:text-ink-soft [&::-webkit-details-marker]:hidden">
-            <svg
-              width="12"
-              height="12"
-              viewBox="0 0 24 24"
-              fill="none"
-              className="shrink-0 opacity-70 transition group-open:rotate-90"
-              aria-hidden
-            >
-              <path
-                d="M9 6l6 6-6 6"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              />
-            </svg>
-            {thoughtLabel}
-          </summary>
-          <div className="mt-1.5 border-l border-ink-line/50 pl-3 text-[12px] leading-relaxed text-ink-mute [&_.text-ink-soft]:text-ink-mute [&_.text-ink-bright]:text-ink-soft">
-            <MarkdownBody
-              content={p.text || (streaming ? '' : '…')}
-              streaming={Boolean(streaming) && i === thinkParts.length - 1}
+      <details open className="group">
+        <summary className="flex cursor-pointer list-none items-center gap-1.5 select-none text-[12px] text-ink-mute hover:text-ink-soft [&::-webkit-details-marker]:hidden">
+          <svg
+            width="12"
+            height="12"
+            viewBox="0 0 24 24"
+            fill="none"
+            className="shrink-0 opacity-70 transition group-open:rotate-90"
+            aria-hidden
+          >
+            <path
+              d="M9 6l6 6-6 6"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
             />
-          </div>
-        </details>
-      ))}
+          </svg>
+          {thoughtLabel}
+        </summary>
+        <div className="mt-1.5 border-l border-ink-line/50 pl-3 text-[12px] leading-relaxed text-ink-mute [&_.text-ink-soft]:text-ink-mute [&_.text-ink-bright]:text-ink-soft">
+          <MarkdownBody content={body} streaming={!!streaming} />
+        </div>
+      </details>
       {textParts.map((p, i) => (
-        <MarkdownBody
-          key={`t-${i}`}
-          content={p.text}
-          streaming={streaming && i === textParts.length - 1}
-        />
+        <MarkdownBody key={`t-${i}`} content={p.text} />
       ))}
     </div>
   )
@@ -2041,8 +2083,10 @@ function ThinkThroughBody({
 
 function AgentTodoCard({ content }: { content: string }): React.JSX.Element | null {
   const { t } = useI18n()
-  const steps = parseTodoUiContent(content)
-  if (!steps?.length) return null
+  const steps = (parseTodoUiContent(content) ?? []).filter(
+    (s) => s.text.trim() && !isEllipsisOnly(s.text) && !isJunkPlanStep(s.text)
+  )
+  if (!steps.length) return null
   const allDone = steps.every((s) => s.status === 'done')
   const statusLabel = allDone
     ? t('chat.plan.statusDone')
@@ -2078,11 +2122,7 @@ function AgentTodoCard({ content }: { content: string }): React.JSX.Element | nu
               >
                 {done ? '✓' : active ? '·' : ''}
               </span>
-              <span
-                className={
-                  done ? 'text-ink-mute line-through decoration-ink-line' : 'text-ink-soft'
-                }
-              >
+              <span className="text-ink-soft">
                 {s.text}
               </span>
             </li>

@@ -6,9 +6,13 @@ import {
   rewriteBashOperators
 } from '../src/shared/shellNormalize'
 import {
+  classifyBrowserOpenCommand,
   extractLocalPreviewUrl,
+  extractOpenHtmlRelativePath,
   looksLikeLocalServerCommand,
-  normalizePreviewUrl
+  looksLikeOpenHtmlCommand,
+  normalizePreviewUrl,
+  pathToFileUrl
 } from '../src/shared/localPreview'
 
 describe('shellNormalize', () => {
@@ -59,6 +63,60 @@ describe('localPreview', () => {
     )
     const url = extractLocalPreviewUrl('Serving HTTP on 0.0.0.0 port 8000 (http://0.0.0.0:8000/)')
     assert.equal(url, 'http://127.0.0.1:8000/')
+  })
+
+  it('ignores LLM bare port / echo; keeps Vite Local (any port)', () => {
+    assert.equal(
+      extractLocalPreviewUrl('> Start-Process chrome.exe http://127.0.0.1:8080/index.html'),
+      null
+    )
+    assert.equal(
+      extractLocalPreviewUrl('Listening on http://127.0.0.1:8080/', { denyPorts: [8080] }),
+      null
+    )
+    assert.equal(
+      extractLocalPreviewUrl('  ➜  Local:   http://localhost:5173/'),
+      'http://localhost:5173/'
+    )
+    // Labeled Vite/serve on 8080 is allowed (real preview), not bare LLM URL
+    assert.equal(
+      extractLocalPreviewUrl('  ➜  Local:   http://localhost:8080/', { denyPorts: [8080] }),
+      'http://localhost:8080/'
+    )
+  })
+
+  it('classifies file open vs Vite URL vs LLM mistake', () => {
+    assert.equal(
+      classifyBrowserOpenCommand('Start-Process (Resolve-Path .\\index.html)')?.kind,
+      'workspace_html'
+    )
+    assert.deepEqual(
+      classifyBrowserOpenCommand('Start-Process chrome.exe http://localhost:5173/'),
+      { kind: 'local_http', url: 'http://localhost:5173/' }
+    )
+    assert.equal(
+      classifyBrowserOpenCommand(
+        'Start-Process chrome.exe http://127.0.0.1:8080/index.html',
+        [8080]
+      )?.kind,
+      'llm_mistake'
+    )
+    assert.equal(looksLikeOpenHtmlCommand('Start-Process chrome.exe http://localhost:5173/'), true)
+  })
+
+  it('pathToFileUrl + open-html path extraction', () => {
+    assert.equal(pathToFileUrl('D:\\test\\index.html'), 'file:///D:/test/index.html')
+    assert.equal(
+      extractOpenHtmlRelativePath(
+        'Start-Process "index.html" -WorkingDirectory "D:\\test"',
+        '.'
+      ),
+      'index.html'
+    )
+    assert.equal(
+      extractOpenHtmlRelativePath('Start-Process (Resolve-Path .\\index.html)', '.'),
+      'index.html'
+    )
   })
 
   it('detects common serve commands', () => {

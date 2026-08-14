@@ -2,6 +2,10 @@
  * Pure agent helpers (no window / React) — safe for node smoke tests.
  */
 
+import { looksLikeOpenHtmlCommand } from '../../../shared/localPreview'
+
+export { looksLikeOpenHtmlCommand }
+
 export type ChatRole = 'system' | 'user' | 'assistant' | 'tool'
 
 export interface ChatMessageLite {
@@ -184,18 +188,67 @@ export function extractThinkInner(text: string | null | undefined): string {
   return (open?.[1] ?? '').trim()
 }
 
-/** Think should be short reasoning — not HTML / tool dumps. */
+/** Think should be prose reasoning — not HTML / tool dumps. */
 export function thinkBodyLooksLikeCodeDump(text: string | null | undefined): boolean {
   const inner = extractThinkInner(text) || (text ?? '')
-  if (
-    /<!DOCTYPE\s+html|<html[\s>]|<write_file\b|call:write_file|<\/style>|bootstrap\.min|<link\s+rel=/i.test(
-      inner
-    )
-  ) {
+  if (findCodeLeakIndex(inner) >= 0) return true
+  if (/<write_file\b|call:write_file|<\/style>|bootstrap\.min|<link\s+rel=/i.test(inner)) {
     return true
   }
-  if (inner.length > 900 && /```|<style[\s>]|<script[\s>]/i.test(inner)) return true
+  // Long DeepThink prose is fine; only flag when markup/fences dominate.
+  if (inner.length > 2400 && /<style[\s>]|<script[\s>]/i.test(inner)) return true
   return false
+}
+
+/** Index where generation / code starts leaking into think or plan prose. */
+export function findCodeLeakIndex(text: string): number {
+  const s = text ?? ''
+  const patterns = [
+    /```/,
+    /<!DOCTYPE\s+html/i,
+    /<html[\s>]/i,
+    /<write_file\b/i,
+    /call:write_file/i,
+    /<\/?style\b/i,
+    /<\/?script\b/i
+  ]
+  let best = -1
+  for (const re of patterns) {
+    const m = s.search(re)
+    if (m >= 0 && (best < 0 || m < best)) best = m
+  }
+  return best
+}
+
+/** Cut think prose before fenced code / HTML dumps. */
+export function stripCodeLeakFromThink(text: string): string {
+  let s = text ?? ''
+  const at = findCodeLeakIndex(s)
+  if (at >= 0) s = s.slice(0, at)
+  return s
+    .replace(/\n{3,}/g, '\n\n')
+    .replace(/[ \t]+$/gm, '')
+    .trim()
+}
+
+/** Pull HTML the model dumped as plain assistant text (not a tool call). */
+export function extractAssistantHtmlDump(text: string | null | undefined): string | null {
+  const raw = text ?? ''
+  const fence = raw.match(/```(?:html|htm)?\s*([\s\S]*?)(?:```|$)/i)
+  if (fence?.[1] && /<!DOCTYPE\s+html|<html[\s>]|<body[\s>]|<nav\b|<section\b|<div\b/i.test(fence[1])) {
+    return fence[1].trim()
+  }
+  const doc = raw.search(/<!DOCTYPE\s+html|<html[\s>]/i)
+  if (doc >= 0) {
+    const body = raw.slice(doc).trim()
+    if (body.length >= 40) return body
+  }
+  return null
+}
+
+export function looksLikeAssistantHtmlDump(text: string | null | undefined): boolean {
+  const dump = extractAssistantHtmlDump(text)
+  return Boolean(dump && dump.length >= 60)
 }
 
 /** True if text is mostly a numbered / checkbox plan, not prose reasoning. */
@@ -218,17 +271,69 @@ export function sanitizeThinkProse(text: string | null | undefined): string {
   let inner = extractThinkInner(text)
   // Never fall back to the whole prelude (that pulled <plan> / 1. 2. 3. into «Думал»).
   if (!inner) return ''
-  inner = inner.replace(/<\s*plan\s*>[\s\S]*?<\s*\/\s*plan\s*>/gi, '').trim()
+  inner = stripPlanLeakFromThink(inner)
+  inner = stripCodeLeakFromThink(inner)
   if (!inner || thinkBodyLooksLikeCodeDump(`<think>${inner}</think>`)) return ''
   if (thinkLooksLikeChecklist(inner)) return ''
   // Drop fenced code / obvious markup leftovers.
   inner = inner
     .replace(/```[\s\S]*?```/g, '')
+    .replace(/```[\s\S]*$/g, '')
     .replace(/<write_file[\s\S]*$/i, '')
     .trim()
   if (thinkLooksLikeChecklist(inner)) return ''
-  if (inner.length > 800) inner = inner.slice(0, 800).trim()
+  if (isEllipsisOnly(inner)) return ''
+  // Allow DeepThink / Cursor-length reasoning in the fold (was capped at 800).
+  if (inner.length > 6000) inner = inner.slice(0, 6000).trim()
   return inner
+}
+
+export function isEllipsisOnly(text: string | null | undefined): boolean {
+  return /^[.….\s·•…]+$/u.test((text ?? '').trim())
+}
+
+/**
+ * Best-effort think prose for the UI. Never collapses a real stream to a lone "…".
+ * Soft-keeps leftover sentences when sanitize would empty a checklist/code mix.
+ */
+export function displayThinkProse(text: string | null | undefined): string {
+  const sanitized = sanitizeThinkProse(text)
+  if (sanitized) return sanitized
+  let inner =
+    extractThinkInner(text) ||
+    stripThinkTags(stripPlanBlock(text ?? '')).trim()
+  inner = stripPlanLeakFromThink(inner)
+  if (!inner || isEllipsisOnly(inner)) return ''
+  if (/^<?\s*plan\b/i.test(inner) || inner === '<plan') return ''
+  if (thinkBodyLooksLikeCodeDump(`<think>${inner}</think>`)) {
+    inner = inner
+      .split(/\r?\n/)
+      .filter(
+        (l) =>
+          l.trim() &&
+          !/^\s*</.test(l) &&
+          !/write_file|```/.test(l) &&
+          !/^(\d+[.)]\s+|[-*•]\s+)/.test(l.trim())
+      )
+      .join('\n')
+      .trim()
+  }
+  if (thinkLooksLikeChecklist(inner)) {
+    const kept = inner
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter(
+        (l) =>
+          l &&
+          !/^(\d+[.)]\s+|[-*•]\s+(\[[ xX]?\]\s+)?|\[\s*[xX ]?\]\s+)/.test(l)
+      )
+      .join(' ')
+      .trim()
+    if (kept.length >= 12 && !isEllipsisOnly(kept)) return kept.slice(0, 6000)
+    return ''
+  }
+  if (!inner || isEllipsisOnly(inner)) return ''
+  return inner.length > 6000 ? inner.slice(0, 6000).trim() : inner
 }
 
 export function stripThinkTags(text: string): string {
@@ -240,24 +345,16 @@ export function stripThinkTags(text: string): string {
 
 /** Live UI think body while tokens stream (do not wait for sanitize — show prose as it arrives). */
 export function formatLiveThinkContent(rawAccum: string): string {
-  let body = extractThinkInner(rawAccum)
-  if (!body) {
-    body = (rawAccum ?? '')
-      .replace(/<\s*\/?\s*(?:think|thinking)\s*>/gi, '')
-      .replace(/<\s*plan\s*>[\s\S]*$/i, '')
-      .trim()
-  }
-  body = body
-    .replace(/<\s*plan\s*>[\s\S]*?(?:<\s*\/\s*plan\s*>|$)/gi, '')
-    .trim()
-  // Drop obvious code lines but keep partial prose visible.
+  let body = liveThinkProse(rawAccum)
+  body = stripCodeLeakFromThink(body)
   if (thinkBodyLooksLikeCodeDump(`<think>${body}</think>`)) {
     body = body
       .split(/\r?\n/)
       .filter(
         (l) =>
           !/^\s*<(!DOCTYPE|html|head|body|style|script|link|meta|section|div|\/)/i.test(l) &&
-          !/write_file|```/.test(l)
+          !/write_file|```/.test(l) &&
+          !/^\s*<\s*\/?\s*plan\b/i.test(l)
       )
       .join('\n')
       .trim()
@@ -265,10 +362,10 @@ export function formatLiveThinkContent(rawAccum: string): string {
   return `<think>\n${body}\n</think>`
 }
 
-/** Wrap clean prose so ThinkThroughBody can fold it. Never wrap code. */
+/** Wrap clean prose so ThinkThroughBody can fold it. Never invent a lone ellipsis. */
 export function wrapThinkForUi(prose: string): string {
-  const clean = sanitizeThinkProse(`<think>${prose}</think>`)
-  return `<think>\n${clean || '…'}\n</think>`
+  const clean = displayThinkProse(`<think>${prose}</think>`) || displayThinkProse(prose)
+  return `<think>\n${clean}\n</think>`
 }
 
 /** HTML/markup that already closes — do not treat as truncated mid-write. */
@@ -340,12 +437,34 @@ export function parseReadFileMeta(content: string): {
   }
 }
 
-/** Parse <plan>…</plan> into Cursor-style todo steps. */
+const LANDING_SECTION_STEPS = [
+  'Каркас HTML + CSS',
+  'Navbar',
+  'Hero',
+  'Features',
+  'How it works',
+  'Social proof',
+  'FAQ',
+  'Footer'
+]
+
+/** Parse <plan>…</plan> or a markdown [Plan] / checklist body into Cursor-style todo steps. */
 export function parsePlanBlock(text: string | null | undefined): AgentTodoStep[] | null {
   const raw = text ?? ''
-  const m = raw.match(/<\s*plan\s*>([\s\S]*?)<\s*\/\s*plan\s*>/i)
-  if (!m) return null
-  const body = m[1] ?? ''
+  let body = ''
+  const xml = raw.match(/<\s*plan\s*>([\s\S]*?)(?:<\s*\/\s*plan\s*>|$)/i)
+  if (xml) {
+    body = xml[1] ?? ''
+  } else {
+    const leak = findPlanLeakIndex(raw)
+    if (leak >= 0) {
+      body = raw.slice(leak).replace(/^[\s\S]*?(?:<\s*plan\b[^>]*>|\[\s*plan\s*\]|#{0,3}\s*plan\s*:?\s*)/i, '')
+    } else if (/^[\s]*[-*•\d]/.test(raw.trim()) && (raw.match(/^\s*[-*•\d]/gm) ?? []).length >= 3) {
+      body = raw
+    } else {
+      return null
+    }
+  }
   const steps: AgentTodoStep[] = []
   for (const line of body.split(/\r?\n/)) {
     let t = line.trim()
@@ -357,7 +476,10 @@ export function parsePlanBlock(text: string | null | undefined): AgentTodoStep[]
       .trim()
     if (t.length < 2) continue
     if (/^#{1,6}\s/.test(t)) continue
+    if (/^<\/?\s*plan/i.test(t) || /^\[\s*plan\s*\]/i.test(t)) continue
+    if (isJunkPlanStep(t)) continue
     for (const piece of splitCompoundPlanStep(t)) {
+      if (isJunkPlanStep(piece)) continue
       steps.push({
         id: `s${steps.length + 1}`,
         text: piece.slice(0, 140),
@@ -370,32 +492,35 @@ export function parsePlanBlock(text: string | null | undefined): AgentTodoStep[]
   return steps.slice(0, 10)
 }
 
-const LANDING_SECTION_STEPS = [
-  'Каркас HTML + CSS',
-  'Navbar',
-  'Hero',
-  'Features',
-  'How it works',
-  'Social proof',
-  'FAQ',
-  'Footer'
-]
+/** Fallback plan when the model skips <plan> — still show the UI card. */
+export function defaultLandingPlanSteps(): AgentTodoStep[] {
+  const steps: AgentTodoStep[] = [
+    ...LANDING_SECTION_STEPS,
+    'Открыть index.html в браузере'
+  ].map((text, i) => ({
+    id: `s${i + 1}`,
+    text,
+    status: 'pending' as const
+  }))
+  steps[0]!.status = 'in_progress'
+  return steps
+}
 
 /** Split “все секции (a, b, c)” / “полный лендинг” mega-steps into atomic todos. */
 export function splitCompoundPlanStep(text: string): string[] {
   const t = text.trim()
   const mega =
-    /полный\s+лендинг|весь\s+лендинг|все\s+секц|index\.html\s*[—–-].{30,}|write index\.html.*bootstrap/i.test(
+    /полный\s+лендинг|весь\s+лендинг|все\s+секц|single[- ]?file|index\.html\s*[—–-].{30,}|write index\.html.*bootstrap|написать\s+.*index\.html|создать\s+.*index\.html/i.test(
       t
     )
-  if (mega && /navbar|hero|feature|faq|footer|bootstrap|секц|лендинг/i.test(t)) {
+  if (mega && /navbar|hero|feature|faq|footer|bootstrap|секц|лендинг|landing/i.test(t)) {
     return [...LANDING_SECTION_STEPS]
   }
   if (t.length < 60) return [t]
   const grouped = t.match(/\(([^)]{15,})\)/)
   if (grouped?.[1] && /navbar|hero|feature|faq|footer|how|social|навиг|секц/i.test(grouped[1])) {
     const parts = grouped[1]
-      .split(/\s*,\s*/)
+      .split(/\s*[+,;/]\s*|\s+и\s+/i)
       .map((x) => x.trim())
       .filter((x) => x.length >= 2)
     if (parts.length >= 3) {
@@ -413,18 +538,255 @@ export function splitCompoundPlanStep(text: string): string[] {
   return [t]
 }
 
-export function stripPlanBlock(text: string): string {
-  return text
-    .replace(/<\s*plan\s*>[\s\S]*?<\s*\/\s*plan\s*>/gi, '')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim()
+/** Index where a plan section starts (XML <plan> or markdown [Plan] / Plan:). */
+export function findPlanLeakIndex(text: string): number {
+  const s = text ?? ''
+  const patterns = [
+    /<\s*plan\b/i,
+    /\[\s*plan\s*\]/i,
+    /\*{0,2}\[\s*plan\s*\]\*{0,2}/i,
+    /(?:^|\n)\s*#{0,3}\s*plan\s*:?\s*(?:\n|$)/i
+  ]
+  let best = -1
+  for (const re of patterns) {
+    const m = s.search(re)
+    if (m >= 0 && (best < 0 || m < best)) best = m
+  }
+  return best
 }
 
-/** Advance one plan step after a successful mutating / shell tool. */
+/** Strip complete or partial plan markup from think prose. */
+export function stripPlanLeakFromThink(text: string): string {
+  let s = text ?? ''
+  const planAt = findPlanLeakIndex(s)
+  if (planAt >= 0) s = s.slice(0, planAt)
+  s = s
+    .replace(/<\s*\/?\s*plan\b[^>]*>?/gi, '')
+    .replace(/\[\s*plan\s*\]/gi, '')
+    .replace(/<[^>]*$/g, '')
+    .replace(/^\s*>+\s*/g, '')
+  return s.replace(/\n{3,}/g, '\n\n').trim()
+}
+
+/**
+ * Live think text from a raw token buffer. Does not require <think> tags.
+ * Cuts at <plan / [Plan], strips tag crumbs, keeps prose as it arrives.
+ */
+export function liveThinkProse(rawAccum: string): string {
+  let s = rawAccum ?? ''
+  const planAt = findPlanLeakIndex(s)
+  if (planAt >= 0) s = s.slice(0, planAt)
+  s = s.replace(/<\s*\/?\s*(?:think|thinking)\s*>/gi, '')
+  s = stripPlanLeakFromThink(s)
+  s = stripCodeLeakFromThink(s)
+  if (isEllipsisOnly(s) || /^<?\s*plan\b/i.test(s) || /^\[\s*plan\s*\]/i.test(s)) return ''
+  return s
+}
+
+export function stripPlanBlock(text: string): string {
+  return stripPlanLeakFromThink(
+    text
+      .replace(/<\s*plan\s*>[\s\S]*?<\s*\/\s*plan\s*>/gi, '')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim()
+  )
+}
+
+/** Vague trailing plan lines the model likes to add — drop them. */
+export function isFluffPlanStep(text: string): boolean {
+  const t = text.trim()
+  if (!t) return true
+  return (
+    /при\s+необходимост|по\s+необходимости|если\s+нужно|при\s+нужде/i.test(t) ||
+    /отредактировать\s+при|подправить\s+при|доработать\s+при/i.test(t) ||
+    /edit\s+if\s+necessary|if\s+necessary|as\s+needed|optional\s+(edit|polish|tweak)/i.test(t) ||
+    /polish\s+if|tweaks?\s+if\s+needed|adjust\s+if\s+needed/i.test(t) ||
+    /^(edit|fix|polish|review|проверить|поправить)\.?$/i.test(t)
+  )
+}
+
+/**
+ * Verify/summary plan rows are NOT real tool work — they blocked Start-Process forever
+ * ("Подтвердить отсутствие ошибок", "Дать краткую сводку…").
+ */
+export function isMetaOrSummaryPlanStep(text: string): boolean {
+  const t = text.trim()
+  if (!t) return true
+  if (isBrowserPlanStep(t)) return false
+  return (
+    /сводк|summary|заключен|отчёт|отчет|report\s+completion/i.test(t) ||
+    /подтвердить|валидац|отсутствие\s+ошибок|корректность\s+отображ/i.test(t) ||
+    /проверк\w*\s+(отсутств|ошибок|корректн|отображ|вёрст|верст|html)/i.test(t) ||
+    /give\s+(a\s+)?brief|краткую\s+сводк|пользователю\s+на\s+(русск|english)/i.test(t) ||
+    /^(verify|validate|check|done|finish|summarize|report)\b/i.test(t) ||
+    /напиши\s+(кратк|итог|заключен)|write\s+(a\s+)?(short\s+)?(summary|closing)/i.test(t)
+  )
+}
+
+/** Ellipsis / code / HTML crumbs that must never become plan rows. */
+export function isJunkPlanStep(text: string): boolean {
+  const t = text.trim()
+  if (!t || isEllipsisOnly(t)) return true
+  if (isFluffPlanStep(t)) return true
+  if (isMetaOrSummaryPlanStep(t)) return true
+  if (/^```/.test(t) || /```/.test(t)) return true
+  if (/^</.test(t)) return true
+  if (/<!DOCTYPE|<html[\s>]|<style[\s>]|<script[\s>]|<head[\s>]|<body[\s>]/i.test(t)) return true
+  if (/^[{[]/.test(t) && t.length < 48) return true
+  if (/^(write_file|call:|tool_call|function\s*call)/i.test(t)) return true
+  if (/^(создаю|пишу|writing|creating)\s+index\.html/i.test(t) && t.length < 80) return true
+  return false
+}
+
+export type AdvanceTodoContext = {
+  content?: string
+  command?: string
+  path?: string
+}
+
+const PLAN_CONTENT_RULES: { step: RegExp; hay: RegExp }[] = [
+  { step: /каркас|html\s*\+|bootstrap|\bcss\b/i, hay: /<!DOCTYPE\s+html|<html[\s>]/i },
+  { step: /navbar|навиг|шапк/i, hay: /<nav\b|id=["']navbar|class=["'][^"']*navbar/i },
+  { step: /hero|главн\w*\s+экран|jumbotron/i, hay: /id=["']hero\b|class=["'][^"']*hero|#hero\b/i },
+  { step: /feature|возможн|преимущ/i, hay: /id=["']features?\b|feature-card|features/i },
+  { step: /how|как\s*работа/i, hay: /how-it-works|howitworks|id=["']how/i },
+  { step: /trust|social|отзыв|social\s*proof|доказат/i, hay: /id=["']trust|testimonial|social-proof|\btrust\b/i },
+  { step: /faq|вопрос/i, hay: /id=["']faq\b|accordion|\bfaq\b/i },
+  { step: /footer|подвал/i, hay: /<footer\b|id=["']footer/i }
+]
+
+export function isBrowserPlanStep(text: string): boolean {
+  return /браузер|browser|открыть\s+index|open\s+in\s+browser|visual|проверк\w*\s+в[её]рст/i.test(
+    text
+  )
+}
+
+/** "Write the whole landing / single-file index.html with all sections" mega-step. */
+export function isLandingWritePlanStep(text: string): boolean {
+  const t = text.trim()
+  if (isBrowserPlanStep(t)) return false
+  return (
+    /single[- ]?file|index\.html|полный\s+лендинг|весь\s+лендинг|все\s+секц|написать\s+.*html|write\s+.*html|создать\s+.*html/i.test(
+      t
+    ) && /navbar|hero|feature|faq|footer|bootstrap|лендинг|landing|секц/i.test(t)
+  )
+}
+
+/** Remaining plan steps that are real work — not browser open / verify / summary fluff. */
+export function pendingPlanWork(steps: AgentTodoStep[]): AgentTodoStep[] {
+  return steps.filter(
+    (s) =>
+      s.status !== 'done' &&
+      !isBrowserPlanStep(s.text) &&
+      !isMetaOrSummaryPlanStep(s.text)
+  )
+}
+
+/** Mark plan steps done when HTML/content clearly contains that section. */
+export function markTodosMatchingContent(
+  steps: AgentTodoStep[],
+  content: string
+): number {
+  if (!content || steps.length === 0) return 0
+  let n = 0
+  for (const s of steps) {
+    if (s.status === 'done') continue
+    if (isBrowserPlanStep(s.text) && !/navbar|hero|faq|footer|feature/i.test(s.text)) {
+      continue
+    }
+    let hit = false
+    for (const r of PLAN_CONTENT_RULES) {
+      if (r.step.test(s.text) && r.hay.test(content)) {
+        hit = true
+        break
+      }
+    }
+    if (!hit) {
+      const sec = s.text.match(/секц\w*\s*:\s*(.+)/i)
+      const key = (sec?.[1] ?? '').trim().toLowerCase().replace(/\s+/g, '-')
+      if (key.length >= 3) {
+        const esc = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+        if (new RegExp(esc, 'i').test(content)) hit = true
+      }
+    }
+    if (hit) {
+      s.status = 'done'
+      n++
+    }
+  }
+  return n
+}
+
+/**
+ * After a structurally complete HTML write: close every non-browser work step
+ * that this file already satisfies (sections + mega "write whole landing" todos).
+ * Incomplete HTML must NOT close the whole plan (that unlocked Start-Process too early).
+ */
+export function markTodosAfterCompleteHtmlWrite(
+  steps: AgentTodoStep[],
+  content: string
+): number {
+  if (!content || steps.length === 0) return 0
+  // Partial writes may contain <html> + a few section ids — only soft-match sections.
+  if (!contentLooksStructurallyComplete(content)) {
+    return markTodosMatchingContent(steps, content)
+  }
+  let n = markTodosMatchingContent(steps, content)
+  for (const s of steps) {
+    if (s.status === 'done') continue
+    if (isBrowserPlanStep(s.text)) continue
+    if (isMetaOrSummaryPlanStep(s.text)) {
+      s.status = 'done'
+      n++
+      continue
+    }
+    if (isLandingWritePlanStep(s.text)) {
+      s.status = 'done'
+      n++
+      continue
+    }
+    // Any remaining section-ish / каркас step once the page exists.
+    if (
+      /каркас|html\s*\+|bootstrap|секц|navbar|hero|feature|how|trust|social|faq|footer|тёмн|dark\s*theme|svg|иллюстрац/i.test(
+        s.text
+      )
+    ) {
+      s.status = 'done'
+      n++
+    }
+  }
+  return n
+}
+
+export function rebalanceTodoStatuses(steps: AgentTodoStep[]): AgentTodoStep[] {
+  if (!steps.some((s) => s.status === 'in_progress')) {
+    const p = steps.find((s) => s.status === 'pending')
+    if (p) p.status = 'in_progress'
+  }
+  // If current in_progress was marked done, promote next pending.
+  const inProg = steps.find((s) => s.status === 'in_progress')
+  if (!inProg) {
+    const p = steps.find((s) => s.status === 'pending')
+    if (p) p.status = 'in_progress'
+  }
+  return steps
+}
+
+export function reconcileTodosWithContent(
+  steps: AgentTodoStep[],
+  content: string
+): AgentTodoStep[] {
+  const next = steps.map((s) => ({ ...s }))
+  markTodosAfterCompleteHtmlWrite(next, content)
+  return rebalanceTodoStatuses(next)
+}
+
+/** Advance plan after a successful mutating / shell tool (content-aware for HTML writes). */
 export function advanceTodosOnTool(
   steps: AgentTodoStep[],
   name: string,
-  ok: boolean
+  ok: boolean,
+  ctx?: AdvanceTodoContext
 ): AgentTodoStep[] {
   if (!ok || steps.length === 0) return steps
   if (
@@ -435,6 +797,33 @@ export function advanceTodosOnTool(
     return steps
   }
   const next = steps.map((s) => ({ ...s }))
+
+  if (
+    (name === 'write_file' || name === 'apply_patch' || name === 'apply_diff') &&
+    (ctx?.content?.length ?? 0) > 80
+  ) {
+    const body = ctx!.content!
+    const marked = contentLooksStructurallyComplete(body)
+      ? markTodosAfterCompleteHtmlWrite(next, body)
+      : markTodosMatchingContent(next, body)
+    if (marked > 0) return rebalanceTodoStatuses(next)
+  }
+
+  if (name === 'execute_terminal_command') {
+    const cmd = ctx?.command || ctx?.content || ''
+    if (looksLikeOpenHtmlCommand(cmd)) {
+      let marked = 0
+      for (const s of next) {
+        if (s.status === 'done') continue
+        if (isBrowserPlanStep(s.text)) {
+          s.status = 'done'
+          marked++
+        }
+      }
+      if (marked > 0) return rebalanceTodoStatuses(next)
+    }
+  }
+
   let cur = next.find((s) => s.status === 'in_progress')
   if (!cur) {
     cur = next.find((s) => s.status === 'pending')
@@ -445,6 +834,10 @@ export function advanceTodosOnTool(
   const nxt = next.find((s) => s.status === 'pending')
   if (nxt) nxt.status = 'in_progress'
   return next
+}
+
+export function todosAllDone(steps: AgentTodoStep[]): boolean {
+  return steps.length > 0 && steps.every((s) => s.status === 'done')
 }
 
 /** Model-facing checklist block. */
@@ -758,7 +1151,7 @@ export function parseThinkBlocks(content: string): ThinkBlockPart[] {
       if (text.trim()) parts.push({ kind: 'text', text })
     }
     const think = (m[2] ?? '').trim()
-    if (think) parts.push({ kind: 'think', text: think })
+    parts.push({ kind: 'think', text: think })
     last = m.index + m[0].length
   }
   if (last < content.length) {
@@ -766,7 +1159,7 @@ export function parseThinkBlocks(content: string): ThinkBlockPart[] {
     const open = rest.match(/^\s*<\s*(think|thinking)\s*>([\s\S]*)$/i)
     if (open) {
       const think = (open[2] ?? '').trim()
-      if (think) parts.push({ kind: 'think', text: think })
+      parts.push({ kind: 'think', text: think })
     } else if (rest.trim() || parts.length === 0) {
       parts.push({ kind: 'text', text: rest })
     }
@@ -910,6 +1303,13 @@ export function fingerprintToolCall(
               : ''
   const normPath = path.replace(/\\/g, '/')
   if (name === 'create_directory') return `${name}|${normPath}`
+  // Any Start-Process / open index.html variant is the same action (cwd/path must not bypass dedupe).
+  if (
+    name === 'execute_terminal_command' &&
+    looksLikeOpenHtmlCommand(content)
+  ) {
+    return `${name}|open_html_preview`
+  }
   if (content.length > 0) {
     return `${name}|${normPath}|${content.length}|${content.slice(0, 48)}|${content.slice(-48)}`
   }

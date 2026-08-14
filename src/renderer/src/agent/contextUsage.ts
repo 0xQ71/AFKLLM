@@ -34,7 +34,7 @@ export interface ContextUsageEstimate {
   limit: number | null
   pct: number
   categories: ContextCategory[]
-  /** True when used came from server prompt_tokens */
+  /** True when used is anchored to server prompt_tokens (may still grow live). */
   measured: boolean
 }
 
@@ -58,6 +58,11 @@ export interface EstimateContextUsageInput {
   messages: ChatMessage[]
   ctxLimit: number | null
   promptTokens?: number | null
+  /**
+   * Local token sum (same heuristic as categories) at the moment `promptTokens`
+   * was last measured. Enables live gauge growth: used ≈ localNow * (prompt / anchor).
+   */
+  anchorLocalSum?: number | null
   agentAutoApprove?: boolean
   agentThinkThrough?: boolean
   agentImageGenEnabled?: boolean
@@ -67,24 +72,11 @@ export interface EstimateContextUsageInput {
   mcpToolsJson?: string
 }
 
-/**
- * Category shares scaled to prompt_tokens when available.
- * Gauge `used` is ONLY server prompt_tokens — never local char estimate
- * (~4–5k from tools/rules alone looks like a fake spike).
- */
-export function estimateContextUsage(input: EstimateContextUsageInput): ContextUsageEstimate {
-  const limit = input.ctxLimit != null && input.ctxLimit > 0 ? input.ctxLimit : null
-
-  const measured =
-    input.promptTokens != null && Number.isFinite(input.promptTokens) && input.promptTokens > 0
-
-  // No measurement yet — empty, not an inflated local guess
-  if (!measured) {
-    return { used: 0, limit, pct: 0, categories: [], measured: false }
-  }
-
-  const used = Math.round(input.promptTokens!)
-
+function buildLocalParts(input: EstimateContextUsageInput): {
+  raw: Array<{ id: ContextCategoryId; tokens: number }>
+  sum: number
+  hasConversation: boolean
+} {
   const systemCore = input.planMode
     ? SYSTEM_PLAN
     : input.agentAutoApprove
@@ -114,9 +106,11 @@ export function estimateContextUsage(input: EstimateContextUsageInput): ContextU
 
   let summaryText = ''
   let conversationText = ''
+  let hasConversation = false
   for (const m of input.messages) {
     if (!m || m.id === 'welcome') continue
     const chunk = `${m.content ?? ''}\n${m.codePreview ?? ''}`
+    if (chunk.trim()) hasConversation = true
     if (m.id === THREAD_SUMMARY_MSG_ID) {
       summaryText += chunk
       continue
@@ -134,19 +128,65 @@ export function estimateContextUsage(input: EstimateContextUsageInput): ContextU
     { id: 'summary', tokens: estimateTokens(summaryText) },
     { id: 'conversation', tokens: estimateTokens(conversationText) }
   ]
+  const sum = raw.reduce((a, c) => a + c.tokens, 0)
+  return { raw, sum, hasConversation }
+}
 
-  const estimatedSum = raw.reduce((a, c) => a + c.tokens, 0)
-  const scale = estimatedSum > 0 ? used / estimatedSum : 1
+/** Local heuristic context size (system + tools + rules + messages). */
+export function estimateLocalContextSum(input: EstimateContextUsageInput): number {
+  return buildLocalParts(input).sum
+}
+
+/**
+ * Category shares for the context gauge.
+ * - Before any server measure: local estimate while the thread has content (live).
+ * - With prompt_tokens: anchor to that measure, then grow live as messages stream
+ *   via used = max(prompt, round(localNow * prompt / anchorLocal)).
+ */
+export function estimateContextUsage(input: EstimateContextUsageInput): ContextUsageEstimate {
+  const limit = input.ctxLimit != null && input.ctxLimit > 0 ? input.ctxLimit : null
+  const { raw, sum: localSum, hasConversation } = buildLocalParts(input)
+
+  const measured =
+    input.promptTokens != null && Number.isFinite(input.promptTokens) && input.promptTokens > 0
+
+  if (!measured && !hasConversation) {
+    return { used: 0, limit, pct: 0, categories: [], measured: false }
+  }
+
+  let used: number
+  if (measured) {
+    const prompt = Math.round(input.promptTokens!)
+    const anchor =
+      input.anchorLocalSum != null &&
+      Number.isFinite(input.anchorLocalSum) &&
+      input.anchorLocalSum > 0
+        ? input.anchorLocalSum
+        : localSum > 0
+          ? localSum
+          : prompt
+    const live = localSum > 0 ? Math.round(localSum * (prompt / anchor)) : prompt
+    used = Math.max(prompt, live)
+  } else {
+    // Before server measure: grow with the thread only (tools/rules alone look like a fake spike).
+    used =
+      (raw.find((c) => c.id === 'conversation')?.tokens ?? 0) +
+      (raw.find((c) => c.id === 'summary')?.tokens ?? 0)
+  }
+
+  const scale = localSum > 0 ? used / localSum : 1
   const categories: ContextCategory[] = raw
+    .filter((c) => measured || c.id === 'conversation' || c.id === 'summary')
     .map((c) => ({
       id: c.id,
       labelKey: `context.cat.${c.id}` as ContextCategory['labelKey'],
-      tokens: Math.max(0, Math.round(c.tokens * scale)),
+      tokens: measured
+        ? Math.max(0, Math.round(c.tokens * scale))
+        : Math.max(0, c.tokens),
       color: COLORS[c.id]
     }))
     .filter((c) => c.tokens > 0)
 
-  // Fix rounding so category sum matches `used`
   const catSum = categories.reduce((a, c) => a + c.tokens, 0)
   if (categories.length > 0 && catSum !== used) {
     const last = categories[categories.length - 1]!
@@ -156,7 +196,7 @@ export function estimateContextUsage(input: EstimateContextUsageInput): ContextU
   const pct =
     limit != null && limit > 0 ? Math.min(100, Math.round((used / limit) * 100)) : 0
 
-  return { used, limit, pct, categories, measured: true }
+  return { used, limit, pct, categories, measured }
 }
 
 export function formatTokenCount(n: number): string {
