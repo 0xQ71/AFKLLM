@@ -654,9 +654,9 @@ const en = {
   'status.detail.imageSecondsLeft': '{n}s left',
   'status.detail.imageMinutesLeft': '{m}m {s}s left',
 
-  'chat.thought.thinking': 'Thinking',
-  'chat.thought.briefly': 'Thought briefly',
-  'chat.thought.forDuration': 'Thought for {duration}',
+  'chat.thought.thinking': 'Thinking:',
+  'chat.thought.briefly': 'Thought:',
+  'chat.thought.forDuration': 'Thought:',
   'chat.newAgentTitle': 'New agent',
 
   'activity.verb.reading': 'Reading',
@@ -1371,9 +1371,9 @@ const ru: Record<MessageKey, string> = {
   'status.detail.imageSecondsLeft': 'осталось {n} с',
   'status.detail.imageMinutesLeft': 'осталось {m}м {s}с',
 
-  'chat.thought.thinking': 'Думаю',
-  'chat.thought.briefly': 'Кратко подумал',
-  'chat.thought.forDuration': 'Думал {duration}',
+  'chat.thought.thinking': 'Думаю:',
+  'chat.thought.briefly': 'Думал:',
+  'chat.thought.forDuration': 'Думал:',
   'chat.newAgentTitle': 'Новый агент',
 
   'activity.verb.reading': 'Читаю',

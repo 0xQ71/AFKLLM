@@ -173,6 +173,173 @@ export function hasThinkBlock(text: string | null | undefined): boolean {
   return /<\s*(?:think|thinking)\s*>/i.test(text ?? '')
 }
 
+/** Inner text of the first think/thinking block (unclosed counts). */
+export function extractThinkInner(text: string | null | undefined): string {
+  const raw = text ?? ''
+  const closed = raw.match(
+    /<\s*(?:think|thinking)\s*>([\s\S]*?)<\s*\/\s*(?:think|thinking)\s*>/i
+  )
+  if (closed) return (closed[1] ?? '').trim()
+  const open = raw.match(/<\s*(?:think|thinking)\s*>([\s\S]*)$/i)
+  return (open?.[1] ?? '').trim()
+}
+
+/** Think should be short reasoning — not HTML / tool dumps. */
+export function thinkBodyLooksLikeCodeDump(text: string | null | undefined): boolean {
+  const inner = extractThinkInner(text) || (text ?? '')
+  if (
+    /<!DOCTYPE\s+html|<html[\s>]|<write_file\b|call:write_file|<\/style>|bootstrap\.min|<link\s+rel=/i.test(
+      inner
+    )
+  ) {
+    return true
+  }
+  if (inner.length > 900 && /```|<style[\s>]|<script[\s>]/i.test(inner)) return true
+  return false
+}
+
+/** True if text is mostly a numbered / checkbox plan, not prose reasoning. */
+export function thinkLooksLikeChecklist(text: string | null | undefined): boolean {
+  const t = (text ?? '').trim()
+  if (!t) return false
+  const lines = t
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean)
+  if (lines.length === 0) return false
+  const checklistish = lines.filter((l) =>
+    /^(\d+[.)]\s+|[-*•]\s+(\[[ xX]?\]\s+)?|\[\s*[xX ]?\]\s+)/.test(l)
+  ).length
+  return checklistish >= 2 && checklistish / lines.length >= 0.5
+}
+
+/** Prose-only think body for the UI fold. Empty if code dump or a plan checklist. */
+export function sanitizeThinkProse(text: string | null | undefined): string {
+  let inner = extractThinkInner(text)
+  // Never fall back to the whole prelude (that pulled <plan> / 1. 2. 3. into «Думал»).
+  if (!inner) return ''
+  inner = inner.replace(/<\s*plan\s*>[\s\S]*?<\s*\/\s*plan\s*>/gi, '').trim()
+  if (!inner || thinkBodyLooksLikeCodeDump(`<think>${inner}</think>`)) return ''
+  if (thinkLooksLikeChecklist(inner)) return ''
+  // Drop fenced code / obvious markup leftovers.
+  inner = inner
+    .replace(/```[\s\S]*?```/g, '')
+    .replace(/<write_file[\s\S]*$/i, '')
+    .trim()
+  if (thinkLooksLikeChecklist(inner)) return ''
+  if (inner.length > 800) inner = inner.slice(0, 800).trim()
+  return inner
+}
+
+export function stripThinkTags(text: string): string {
+  return text
+    .replace(/<\s*\/?\s*(?:think|thinking)\s*>/gi, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+}
+
+/** Live UI think body while tokens stream (do not wait for sanitize — show prose as it arrives). */
+export function formatLiveThinkContent(rawAccum: string): string {
+  let body = extractThinkInner(rawAccum)
+  if (!body) {
+    body = (rawAccum ?? '')
+      .replace(/<\s*\/?\s*(?:think|thinking)\s*>/gi, '')
+      .replace(/<\s*plan\s*>[\s\S]*$/i, '')
+      .trim()
+  }
+  body = body
+    .replace(/<\s*plan\s*>[\s\S]*?(?:<\s*\/\s*plan\s*>|$)/gi, '')
+    .trim()
+  // Drop obvious code lines but keep partial prose visible.
+  if (thinkBodyLooksLikeCodeDump(`<think>${body}</think>`)) {
+    body = body
+      .split(/\r?\n/)
+      .filter(
+        (l) =>
+          !/^\s*<(!DOCTYPE|html|head|body|style|script|link|meta|section|div|\/)/i.test(l) &&
+          !/write_file|```/.test(l)
+      )
+      .join('\n')
+      .trim()
+  }
+  return `<think>\n${body}\n</think>`
+}
+
+/** Wrap clean prose so ThinkThroughBody can fold it. Never wrap code. */
+export function wrapThinkForUi(prose: string): string {
+  const clean = sanitizeThinkProse(`<think>${prose}</think>`)
+  return `<think>\n${clean || '…'}\n</think>`
+}
+
+/** HTML/markup that already closes — do not treat as truncated mid-write. */
+export function contentLooksStructurallyComplete(content: string): boolean {
+  const t = content.trim()
+  if (!t) return false
+  if (/<\/html\s*>/i.test(t)) return true
+  if (/<\/body\s*>/i.test(t) && /<\/html\s*>/i.test(t)) return true
+  // Non-HTML: balanced enough closing brace / no open string — leave to other checks
+  return false
+}
+
+/**
+ * Pack read_file for the model: head + tail + metadata.
+ * Never present a head-only slice as if it were EOF (false "file truncated at ~250 lines").
+ */
+export function packReadFileForAgent(
+  raw: string,
+  opts?: { headLines?: number; tailLines?: number; maxChars?: number }
+): string {
+  const headN = opts?.headLines ?? 80
+  const tailN = opts?.tailLines ?? 40
+  const maxChars = opts?.maxChars ?? 10_000
+  const lines = raw.split(/\r?\n/)
+  const totalLines = lines.length
+  const bytes = raw.length
+  const complete = contentLooksStructurallyComplete(raw)
+  const status = complete ? 'FILE_COMPLETE' : 'FILE_MAYBE_INCOMPLETE'
+
+  if (bytes <= maxChars && totalLines <= headN + tailN) {
+    return (
+      `[read_file meta] total_lines=${totalLines} bytes=${bytes} truncated=false ${status}\n` +
+      `--- full file ---\n` +
+      raw
+    )
+  }
+
+  const head = lines.slice(0, headN).join('\n')
+  const tailStart = Math.max(headN, totalLines - tailN)
+  const tail = lines.slice(tailStart).join('\n')
+  const omitted = Math.max(0, tailStart - headN)
+  let body =
+    `[read_file meta] total_lines=${totalLines} bytes=${bytes} truncated=true ${status}\n` +
+    `NOTE: Middle omitted (${omitted} lines). Tail is shown — closing tags may be here. Do NOT rewrite the file just because the head ends mid-section.\n` +
+    `--- lines 1-${Math.min(headN, totalLines)} ---\n` +
+    head
+  if (tailStart < totalLines) {
+    body +=
+      `\n--- lines ${tailStart + 1}-${totalLines} (tail) ---\n` + tail
+  }
+  if (body.length > maxChars + 2000) {
+    return body.slice(0, maxChars) + '\n…[pack truncated for context]'
+  }
+  return body
+}
+
+/** Parse total_lines from packed read_file meta for UI activity labels. */
+export function parseReadFileMeta(content: string): {
+  totalLines?: number
+  truncated?: boolean
+} {
+  const m = content.match(
+    /\[read_file meta\]\s+total_lines=(\d+)\s+bytes=\d+\s+truncated=(true|false)/i
+  )
+  if (!m) return {}
+  return {
+    totalLines: Number(m[1]),
+    truncated: m[2]!.toLowerCase() === 'true'
+  }
+}
+
 /** Parse <plan>…</plan> into Cursor-style todo steps. */
 export function parsePlanBlock(text: string | null | undefined): AgentTodoStep[] | null {
   const raw = text ?? ''
@@ -190,13 +357,60 @@ export function parsePlanBlock(text: string | null | undefined): AgentTodoStep[]
       .trim()
     if (t.length < 2) continue
     if (/^#{1,6}\s/.test(t)) continue
-    steps.push({
-      id: `s${steps.length + 1}`,
-      text: t.slice(0, 200),
-      status: steps.length === 0 ? 'in_progress' : 'pending'
-    })
+    for (const piece of splitCompoundPlanStep(t)) {
+      steps.push({
+        id: `s${steps.length + 1}`,
+        text: piece.slice(0, 140),
+        status: 'pending'
+      })
+    }
   }
-  return steps.length > 0 ? steps : null
+  if (steps.length === 0) return null
+  steps[0]!.status = 'in_progress'
+  return steps.slice(0, 10)
+}
+
+const LANDING_SECTION_STEPS = [
+  'Каркас HTML + CSS',
+  'Navbar',
+  'Hero',
+  'Features',
+  'How it works',
+  'Social proof',
+  'FAQ',
+  'Footer'
+]
+
+/** Split “все секции (a, b, c)” / “полный лендинг” mega-steps into atomic todos. */
+export function splitCompoundPlanStep(text: string): string[] {
+  const t = text.trim()
+  const mega =
+    /полный\s+лендинг|весь\s+лендинг|все\s+секц|index\.html\s*[—–-].{30,}|write index\.html.*bootstrap/i.test(
+      t
+    )
+  if (mega && /navbar|hero|feature|faq|footer|bootstrap|секц|лендинг/i.test(t)) {
+    return [...LANDING_SECTION_STEPS]
+  }
+  if (t.length < 60) return [t]
+  const grouped = t.match(/\(([^)]{15,})\)/)
+  if (grouped?.[1] && /navbar|hero|feature|faq|footer|how|social|навиг|секц/i.test(grouped[1])) {
+    const parts = grouped[1]
+      .split(/\s*,\s*/)
+      .map((x) => x.trim())
+      .filter((x) => x.length >= 2)
+    if (parts.length >= 3) {
+      return parts.map((p) => (/^секц/i.test(p) ? p : `Секция: ${p}`))
+    }
+  }
+  if (/[,;].*(?:navbar|hero|features|faq|footer)/i.test(t) && (t.match(/,/g) ?? []).length >= 2) {
+    const afterColon = t.split(/:\s*/).slice(1).join(': ').trim() || t
+    const parts = afterColon
+      .split(/\s*,\s*/)
+      .map((x) => x.replace(/\s+и\s+/gi, ' ').trim())
+      .filter((x) => x.length >= 3 && x.length < 80)
+    if (parts.length >= 3) return parts
+  }
+  return [t]
 }
 
 export function stripPlanBlock(text: string): string {

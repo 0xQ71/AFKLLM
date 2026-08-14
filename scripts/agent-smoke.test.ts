@@ -28,6 +28,14 @@ import {
   advanceTodosOnTool,
   formatTodoUiContent,
   parseTodoUiContent,
+  thinkBodyLooksLikeCodeDump,
+  thinkLooksLikeChecklist,
+  sanitizeThinkProse,
+  wrapThinkForUi,
+  formatLiveThinkContent,
+  packReadFileForAgent,
+  contentLooksStructurallyComplete,
+  parseReadFileMeta,
   type ApiMessage
 } from '../src/renderer/src/agent/agentPure'
 import { AgentToolRegistry } from '../src/main/agent/AgentToolRegistry'
@@ -548,6 +556,66 @@ describe('agent todo plan', () => {
       'Verify in browser'
     ])
     assert.equal(stripPlanBlock('hi\n<plan>\n- a\n</plan>\nbye'), 'hi\n\nbye')
+  })
+
+  it('splits compound landing steps and rejects code dumps in think', () => {
+    const steps = parsePlanBlock(
+      '<plan>\n- [ ] Написать index.html со всеми секциями (navbar, hero, features, how it works, social proof, FAQ, footer)\n- [ ] Открыть в браузере\n</plan>'
+    )
+    assert.ok((steps?.length ?? 0) >= 5)
+    assert.equal(
+      thinkBodyLooksLikeCodeDump(
+        '<think>\n<!DOCTYPE html><html><style>:root{}</style>\n</think>'
+      ),
+      true
+    )
+    assert.equal(thinkBodyLooksLikeCodeDump('<think>\nGoal: landing. Next: write_file.\n</think>'), false)
+    const mega = parsePlanBlock(
+      '<plan>\n- [ ] Write index.html — полный лендинг Northline с Bootstrap 5, встроенным CSS, SVG-иллюстрациями и семантической разметкой.\n- [ ] Открыть в браузере\n</plan>'
+    )
+    assert.ok((mega?.length ?? 0) >= 6)
+    assert.equal(sanitizeThinkProse('<think>\n<!DOCTYPE html><html></html>\n</think>'), '')
+    assert.match(wrapThinkForUi('<!DOCTYPE html>'), /…/)
+    assert.match(wrapThinkForUi('Цель: лендинг. Дальше write_file.'), /Цель: лендинг/)
+    assert.equal(
+      sanitizeThinkProse(
+        '<think>\n1. Write index.html\n2. Open in browser\n3. Summarize\n</think>'
+      ),
+      ''
+    )
+    assert.equal(thinkLooksLikeChecklist('1. Write\n2. Open\n3. Summarize'), true)
+  })
+
+  it('streams live think prose without waiting for sanitize', () => {
+    const live = formatLiveThinkContent('<think>\nЦель: лендинг Northline без AI-градиентов. Дальше разложу секции')
+    assert.match(live, /Цель: лендинг Northline/)
+    assert.match(live, /<\s*think\s*>/i)
+    // Partial stream must stay visible (sanitize would often empty incomplete dumps)
+    const partial = formatLiveThinkContent('Сначала пойму аудиторию B2B, потом hero')
+    assert.match(partial, /аудиторию B2B/)
+  })
+})
+
+describe('packReadFileForAgent', () => {
+  it('includes head, tail, total_lines and FILE_COMPLETE for long HTML', () => {
+    const lines = Array.from({ length: 400 }, (_, i) => {
+      if (i === 0) return '<!DOCTYPE html><html><body>'
+      if (i === 398) return '</body>'
+      if (i === 399) return '</html>'
+      return `<!-- section line ${i + 1} -->`
+    })
+    const raw = lines.join('\n')
+    const packed = packReadFileForAgent(raw, { headLines: 80, tailLines: 40, maxChars: 6000 })
+    assert.match(packed, /total_lines=400/)
+    assert.match(packed, /truncated=true/)
+    assert.match(packed, /FILE_COMPLETE/)
+    assert.match(packed, /lines 1-80/)
+    assert.match(packed, /<\/html>/)
+    assert.match(packed, /Do NOT rewrite/)
+    const meta = parseReadFileMeta(packed)
+    assert.equal(meta.totalLines, 400)
+    assert.equal(meta.truncated, true)
+    assert.equal(contentLooksStructurallyComplete(raw), true)
   })
 })
 

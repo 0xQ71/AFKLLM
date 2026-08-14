@@ -1,4 +1,6 @@
-﻿export type ComposerActivityKind =
+﻿import { parseReadFileMeta } from './agentPure'
+
+export type ComposerActivityKind =
   | 'read'
   | 'search'
   | 'explore'
@@ -134,10 +136,22 @@ export function buildActivityFromTool(params: {
   switch (params.name) {
     case 'read_file': {
       if (!streaming && params.resultContent && lineStart == null) {
-        const n = countLines(params.resultContent)
-        if (n > 0) {
+        const meta = parseReadFileMeta(params.resultContent)
+        const range = params.resultContent.match(
+          /showing lines\s+(\d+)\s*[–-]\s*(\d+)\s+of\s+(\d+)/i
+        )
+        if (range) {
+          lineStart = Number(range[1])
+          lineEnd = Number(range[2])
+        } else if (meta.totalLines != null) {
           lineStart = 1
-          lineEnd = n
+          lineEnd = meta.totalLines
+        } else {
+          const n = countLines(params.resultContent)
+          if (n > 0) {
+            lineStart = 1
+            lineEnd = n
+          }
         }
       } else if (
         lineStart != null &&

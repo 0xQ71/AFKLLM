@@ -26,13 +26,12 @@ import {
   AGENT_TODO_MSG_ID,
   FILES_CHANGED_TOOL,
   parseThinkBlocks,
-  promoteThinkOnlyAnswer,
   runAgentTurn,
   stripPlanBlock,
   stripPlanStatus,
   type TurnFileChange
 } from '../agent/runAgentTurn'
-import { parseChecklistUiContent, parseTodoUiContent } from '../agent/agentPure'
+import { parseChecklistUiContent, parseTodoUiContent, formatLiveThinkContent, extractThinkInner, sanitizeThinkProse, stripThinkTags } from '../agent/agentPure'
 import type { QueueManager } from '../llm/queueManager'
 import type { ChatSession, PersistedChatMessage } from '../../../shared/chats'
 import {
@@ -327,6 +326,8 @@ export function ChatPanel({
   const bottomRef = useRef<HTMLDivElement>(null)
   const feedScrollRef = useRef<HTMLDivElement>(null)
   const stickToBottomRef = useRef(true)
+  const ignoreFeedScrollRef = useRef(false)
+  const codeStickRef = useRef(new Map<string, boolean>())
   const codeEndRefs = useRef<Map<string, HTMLPreElement>>(new Map())
   const abortRef = useRef<AbortController | null>(null)
   const persistTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -460,29 +461,49 @@ export function ChatPanel({
   }, [workspaceKey])
 
   useEffect(() => {
-    if (!stickToBottomRef.current) return
+    if (!stickToBottomRef.current) {
+      // Still pin streaming code previews only if that preview itself is sticky.
+      for (const m of messages) {
+        if (!(m.streaming && m.codePreview)) continue
+        if (codeStickRef.current.get(m.id) === false) continue
+        const codeEl = codeEndRefs.current.get(m.id)
+        if (!codeEl) continue
+        const near =
+          codeEl.scrollHeight - codeEl.scrollTop - codeEl.clientHeight < 48
+        if (!near && codeEl.scrollTop > 0) {
+          codeStickRef.current.set(m.id, false)
+          continue
+        }
+        codeEl.scrollTop = codeEl.scrollHeight
+      }
+      return
+    }
     const el = feedScrollRef.current
     if (el) {
+      ignoreFeedScrollRef.current = true
       el.scrollTop = el.scrollHeight
-    } else {
-      bottomRef.current?.scrollIntoView({ behavior: 'auto', block: 'end' })
+      requestAnimationFrame(() => {
+        ignoreFeedScrollRef.current = false
+      })
     }
     for (const m of messages) {
-      if (m.streaming && m.codePreview) {
-        const codeEl = codeEndRefs.current.get(m.id)
-        if (codeEl) codeEl.scrollTop = codeEl.scrollHeight
-      }
+      if (!(m.streaming && m.codePreview)) continue
+      if (codeStickRef.current.get(m.id) === false) continue
+      const codeEl = codeEndRefs.current.get(m.id)
+      if (codeEl) codeEl.scrollTop = codeEl.scrollHeight
     }
   }, [messages])
 
   const onFeedScroll = (): void => {
+    if (ignoreFeedScrollRef.current) return
     const el = feedScrollRef.current
     if (!el) return
     const dist = el.scrollHeight - el.scrollTop - el.clientHeight
     stickToBottomRef.current = dist < 80
   }
 
-  const onFeedWheel = (e: WheelEvent<HTMLDivElement>): void => {
+  const onFeedWheelCapture = (e: WheelEvent<HTMLDivElement>): void => {
+    // Capture even when the wheel is over nested code previews.
     if (e.deltaY < 0) stickToBottomRef.current = false
     else {
       const el = feedScrollRef.current
@@ -1134,7 +1155,7 @@ export function ChatPanel({
       <div
         ref={feedScrollRef}
         onScroll={onFeedScroll}
-        onWheel={onFeedWheel}
+        onWheelCapture={onFeedWheelCapture}
         className="min-h-0 flex-1 space-y-0.5 overflow-auto px-4 py-3"
       >
         {!sessionId ? (
@@ -1376,8 +1397,26 @@ export function ChatPanel({
                 </summary>
                 <pre
                   ref={(el) => {
-                    if (el) codeEndRefs.current.set(m.id, el)
-                    else codeEndRefs.current.delete(m.id)
+                    if (el) {
+                      codeEndRefs.current.set(m.id, el)
+                      if (!codeStickRef.current.has(m.id)) codeStickRef.current.set(m.id, true)
+                    } else {
+                      codeEndRefs.current.delete(m.id)
+                      codeStickRef.current.delete(m.id)
+                    }
+                  }}
+                  onScroll={(e) => {
+                    const el = e.currentTarget
+                    const dist = el.scrollHeight - el.scrollTop - el.clientHeight
+                    codeStickRef.current.set(m.id, dist < 48)
+                  }}
+                  onWheel={(e) => {
+                    if (e.deltaY < 0) codeStickRef.current.set(m.id, false)
+                    else {
+                      const el = e.currentTarget
+                      const dist = el.scrollHeight - el.scrollTop - el.clientHeight
+                      if (dist < 48) codeStickRef.current.set(m.id, true)
+                    }
                   }}
                   className="code-stream mt-1 max-h-48 overflow-auto rounded-lg border border-ink-line/50 bg-ink-950/60 px-2.5 py-2 font-mono text-[10px] leading-relaxed text-ink-bright"
                 >
@@ -1936,62 +1975,66 @@ function ThinkThroughBody({
   durationLabel?: string
 }): React.JSX.Element {
   const { t } = useI18n()
-  // Parse raw content so <think> stays foldable; only promote when there is no think fold.
-  const parts = parseThinkBlocks(content).map((p) =>
-    p.kind === 'text' ? { ...p, text: stripPlanBlock(p.text) } : p
-  )
-  const hasThink = parts.some((p) => p.kind === 'think')
-  if (!hasThink) {
-    return (
-      <MarkdownBody content={promoteThinkOnlyAnswer(content)} streaming={streaming} />
-    )
+  void durationLabel
+  // While streaming: show live tokens. After: sanitize dumps/checklists.
+  const displaySrc = streaming ? formatLiveThinkContent(content) : content
+  const parts = parseThinkBlocks(displaySrc).map((p) => {
+    if (p.kind === 'think') {
+      const text = streaming
+        ? extractThinkInner(`<think>${p.text}</think>`) || p.text
+        : sanitizeThinkProse(`<think>${p.text}</think>`) || p.text
+      return { ...p, text }
+    }
+    return { ...p, text: stripPlanBlock(stripThinkTags(p.text)) }
+  })
+  const thinkParts = parts.filter((p) => p.kind === 'think' && (p.text.trim() || streaming))
+  const textParts = parts.filter((p) => p.kind === 'text' && p.text.trim())
+  const showThinkFold =
+    thinkParts.length > 0 || (streaming && /<\s*(?:think|thinking)\s*>/i.test(content || displaySrc))
+  const thoughtLabel = streaming ? t('chat.thought.thinking') : t('chat.thought.briefly')
+  if (!showThinkFold) {
+    const visible =
+      textParts.map((p) => p.text).join('\n\n').trim() || stripThinkTags(stripPlanBlock(content))
+    return <MarkdownBody content={visible} streaming={streaming} />
   }
-  const thoughtLabel =
-    durationLabel && !streaming
-      ? t('chat.thought.forDuration', { duration: durationLabel })
-      : streaming
-        ? t('chat.thought.thinking')
-        : t('chat.thought.briefly')
   return (
     <div className="space-y-2">
-      {parts.map((p, i) =>
-        p.kind === 'think' ? (
-          <details
-            key={i}
-            open={streaming && i === parts.length - 1}
-            className="group"
-          >
-            <summary className="flex cursor-pointer list-none items-center gap-1.5 select-none text-[12px] text-ink-mute hover:text-ink-soft [&::-webkit-details-marker]:hidden">
-              <svg
-                width="12"
-                height="12"
-                viewBox="0 0 24 24"
-                fill="none"
-                className="shrink-0 opacity-70 transition group-open:rotate-90"
-                aria-hidden
-              >
-                <path
-                  d="M9 6l6 6-6 6"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                />
-              </svg>
-              {thoughtLabel}
-            </summary>
-            <div className="mt-1.5 border-l border-ink-line/50 pl-3 text-[12px] leading-relaxed text-ink-mute [&_.text-ink-soft]:text-ink-mute [&_.text-ink-bright]:text-ink-soft">
-              <MarkdownBody content={p.text} />
-            </div>
-          </details>
-        ) : (
-          <MarkdownBody
-            key={i}
-            content={p.text}
-            streaming={streaming && i === parts.length - 1}
-          />
-        )
-      )}
+      {thinkParts.map((p, i) => (
+        <details key={i} open={Boolean(streaming) || i === 0} className="group">
+          <summary className="flex cursor-pointer list-none items-center gap-1.5 select-none text-[12px] text-ink-mute hover:text-ink-soft [&::-webkit-details-marker]:hidden">
+            <svg
+              width="12"
+              height="12"
+              viewBox="0 0 24 24"
+              fill="none"
+              className="shrink-0 opacity-70 transition group-open:rotate-90"
+              aria-hidden
+            >
+              <path
+                d="M9 6l6 6-6 6"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+            </svg>
+            {thoughtLabel}
+          </summary>
+          <div className="mt-1.5 border-l border-ink-line/50 pl-3 text-[12px] leading-relaxed text-ink-mute [&_.text-ink-soft]:text-ink-mute [&_.text-ink-bright]:text-ink-soft">
+            <MarkdownBody
+              content={p.text || (streaming ? '' : '…')}
+              streaming={Boolean(streaming) && i === thinkParts.length - 1}
+            />
+          </div>
+        </details>
+      ))}
+      {textParts.map((p, i) => (
+        <MarkdownBody
+          key={`t-${i}`}
+          content={p.text}
+          streaming={streaming && i === textParts.length - 1}
+        />
+      ))}
     </div>
   )
 }

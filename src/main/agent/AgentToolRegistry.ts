@@ -439,18 +439,20 @@ export class AgentToolRegistry {
       return { id: '', name: 'read_file', ok: true, content: raw }
     }
     const lines = raw.split(/\r?\n/)
-    const start = hasStart ? Math.min(Math.floor(startRaw), lines.length || 1) : 1
-    const end = hasEnd
-      ? Math.min(Math.floor(endRaw), lines.length || 1)
-      : lines.length || 1
+    const total = lines.length || 1
+    const start = hasStart ? Math.min(Math.floor(startRaw), total) : 1
+    const end = hasEnd ? Math.min(Math.floor(endRaw), total) : total
     const from = Math.max(1, Math.min(start, end))
     const to = Math.max(from, Math.max(start, end))
     const slice = lines.slice(from - 1, to).join('\n')
+    const meta =
+      `showing lines ${from}–${to} of ${total}` +
+      (to < total ? ` (NOT EOF — file continues after line ${to})` : ' (through EOF)')
     return {
       id: '',
       name: 'read_file',
       ok: true,
-      content: slice
+      content: `[read_file range] ${meta}\n---\n${slice}`
     }
   }
 
@@ -545,11 +547,25 @@ export class AgentToolRegistry {
     this.notifyChange(relativePath)
     const total = append ? existing.length + content.length : content.length
     const pathKey = relativePath.replace(/\\/g, '/')
+    const writtenBody = append ? existing + content : content
+    const lineCount = writtenBody.split(/\r?\n/).length
+    const closesHtml = /<\/html\s*>/i.test(writtenBody)
+    const closesBody = /<\/body\s*>/i.test(writtenBody)
+    const htmlHint =
+      /\.html?$/i.test(relativePath) || /<!DOCTYPE\s+html|<html[\s>]/i.test(writtenBody)
+        ? ` lines=${lineCount} closes_with_</body>=${closesBody ? 'yes' : 'no'} closes_with_</html>=${closesHtml ? 'yes' : 'no'}.` +
+          (closesHtml
+            ? ' FILE_COMPLETE — do not rewrite just to "finish the tail".'
+            : ' If incomplete, append=true on the SAME path (do not invent a new file).')
+        : ` lines=${lineCount}.`
     return {
       id: '',
       name: 'write_file',
       ok: true,
-      content: `${append ? 'Appended' : 'Wrote'} ${content.length} bytes to ${relativePath} (file now ${total} bytes). Finish this file before starting another.`,
+      content:
+        `${append ? 'Appended' : 'Wrote'} ${content.length} bytes to ${relativePath} (file now ${total} bytes).` +
+        htmlHint +
+        ' Finish this file before starting another.',
       editReview: { path: pathKey, status: 'pending' }
     }
   }
