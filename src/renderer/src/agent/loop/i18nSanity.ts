@@ -7,9 +7,42 @@ export const I18N_SANITY_PREFIX = 'I18N_SANITY:'
 
 const I18N_HINT =
   `${I18N_SANITY_PREFIX} do NOT claim the language switcher works. ` +
-  'i18n values MUST be strings. Never assign objects/arrays to textContent/innerHTML ' +
-  '(that renders "[object Object]"). Query [data-i18n="key"] and set a string. ' +
-  'Features cards need separate title and body string keys — not one object per card.'
+  'i18n values MUST be strings. getElementById / #id MUST match an id in the HTML ' +
+  '(langToggle vs lang-toggle is a no-op click). Every data-i18n key MUST exist in the JS dict. ' +
+  'Never assign objects/arrays to textContent (that renders "[object Object]").'
+
+/**
+ * HTML uses data-i18n, but JS looks up #ids that are not in the markup.
+ * Do not skip this just because the script also queries [data-i18n].
+ */
+export function htmlJsI18nMismatch(html: string, js: string): boolean {
+  if (!html.trim() || !js.trim()) return false
+  const keys = extractDataI18nKeys(html)
+  const htmlIds = extractHtmlIds(html)
+  const jsIds = extractJsIdSelectors(js)
+  const missing = jsIds.filter((id) => !htmlIds.has(id))
+  if (missing.some((id) => /lang|i18n|toggle|theme/i.test(id))) return true
+  if (htmlI18nKeysMissingFromJs(html, js)) return true
+  if (missing.length === 0) return false
+  if (!keys.length) {
+    return missing.some((id) => /hero|title|subtitle|feature|cta|download|footer|nav|menu/i.test(id))
+  }
+  return missing.some((id) =>
+    /hero|title|subtitle|feature|cta|download|footer|lang|nav|menu|toggle/i.test(id)
+  )
+}
+
+/** True when most HTML data-i18n keys never appear as quoted strings in JS. */
+export function htmlI18nKeysMissingFromJs(html: string, js: string): boolean {
+  const keys = extractDataI18nKeys(html)
+  if (keys.length < 3 || !js.trim()) return false
+  let hit = 0
+  for (const k of keys) {
+    const escaped = k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    if (new RegExp(`['"]${escaped}['"]`).test(js)) hit++
+  }
+  return hit < keys.length / 2
+}
 
 export function extractDataI18nKeys(html: string): string[] {
   const keys: string[] = []
@@ -72,24 +105,6 @@ export function jsAssignsNonStringToDom(js: string): boolean {
     return true
   }
   return false
-}
-
-/**
- * HTML uses data-i18n, but JS looks up #hero-title / getElementById that are not in the markup.
- */
-export function htmlJsI18nMismatch(html: string, js: string): boolean {
-  if (!html.trim() || !js.trim()) return false
-  const keys = extractDataI18nKeys(html)
-  if (!keys.length) return false
-  const htmlIds = extractHtmlIds(html)
-  const jsIds = extractJsIdSelectors(js)
-  const missing = jsIds.filter((id) => !htmlIds.has(id))
-  if (missing.length === 0) return false
-  const usesDataI18n = /\[data-i18n|data-i18n\s*=/i.test(js)
-  if (usesDataI18n) return false
-  return missing.some((id) =>
-    /hero|title|subtitle|feature|cta|download|footer/i.test(id)
-  )
 }
 
 export function formatI18nSanityHint(opts: { html?: string; js?: string }): string | null {

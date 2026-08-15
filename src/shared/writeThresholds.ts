@@ -4,6 +4,12 @@ export const SMALL_FILE_OVERWRITE_CHARS = 6000
 export const LARGE_FILE_OVERWRITE_CHARS = 40_000
 export const TRUNCATION_GUARD_RATIO = 0.7
 
+/** search_block covering most of an already-complete file is a full rewrite. */
+export function isWholeFileSearchBlock(searchLen: number, fileLen: number): boolean {
+  if (fileLen < 800 || searchLen < 1500) return false
+  return searchLen >= fileLen * 0.7
+}
+
 /** Any source file under this size may be overwritten in one shot. */
 export function allowsFullOverwrite(relativePath: string, contentChars: number): boolean {
   if (contentChars < SMALL_FILE_OVERWRITE_CHARS) return true

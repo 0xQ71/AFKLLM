@@ -126,8 +126,8 @@ export function evidenceSupportsStep(stepText: string, log: StepEvidence[]): boo
       (e.path ?? '').replace(/\\/g, '/').toLowerCase().endsWith(want)
     )
   }
-  if (/напис|write|созда|правк|исправ|edit|fix|добав|patch|измен/i.test(t)) {
-    return okWrites.some((e) => e.ok)
+  if (/переключ|toggle|theme|тем[аые]|i18n|switcher|навбар|navbar/i.test(t)) {
+    return okWrites.some((e) => /\.(html?|css|jsx?|mjs|cjs)$/i.test(e.path ?? ''))
   }
   return false
 }

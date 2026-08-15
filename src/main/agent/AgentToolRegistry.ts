@@ -27,6 +27,7 @@ import {
 } from '../../shared/shellErrors'
 import {
   allowsFullOverwrite,
+  isWholeFileSearchBlock,
   SMALL_FILE_OVERWRITE_CHARS,
   truncationGuardMessage
 } from '../../shared/writeThresholds'
@@ -847,6 +848,19 @@ export class AgentToolRegistry {
           'SURGICAL_EDIT: instruction asks to replace the entire file. Forbidden on a complete file. ' +
           'Use a SHORT surgical instruction or search_block+replace_block. ' +
           'Then verify / summarize — do NOT rewrite the whole file.'
+      }
+    }
+
+    if (fileComplete && isWholeFileSearchBlock(searchBlock.length, original.length)) {
+      return {
+        id: '',
+        name: 'apply_diff',
+        ok: false,
+        content: '',
+        error:
+          'SURGICAL_EDIT: search_block covers most of this complete file. Forbidden. ' +
+          'Pass a SHORT unique snippet (typically < 80 lines), not the whole file. ' +
+          'Do NOT rewrite this file.'
       }
     }
 

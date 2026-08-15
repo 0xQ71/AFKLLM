@@ -786,13 +786,17 @@ export type CoercePlanOptions = {
  */
 export function coerceProductPlan(
   steps: AgentTodoStep[] | null | undefined,
-  _opts?: CoercePlanOptions
+  opts?: CoercePlanOptions
 ): AgentTodoStep[] {
-  const cleaned = (steps ?? []).filter(
+  let cleaned = (steps ?? []).filter(
     (s) => !isJunkPlanStep(s.text) && !isToolOrientedPlanStep(s.text)
   )
+  if (opts?.surgical) {
+    cleaned = cleaned.filter((s) => !isScaffoldLandingPlanStep(s.text))
+  }
   if (!cleaned.length) return []
-  return cleaned.slice(0, 10).map((s, i) => ({
+  const cap = opts?.surgical ? 4 : 10
+  return cleaned.slice(0, cap).map((s, i) => ({
     ...s,
     id: `s${i + 1}`,
     status: (i === 0 ? 'in_progress' : 'pending') as AgentTodoStep['status']
@@ -803,27 +807,45 @@ export function coerceProductPlan(
  * Drop plan rows that restate earlier chat work or expand far beyond THIS request
  * (e.g. navbar ask → weather / i18n / “fully rewrite landing”).
  */
+/** From-scratch landing rows that must not reappear on a surgical follow-up. */
+export function isScaffoldLandingPlanStep(text: string): boolean {
+  const x = text.trim()
+  if (!x) return false
+  if (/исправ|поправ|fix\b|toggle|переключ|theme|тем[аые]/i.test(x)) return false
+  return (
+    /create\s+index\.html|созда(ть|й|ю)\s+index\.html|напис\S*\s+index\.html/i.test(x) ||
+    /create\s+styles\.css|созда(ть|й|ю)\s+styles\.css/i.test(x) ||
+    /create\s+js\/main\.js|созда(ть|й|ю)\s+js\/main/i.test(x) ||
+    /explore.{0,60}(github|репозитор)|изучить\s+(репозитор|github|readme)|собрать\s+точн/i.test(
+      x
+    ) ||
+    /полный\s+лендинг|full\s+(multi-?file\s+)?landing|создать\s+assets/i.test(x)
+  )
+}
+
 export function filterPlanToCurrentRequest(
   steps: AgentTodoStep[],
   userText: string
 ): AgentTodoStep[] {
   const t = userText.trim()
   if (!steps.length || !t) return steps
+  const surgical = looksLikeSurgicalFollowUp(t)
   const navbarOnly =
     /навбар|navbar|header/i.test(t) &&
     !/лендинг\s+с\s*нуля|landing\s+from\s+scratch|все\s+секц|bootstrap\s*5/i.test(t)
   const out = steps.filter((s) => {
     const x = s.text
     if (/погод|weather|одежд|печк|что\s+лучше\s+одеть/i.test(x)) return false
+    if (surgical && isScaffoldLandingPlanStep(x)) return false
     if (
-      /i18n|RU\s*\/\s*EN|переключ\S*\s+язык|language\s+switch/i.test(x) &&
-      !/язык|i18n|переключател/i.test(t)
+      /i18n|RU\s*\/\s*EN|EN\s*\/\s*RU|переключ\S*\s+язык|language\s+switch/i.test(x) &&
+      !/язык|i18n|переключател|EN\s*\/\s*RU|RU\s*\/\s*EN|switcher/i.test(t)
     ) {
       return false
     }
     if (
-      looksLikeI18nFollowUp(t) &&
-      /git\s+clone|изучить\s+репозитор|создать\s+assets|полный\s+лендинг|все\s+секц|styles\.css|hero\.svg|bootstrap/i.test(
+      (looksLikeI18nFollowUp(t) || surgical) &&
+      /git\s+clone|изучить\s+репозитор|создать\s+assets|полный\s+лендинг|все\s+секц|hero\.svg|bootstrap/i.test(
         x
       )
     ) {
@@ -839,10 +861,7 @@ export function filterPlanToCurrentRequest(
     }
     return true
   })
-  const capped = (out.length ? out : steps).slice(
-    0,
-    navbarOnly || looksLikeI18nFollowUp(t) ? 4 : 10
-  )
+  const capped = out.slice(0, navbarOnly || looksLikeI18nFollowUp(t) || surgical ? 4 : 10)
   return capped.map((s, i) => ({
     ...s,
     id: `s${i + 1}`,
@@ -1280,20 +1299,55 @@ export function looksLikeChatQa(
   return false
 }
 
+/** User asked to add a light/dark (or theme) control. */
+export function looksLikeThemeToggleRequest(userText: string): boolean {
+  const t = userText.trim()
+  if (!t) return false
+  return /переключател\S*\s+тем|theme\s+toggle|light\s*\/\s*dark|dark\s*\/\s*light|светл\S*.{0,24}т[её]мн|т[её]мн\S*.{0,24}светл|data-theme/i.test(
+    t
+  )
+}
+
 /** Short follow-up: existing landing language switcher / i18n is broken. */
 export function looksLikeI18nFollowUp(userText: string): boolean {
   const t = userText.trim()
   if (!t) return false
   if (looksLikeLandingBuildTask(t) && t.length > 400) return false
-  return (
-    /переключател\S*\s+язык|language\s+switcher|data-i18n|\bi18n\b|\[object Object\]/i.test(
+  if (
+    /EN\s*\/\s*RU|RU\s*\/\s*EN|language\s+switcher|data-i18n|\bi18n\b|\[object Object\]|переключател\S*\s+язык/i.test(
       t
-    ) ||
-    (t.length <= 280 &&
-      /не\s+работает|doesn'?t\s+work|does\s+not\s+work|is\s+broken|сломан/i.test(t) &&
-      /язык|lang|i18n|переключател|перевод/i.test(t))
+    )
+  ) {
+    return true
+  }
+  return (
+    t.length <= 400 &&
+    /не\s+работает|doesn'?t\s+work|does\s+not\s+work|is\s+broken|\bbroken\b|сломан/i.test(t) &&
+    /язык|lang|i18n|переключател|перевод|switcher/i.test(t)
   )
 }
+
+/** Explicit “rewrite the whole file” — surgical overwrite guards stand down. */
+export function looksLikeExplicitRewrite(userText: string): boolean {
+  return /перепиши\s+(весь|полностью|файл|лендинг|всё|все)|rewrite\s+(the\s+)?(whole|entire|full)|с\s*нуля|from\s+scratch|заново\s+весь|regenerate\s+(the\s+)?(page|file|landing)|создай\/перезапиши|создай\s+или\s+перезапиши|сначала\s+создай/i.test(
+    userText
+  )
+}
+
+/** Surgical follow-up must not overwrite an existing HTML/CSS/JS module. */
+export function shouldBlockSurgicalOverwrite(opts: {
+  userText: string
+  relativePath: string
+  overwrite: boolean
+}): boolean {
+  if (!opts.overwrite) return false
+  if (looksLikeExplicitRewrite(opts.userText)) return false
+  if (!looksLikeSurgicalFollowUp(opts.userText)) return false
+  return /\.(html?|css|jsx?|mjs|cjs)$/i.test(opts.relativePath.replace(/\\/g, '/'))
+}
+
+/** search_block that is most of an already-complete file = full rewrite. */
+export { isWholeFileSearchBlock } from '../../../shared/writeThresholds'
 
 /** Long “build from scratch” briefs — never surgical. */
 export function looksLikeFromScratchTask(userText: string): boolean {

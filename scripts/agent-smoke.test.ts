@@ -61,6 +61,9 @@ import {
   looksLikeFileEditRequest,
   looksLikeSurgicalFollowUp,
   looksLikeI18nFollowUp,
+  looksLikeThemeToggleRequest,
+  looksLikeExplicitRewrite,
+  shouldBlockSurgicalOverwrite,
   isLandingJsPath,
   isSourcePath,
   filterPlanToCurrentRequest,
@@ -115,11 +118,13 @@ import { honestClosingNote } from '../src/renderer/src/agent/loop/report'
 import {
   formatI18nSanityHint,
   htmlJsI18nMismatch,
+  htmlI18nKeysMissingFromJs,
   jsI18nDictLooksBroken
 } from '../src/renderer/src/agent/loop/i18nSanity'
-import { formatEditSanityHint } from '../src/renderer/src/agent/loop/editSanity'
+import { formatEditSanityHint, navLooksUnstyled, htmlJsHasThemeControl } from '../src/renderer/src/agent/loop/editSanity'
 import { formatSurgicalFollowUpHint, isHtmlOnlyStacks } from '../src/renderer/src/agent/loop/prompts'
-import { truncationGuardMessage } from '../src/shared/writeThresholds'
+import { truncationGuardMessage, isWholeFileSearchBlock } from '../src/shared/writeThresholds'
+import { evidenceSupportsStep, evidenceFromTool, recordEvidence } from '../src/renderer/src/agent/loop/evidence'
 
 describe('looksLikeToolMarkupLeak', () => {
   it('detects channel / tool_call leaks', () => {
@@ -857,6 +862,35 @@ describe('agent todo plan', () => {
     assert.equal(looksLikeFileEditRequest('не работает переключатель языка'), true)
     assert.equal(looksLikeI18nFollowUp('не работает переключатель языка'), true)
     assert.equal(looksLikeI18nFollowUp('language switcher is broken'), true)
+    const user2 =
+      '1) Добавь переключатель тем: светлая тема и темная тема\n2) Не работает EN/RU переключатель'
+    assert.equal(looksLikeI18nFollowUp(user2), true)
+    assert.equal(looksLikeSurgicalFollowUp(user2), true)
+    assert.equal(looksLikeThemeToggleRequest(user2), true)
+    assert.equal(looksLikeExplicitRewrite(user2), false)
+    assert.equal(
+      shouldBlockSurgicalOverwrite({
+        userText: user2,
+        relativePath: 'index.html',
+        overwrite: true
+      }),
+      true
+    )
+    const i18nHint = formatSurgicalFollowUpHint({
+      stacks: [
+        {
+          id: 'html',
+          label: 'HTML',
+          markers: ['index.html'],
+          sourceGlobs: [],
+          ignoreDirs: []
+        }
+      ],
+      i18nFix: true
+    })
+    assert.match(i18nHint, /apply_diff/)
+    assert.doesNotMatch(i18nHint, /FORBIDDEN:.*RU\/EN/)
+    assert.match(i18nHint, /web_search/)
     assert.equal(looksLikeSurgicalFollowUp('не работает pytest'), true)
     assert.equal(looksLikeSurgicalFollowUp('TypeError in app.py'), true)
     assert.equal(looksLikeSurgicalFollowUp('go test fails'), true)
@@ -926,6 +960,33 @@ describe('agent todo plan', () => {
     )
     assert.ok(i18nScoped.some((s) => /переключател/i.test(s.text)))
     assert.ok(!i18nScoped.some((s) => /git\s+clone|полный\s+лендинг|создать\s+assets/i.test(s.text)))
+    const user2Plan = filterPlanToCurrentRequest(
+      [
+        {
+          id: '1',
+          text: 'Create index.html — full landing page linking to CSS/JS/assets',
+          status: 'pending' as const
+        },
+        {
+          id: '2',
+          text: 'Explore the AFKLLM GitHub repo',
+          status: 'pending' as const
+        },
+        {
+          id: '3',
+          text: 'Исправить EN/RU переключатель в js/main.js',
+          status: 'pending' as const
+        },
+        {
+          id: '4',
+          text: 'Добавить переключатель светлой/тёмной темы',
+          status: 'pending' as const
+        }
+      ],
+      '1) Добавь переключатель тем: светлая тема и темная тема\n2) Не работает EN/RU переключатель'
+    )
+    assert.ok(!user2Plan.some((s) => /Create index\.html|Explore the AFKLLM/i.test(s.text)))
+    assert.ok(user2Plan.some((s) => /переключател|тем/i.test(s.text)))
     assert.equal(
       looksLikeChatQa('а если ещё теплее', [
         { role: 'user', content: 'какая погода сейчас Москве' },
@@ -1690,6 +1751,36 @@ describe('AgentToolRegistry edit review', () => {
     }
   })
 
+  it('apply_diff of a whole complete HTML file is SURGICAL_EDIT', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'afkllm-whole-diff-'))
+    try {
+      const reg = new AgentToolRegistry({ projectRoot: root })
+      const rel = 'index.html'
+      const html =
+        '<!DOCTYPE html><html><head><title>AFKLLM</title></head><body>' +
+        '<nav><ul class="nav-links"><li>a</li></ul></nav>' +
+        '<p>' +
+        'section '.repeat(200) +
+        '</p></body></html>\n'
+      assert.equal(isWholeFileSearchBlock(html.length, html.length), true)
+      await fs.writeFile(path.join(root, rel), html, 'utf8')
+      const blocked = await reg.invoke({
+        id: '1',
+        name: 'apply_diff',
+        arguments: {
+          relative_path: rel,
+          search_block: html,
+          replace_block: html.replace('AFKLLM', 'Other')
+        }
+      })
+      assert.equal(blocked.ok, false)
+      assert.match(blocked.error ?? '', /SURGICAL_EDIT/)
+      assert.equal(await fs.readFile(path.join(root, rel), 'utf8'), html)
+    } finally {
+      await fs.rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('small complete HTML may still be overwritten in one shot', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'afkllm-small-html-'))
     try {
@@ -2240,6 +2331,17 @@ describe('i18n sanity', () => {
       "document.querySelector('#hero-subtitle').textContent = t.sub;\n"
     assert.equal(htmlJsI18nMismatch(html, jsIds), true)
     assert.match(formatI18nSanityHint({ html, js: jsIds }) ?? '', /I18N_SANITY/)
+    const landingHtml =
+      '<nav><ul class="nav-links"></ul><button id="langToggle">EN</button></nav>' +
+      '<h1 data-i18n="nav-how">Как</h1><p data-i18n="cta-download">Скачать</p>' +
+      '<p data-i18n="features-title">Возможности</p><p data-i18n="why-title">Почему</p>'
+    const landingJs =
+      "const i18n = { ru: { 'nav-how-it-works': 'Как', 'btn-download': 'Скачать' } };\n" +
+      "document.getElementById('lang-toggle').addEventListener('click', () => {});\n" +
+      "document.querySelectorAll('[data-i18n]').forEach((el) => { el.textContent = i18n.ru[el.getAttribute('data-i18n')]; });\n"
+    assert.equal(htmlJsI18nMismatch(landingHtml, landingJs), true)
+    assert.equal(htmlI18nKeysMissingFromJs(landingHtml, landingJs), true)
+    assert.match(formatI18nSanityHint({ html: landingHtml, js: landingJs }) ?? '', /I18N_SANITY/)
   })
 })
 
@@ -2300,6 +2402,42 @@ describe('edit sanity + html-only stacks', () => {
     })
     assert.match(htmlHint, /preview ONCE/i)
     assert.match(htmlHint, /get_diagnostics on static HTML/)
+    const landingHtml =
+      '<!DOCTYPE html><html><head><link rel="stylesheet" href="styles.css"></head>' +
+      '<body><nav><ul class="nav-links"><li>x</li></ul></nav></body></html>'
+    const landingCss = '.hero { display: flex; }\n.footer-links { list-style: none; }\n'
+    assert.equal(navLooksUnstyled(landingHtml, landingCss), true)
+    assert.match(
+      formatEditSanityHint({
+        path: 'index.html',
+        content: landingHtml,
+        html: landingHtml,
+        css: landingCss,
+        cssPath: 'styles.css'
+      }) ?? '',
+      /EDIT_SANITY/
+    )
+    const navCss = '.nav-links { display: flex; list-style: none; gap: 16px; }\n'
+    assert.equal(navLooksUnstyled(landingHtml, navCss), false)
+    const themeAsk = '1) Добавь переключатель тем: светлая тема и темная тема\n2) Не работает EN/RU переключатель'
+    assert.equal(htmlJsHasThemeControl(landingHtml, ''), false)
+    assert.match(
+      formatEditSanityHint({
+        path: 'index.html',
+        content: landingHtml,
+        html: landingHtml,
+        js: '',
+        css: navCss,
+        userText: themeAsk
+      }) ?? '',
+      /EDIT_SANITY/
+    )
+    assert.ok(
+      htmlJsHasThemeControl(
+        '<button id="themeToggle" data-theme="dark">',
+        'document.documentElement.dataset.theme = "light"'
+      )
+    )
   })
 })
 

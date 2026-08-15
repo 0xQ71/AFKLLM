@@ -90,6 +90,9 @@ import {
   looksLikeFileEditRequest,
   looksLikeSurgicalFollowUp,
   looksLikeI18nFollowUp,
+  looksLikeThemeToggleRequest,
+  looksLikeExplicitRewrite,
+  shouldBlockSurgicalOverwrite,
   isSourcePath,
   filterPlanToCurrentRequest,
   parseGlobalRenameIntent,
@@ -427,13 +430,6 @@ export {
   SYSTEM_CONFIRM_CORE,
   SYSTEM_PLAN,
   THINK_THROUGH
-}
-
-/** Explicit full-rewrite request → overwrite of large files allowed. */
-function looksLikeExplicitRewrite(text: string): boolean {
-  return /перепиши\s+(весь|полностью|файл|лендинг|всё|все)|rewrite\s+(the\s+)?(whole|entire|full)|с\s*нуля|from\s+scratch|заново\s+весь|regenerate\s+(the\s+)?(page|file|landing)|создай\/перезапиши|создай\s+или\s+перезапиши|сначала\s+создай/i.test(
-    text
-  )
 }
 
 /** Open/show preview intent when index.html is already built — skip plan ceremony. */
@@ -2076,6 +2072,8 @@ export async function runAgentTurn(params: {
   let lastHtmlWritePath = 'index.html'
   let lastJsWrite = ''
   let lastJsWritePath = 'js/main.js'
+  let lastCssWrite = ''
+  let lastCssWritePath = 'styles.css'
   let i18nSanityFailed = false
   let editSanityFailed = false
   const completeHtmlByPath = new Set<string>()
@@ -2224,9 +2222,10 @@ export async function runAgentTurn(params: {
   let thinkSatisfied = false
   const coercePlan = (plan: AgentTodoStep[] | null | undefined): AgentTodoStep[] =>
     filterPlanToCurrentRequest(
-      coerceProductPlan(plan, { userText: params.userText }).filter(
-        (s) => !isJunkPlanStep(s.text)
-      ),
+      coerceProductPlan(plan, {
+        userText: params.userText,
+        surgical: looksLikeSurgicalFollowUp(params.userText)
+      }).filter((s) => !isJunkPlanStep(s.text)),
       params.userText
     )
   const paintTodo = (
@@ -2331,6 +2330,25 @@ export async function runAgentTurn(params: {
             ? String((tool as { name?: unknown }).name ?? '')
             : ''
       return name === 'web_search'
+    })
+  }
+  if (
+    looksLikeSurgicalFollowUp(params.userText) &&
+    !/github\.com|web_search|поиск в интернет|search the web|факты из/i.test(params.userText)
+  ) {
+    agentTools = agentTools.filter((tool) => {
+      const name =
+        tool &&
+        typeof tool === 'object' &&
+        'function' in tool &&
+        tool.function &&
+        typeof tool.function === 'object' &&
+        'name' in tool.function
+          ? String((tool.function as { name?: unknown }).name ?? '')
+          : tool && typeof tool === 'object' && 'name' in tool
+            ? String((tool as { name?: unknown }).name ?? '')
+            : ''
+      return name !== 'web_search'
     })
   }
 
@@ -2537,13 +2555,17 @@ export async function runAgentTurn(params: {
 
     {
     const surgicalPlan = looksLikeSurgicalFollowUp(params.userText)
+    const i18nPlan = looksLikeI18nFollowUp(params.userText)
     pushUserMessage(
       apiMessages,
       surgicalPlan
         ? 'PLAN_ONLY (tools still DISABLED). Output ONLY <plan>…</plan> with 2–4 ATOMIC steps for THIS user message only ' +
             `(«${params.userText.trim().slice(0, 160)}»). ` +
-            'FORBIDDEN: restating earlier chat work (weather, clothing, old sections), RU/EN i18n unless asked, ' +
-            'rewriting the whole file/module, tool names, code, <think>. Stop after </plan>.'
+            'FORBIDDEN: restating earlier chat work (weather, clothing, old sections), ' +
+            (i18nPlan
+              ? 'rewriting the whole landing, Create index.html / Explore GitHub, web_search, README.md, '
+              : 'RU/EN i18n unless asked, rewriting the whole file/module, ') +
+            'tool names, code, <think>. Stop after </plan>.'
         : 'PLAN_ONLY (tools still DISABLED). Output ONLY <plan>…</plan> with 3–9 ATOMIC steps from the user request ' +
             'and your prior <think> (what to create/change, in order). ' +
             'FORBIDDEN: tool names (execute_terminal_command, write_file, Start-Process, read_file), CSS class names as steps, ' +
@@ -3616,7 +3638,7 @@ export async function runAgentTurn(params: {
           (looksLikeSurgicalFollowUp(params.userText) ||
             (looksLikeFileEditRequest(params.userText) &&
               !looksLikeLandingBuildTask(params.userText))) &&
-          /(?:^|\/)(styles|hero)\.css$/i.test(String(resolvedPath || filePath || ''))
+          /\.css$/i.test(String(resolvedPath || filePath || ''))
         ) {
           const search =
             typeof args.search_block === 'string' ? args.search_block : ''
@@ -3642,8 +3664,8 @@ export async function runAgentTurn(params: {
               ok: false,
               content: '',
               error:
-                'SURGICAL_CSS: do NOT rewrite styles.css. Use apply_diff with a SMALL search_block ' +
-                '(navbar / header rules only, typically < 80 lines). Leave the rest of the stylesheet untouched.'
+                'SURGICAL_CSS: do NOT rewrite this stylesheet. Use apply_diff with a SMALL search_block ' +
+                '(navbar / header / theme rules only, typically < 80 lines). Leave the rest of the stylesheet untouched.'
             }
           } else {
             syntheticResult = false
@@ -3881,6 +3903,23 @@ export async function runAgentTurn(params: {
             error:
               'MISSING_PATH: relative_path is required BEFORE content ' +
               '(e.g. relative_path="index.html"). Do not stream a whole file without a path.'
+          }
+        } else if (
+          name === 'write_file' &&
+          shouldBlockSurgicalOverwrite({
+            userText: params.userText,
+            relativePath: String(resolvedPath || filePath || args.relative_path || ''),
+            overwrite: Boolean(args.overwrite) || Boolean(args.allow_full_rewrite)
+          })
+        ) {
+          toolResult = {
+            id: call.id,
+            name,
+            ok: false,
+            content: '',
+            error:
+              'SURGICAL_EDIT: do not overwrite this existing HTML/CSS/JS file. ' +
+              'Use apply_diff with a SHORT search_block. Do NOT rewrite the whole file.'
           }
         } else if (
           name === 'create_directory' &&
@@ -4208,8 +4247,22 @@ export async function runAgentTurn(params: {
           toolResult.ok &&
           (name === 'write_file' || name === 'apply_diff' || name === 'apply_patch')
         ) {
-          mutatingEditOk = true
-          mutatingEditFailed = false
+          const wrotePath = (
+            toolResult.editReview?.path ||
+            (typeof args.relative_path === 'string' ? args.relative_path : '') ||
+            filePath ||
+            ''
+          )
+            .replace(/\\/g, '/')
+            .trim()
+          const extraReadme =
+            looksLikeSurgicalFollowUp(params.userText) &&
+            /(?:^|\/)readme\.md$/i.test(wrotePath) &&
+            !/readme/i.test(params.userText)
+          if (!extraReadme) {
+            mutatingEditOk = true
+            mutatingEditFailed = false
+          }
         } else if (
           !toolResult.ok &&
           (name === 'write_file' || name === 'apply_diff' || name === 'apply_patch')
@@ -4245,6 +4298,10 @@ export async function runAgentTurn(params: {
           if (wp && /\.jsx?$/i.test(wp)) {
             lastJsWrite = args.append ? `${lastJsWrite}${body}` : body
             lastJsWritePath = wp
+          }
+          if (wp && /\.css$/i.test(wp)) {
+            lastCssWrite = args.append ? `${lastCssWrite}${body}` : body
+            lastCssWritePath = wp
           }
           if (
             contentLooksStructurallyComplete(lastHtmlWrite)
@@ -4305,6 +4362,25 @@ export async function runAgentTurn(params: {
         }
         if (
           toolResult.ok &&
+          (name === 'apply_diff' || name === 'apply_patch') &&
+          /\.css$/i.test(filePath || String(args.relative_path ?? ''))
+        ) {
+          const cssPath =
+            filePath ||
+            (typeof args.relative_path === 'string' ? args.relative_path : '') ||
+            lastCssWritePath
+          try {
+            const disk = await window.api.workspace.readFile(cssPath)
+            if (disk.ok && typeof disk.content === 'string') {
+              lastCssWrite = disk.content
+              lastCssWritePath = cssPath
+            }
+          } catch {
+            /* ignore */
+          }
+        }
+        if (
+          toolResult.ok &&
           (name === 'write_file' || name === 'apply_diff' || name === 'apply_patch') &&
           !/INCOMPLETE_WRITE/i.test(toolResult.content ?? '')
         ) {
@@ -4322,17 +4398,44 @@ export async function runAgentTurn(params: {
               /* ignore */
             }
           }
+          if (!html) {
+            try {
+              const disk = await window.api.workspace.readFile(lastHtmlWritePath || 'index.html')
+              if (disk.ok && typeof disk.content === 'string') {
+                html = disk.content
+                lastHtmlWrite = disk.content
+              }
+            } catch {
+              /* ignore */
+            }
+          }
+          let css = lastCssWrite
+          if (!css) {
+            try {
+              const disk = await window.api.workspace.readFile(lastCssWritePath || 'styles.css')
+              if (disk.ok && typeof disk.content === 'string') {
+                css = disk.content
+                lastCssWrite = disk.content
+              }
+            } catch {
+              /* ignore */
+            }
+          }
           const body =
             (typeof args.content === 'string' && args.content) ||
             (/\.html?$/i.test(written) ? lastHtmlWrite : '') ||
             (/\.jsx?$/i.test(written) ? lastJsWrite : '') ||
+            (/\.css$/i.test(written) ? lastCssWrite : '') ||
             lastJsWrite ||
             lastHtmlWrite
           const hint = formatEditSanityHint({
             path: written,
             content: body,
             html,
-            js: lastJsWrite
+            js: lastJsWrite,
+            css,
+            cssPath: lastCssWritePath,
+            userText: params.userText
           })
           if (hint) {
             editSanityFailed = true

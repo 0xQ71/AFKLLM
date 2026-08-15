@@ -321,6 +321,21 @@ describe('evidence-gated plan', () => {
     assert.equal(next.find((s) => s.id === '1')?.status, 'done')
     assert.equal(evidenceSupportsStep(steps[0]!.text, evidence), true)
   })
+
+  it('writing README does not tick Create index.html', () => {
+    const log = recordEvidence(
+      [],
+      evidenceFromTool({ name: 'write_file', ok: true, path: 'README.md' })!
+    )
+    assert.equal(evidenceSupportsStep('Create index.html — full landing page', log), false)
+    assert.equal(evidenceSupportsStep('Исправить EN/RU переключатель', log), false)
+    const jsLog = recordEvidence(
+      [],
+      evidenceFromTool({ name: 'apply_diff', ok: true, path: 'js/main.js' })!
+    )
+    assert.equal(evidenceSupportsStep('Create index.html — full landing page', jsLog), false)
+    assert.equal(evidenceSupportsStep('Исправить EN/RU переключатель', jsLog), true)
+  })
 })
 
 describe('write thresholds', () => {

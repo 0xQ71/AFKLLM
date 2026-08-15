@@ -12,20 +12,21 @@ export function formatSurgicalFollowUpHint(opts: {
     return (
       'SURGICAL i18n fix: the landing is already on disk. ' +
       'read_file index.html and js/main.js ONCE. ' +
-      'Fix the existing language switcher with apply_diff or ONE complete write_file of js/main.js (overwrite=true). ' +
-      'i18n dictionary VALUES must be strings — never objects or selector arrays (that renders [object Object]). ' +
-      'Query [data-i18n="key"] and set textContent to a string. Features cards: separate title/body string keys. ' +
-      'Do NOT rewrite the whole landing or invent a new i18n layer. Preview ONCE, then STOP with a short summary.'
+      'Fix the existing language switcher with apply_diff — getElementById MUST match the HTML id; ' +
+      'every data-i18n key MUST exist in the dict as a STRING. ' +
+      'If the user also asked for a theme toggle, add data-theme + a control with apply_diff. ' +
+      'Do NOT rewrite the whole landing, web_search, or create README.md. ' +
+      'Preview ONCE after the patch, then STOP with a short summary. Preview is not proof the switcher works.'
     )
   }
   if (isHtmlOnlyStacks(opts.stacks)) {
     return (
       'SURGICAL follow-up: existing files are already on disk. ' +
       'Call tools NOW. New small modules → one complete write_file each. ' +
-      'Existing HTML/CSS → apply_diff only (search_block ≤ ~80 lines). ' +
+      'Existing HTML/CSS/JS → apply_diff only (search_block ≤ ~80 lines). ' +
       'Open preview ONCE with Start-Process (Resolve-Path .\\index.html), then STOP and write a short summary. ' +
       'FORBIDDEN: rewriting the whole page, get_diagnostics on static HTML, opening the page more than once, ' +
-      'RU/EN i18n unless asked, narrating "created files" without tools.'
+      'web_search, inventing README.md, narrating "created files" without tools.'
     )
   }
   return (
