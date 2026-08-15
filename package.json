@@ -20,7 +20,7 @@
     "typecheck:node": "tsc --noEmit -p tsconfig.node.json",
     "typecheck:web": "tsc --noEmit -p tsconfig.web.json",
     "typecheck": "npm run typecheck:node && npm run typecheck:web",
-    "test:smoke": "tsx --test scripts/agent-smoke.test.ts scripts/git-smoke.test.ts scripts/shell-smoke.test.ts scripts/diagnostics-smoke.test.ts scripts/web-search-smoke.test.ts scripts/mcp-checkpoint-smoke.test.ts scripts/mcp-live-smoke.test.ts scripts/apply-patch-smoke.test.ts scripts/context-index-smoke.test.ts scripts/editor-ide-smoke.test.ts scripts/telemetry-smoke.test.ts scripts/shell-layout-smoke.test.ts scripts/composer-activity-smoke.test.ts scripts/acceptance-gate-smoke.test.ts scripts/translate-ru-smoke.test.ts scripts/llama-runtime-smoke.test.ts scripts/write-file-smoke.test.ts",
+    "test:smoke": "tsx --test scripts/agent-smoke.test.ts scripts/git-smoke.test.ts scripts/shell-smoke.test.ts scripts/diagnostics-smoke.test.ts scripts/web-search-smoke.test.ts scripts/mcp-checkpoint-smoke.test.ts scripts/mcp-live-smoke.test.ts scripts/apply-patch-smoke.test.ts scripts/context-index-smoke.test.ts scripts/editor-ide-smoke.test.ts scripts/telemetry-smoke.test.ts scripts/shell-layout-smoke.test.ts scripts/composer-activity-smoke.test.ts scripts/acceptance-gate-smoke.test.ts scripts/translate-ru-smoke.test.ts scripts/llama-runtime-smoke.test.ts scripts/write-file-smoke.test.ts scripts/stack-detect.test.ts",
     "test:git": "tsx --test scripts/git-smoke.test.ts",
     "dist": "npm run build && electron-builder --win --config",
     "dist:dir": "npm run build && electron-builder --win --dir --config",

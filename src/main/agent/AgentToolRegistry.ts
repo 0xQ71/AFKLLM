@@ -17,22 +17,31 @@ import {
 } from '../../shared/applyPatch'
 import { normalizeAgentShellCommand } from '../../shared/shellNormalize'
 import {
+  extractErrorFocus,
+  isUserInterruptExit,
+  looksLikeGuiLaunchCommand,
+  looksLikeShellFileMutation
+} from '../../shared/shellErrors'
+import { allowsFullOverwrite, truncationGuardMessage } from '../../shared/writeThresholds'
+import {
+  commandForMode,
+  DEFAULT_IGNORE_DIRS,
+  type VerifyMode
+} from '../../shared/projectStack'
+import { probeProjectStack } from '../context/StackProbe'
+import type { DiagnosticsSnapshot } from '../../shared/diagnostics'
+import {
   classifyBrowserOpenCommand,
   extractLocalPreviewUrl,
   extractOpenHtmlRelativePath,
+  htmlDocumentComplete,
+  isAfkllmInternalHtmlPath,
   looksLikeLocalServerCommand,
   pathToFileUrl
 } from '../../shared/localPreview'
+import { fastApplyEdit } from '../llama/ApplyEditClient'
 
-const IGNORED_DIRS = new Set([
-  'node_modules',
-  '.git',
-  'dist',
-  'out',
-  '.next',
-  'coverage',
-  '.cache'
-])
+const IGNORED_DIRS = new Set<string>([...DEFAULT_IGNORE_DIRS])
 
 type ToolHandler = (args: Record<string, unknown>) => Promise<AgentToolResult>
 
@@ -75,6 +84,12 @@ export interface AgentToolRegistryOptions {
    * Provided by main process (slot orchestrator + SdRuntimeManager).
    */
   generateImage?: (args: Record<string, unknown>) => Promise<AgentToolResult>
+  /**
+   * Coresident apply llama-server base URL (port+1) when ready; null if unloaded.
+   */
+  getApplyBaseUrl?: () => string | null
+  /** Latest IDE diagnostics snapshot (tsc/eslint). */
+  getDiagnostics?: () => DiagnosticsSnapshot
 }
 
 /**
@@ -96,6 +111,8 @@ export class AgentToolRegistry {
   private getDenyPreviewPorts?: () => number[]
   private contextIndex?: AgentToolRegistryOptions['contextIndex']
   private generateImageFn?: AgentToolRegistryOptions['generateImage']
+  private getApplyBaseUrl?: () => string | null
+  private getDiagnostics?: () => DiagnosticsSnapshot
   /** First-edit-per-path snapshot for Accept/Reject undo */
   private pendingEdits = new Map<string, PendingEdit>()
 
@@ -111,6 +128,8 @@ export class AgentToolRegistry {
     this.getDenyPreviewPorts = options.getDenyPreviewPorts
     this.contextIndex = options.contextIndex
     this.generateImageFn = options.generateImage
+    this.getApplyBaseUrl = options.getApplyBaseUrl
+    this.getDiagnostics = options.getDiagnostics
     this.handlers = new Map([
       ['read_file', (a) => this.readFile(a)],
       ['write_file', (a) => this.writeFile(a)],
@@ -123,7 +142,9 @@ export class AgentToolRegistry {
       ['create_directory', (a) => this.createDirectory(a)],
       ['execute_terminal_command', (a) => this.executeTerminal(a)],
       ['read_terminal', (a) => this.readTerminal(a)],
-      ['generate_image', (a) => this.generateImage(a)]
+      ['generate_image', (a) => this.generateImage(a)],
+      ['verify_project', (a) => this.verifyProject(a)],
+      ['get_diagnostics', (a) => this.getDiagnosticsTool(a)]
     ])
   }
 
@@ -530,10 +551,22 @@ export class AgentToolRegistry {
     // Block silent full rewrites of large files — the #1 cause of "rewrites everything after compact"
     if (!append && !overwrite && existing.trim().length > 40) {
       const tail = existing.slice(-350)
-      // Landing HTML often exceeds 6KB — still tell the model to overwrite=true, not apply_diff.
-      const small =
-        existing.length < 6000 ||
-        (/\.html?$/i.test(relativePath) && existing.length < 40_000)
+      const completeHtml =
+        /\.html?$/i.test(relativePath) && htmlDocumentComplete(existing)
+      if (completeHtml) {
+        return {
+          id: '',
+          name: 'write_file',
+          ok: false,
+          content:
+            `FILE_COMPLETE: "${relativePath}" already looks finished (${existing.length} bytes).\n` +
+            'Do NOT rewrite the whole file. Use apply_diff / apply_patch for a small fix. File currently ends with:\n<<<\n' +
+            tail +
+            '\n>>>',
+          error: `FILE_COMPLETE: ${relativePath} — do not overwrite; preview or patch`
+        }
+      }
+      const small = allowsFullOverwrite(relativePath, existing.length)
       return {
         id: '',
         name: 'write_file',
@@ -541,12 +574,77 @@ export class AgentToolRegistry {
         content:
           `FILE_EXISTS: "${relativePath}" already has ${existing.length} bytes.\n` +
           (small
-            ? `This is a small/landing file. Call write_file again with overwrite=true and the FULL corrected content.\n`
+            ? `This is a small file. Call write_file again with overwrite=true and the FULL corrected content.\n`
             : `Do NOT rewrite from scratch. Use apply_patch / apply_diff to edit, or append=true to continue.\n`) +
           `File currently ends with:\n<<<\n${tail}\n>>>`,
         error: small
           ? `FILE_EXISTS: ${relativePath} — use overwrite=true for this small file`
           : `FILE_EXISTS: ${relativePath} — use append=true or apply_diff`
+      }
+    }
+
+    // Never clobber a finished landing with a truncated / CSS-only rewrite.
+    if (
+      overwrite &&
+      !append &&
+      existed &&
+      htmlDocumentComplete(existing) &&
+      !htmlDocumentComplete(content)
+    ) {
+      return {
+        id: '',
+        name: 'write_file',
+        ok: false,
+        content: '',
+        error:
+          `FILE_COMPLETE: "${relativePath}" already ends with </html>. ` +
+          'Refusing to overwrite it with incomplete HTML. Use apply_diff or send a complete document.'
+      }
+    }
+
+    if (overwrite && !append && existed) {
+      const complete =
+        htmlDocumentComplete(existing) || existing.length >= 800
+      const guard = truncationGuardMessage({
+        relativePath,
+        existingBytes: existing.length,
+        newBytes: content.length,
+        allowFullRewrite: Boolean(args.allow_full_rewrite),
+        existingComplete: complete
+      })
+      if (guard) {
+        return {
+          id: '',
+          name: 'write_file',
+          ok: false,
+          content: guard,
+          error: guard
+        }
+      }
+    }
+
+    // Huge finished files only: require apply_diff or allow_full_rewrite.
+    // Medium HTML (under LARGE_FILE_OVERWRITE_CHARS) may be overwritten in one
+    // shot — the apply-model slot is often too small for the whole page.
+    if (
+      overwrite &&
+      !append &&
+      existed &&
+      htmlDocumentComplete(existing) &&
+      existing.length >= 800 &&
+      htmlDocumentComplete(content) &&
+      !Boolean(args.allow_full_rewrite) &&
+      !allowsFullOverwrite(relativePath, existing.length)
+    ) {
+      return {
+        id: '',
+        name: 'write_file',
+        ok: false,
+        content:
+          `FILE_COMPLETE: "${relativePath}" already ends with </html> (${existing.length} bytes).\n` +
+          'This file is too large for a one-shot overwrite. Use apply_diff / apply_patch, ' +
+          'or pass allow_full_rewrite=true after failed patches.',
+        error: `FILE_COMPLETE: ${relativePath} — use apply_diff; full rewrite blocked`
       }
     }
 
@@ -662,46 +760,190 @@ export class AgentToolRegistry {
     const relativePath = String(args.relative_path ?? '')
     const searchBlock = String(args.search_block ?? '')
     const replaceBlock = String(args.replace_block ?? '')
+    const replaceAll = Boolean(args.replace_all)
+    const instructionArg = String(args.instruction ?? '').trim()
 
-    if (!searchBlock) {
+    if (!searchBlock && !instructionArg) {
       return {
         id: '',
         name: 'apply_diff',
         ok: false,
         content: '',
-        error: 'search_block is empty'
+        error: 'search_block is empty (or pass instruction for apply-model edit)'
       }
     }
 
-    const abs = this.safeResolve(relativePath)
-    const original = await fs.readFile(abs, 'utf8')
-    const applied = applySearchReplaceFuzzy(original, searchBlock, replaceBlock)
+    // "Replace entire HTML / complete single-page landing" via instruction is a full
+    // rewrite in disguise — hangs apply model and fights FILE_COMPLETE.
+    const fullRewriteIntent =
+      /replace\s+entire|entire\s+html|whole\s+(html|file|landing)|полный\s+(html|файл|лендинг)|перепис\w*\s+(весь|целиком|полностью)|rewrite\s+(the\s+)?(whole|entire|full)|complete\s+single[- ]?page\s+landing|replace\s+.*\s+with\s+a\s+complete/i.test(
+        instructionArg
+      )
 
-    if (!applied.ok) {
-      const preview = original.replace(/\r\n/g, '\n').slice(0, 1200)
+    let effectivePath = relativePath
+    let abs = this.safeResolve(relativePath)
+    let original: string
+    try {
+      original = await fs.readFile(abs, 'utf8')
+    } catch {
       return {
         id: '',
         name: 'apply_diff',
         ok: false,
-        content:
-          `${applied.error}\n\n` +
-          `NEXT: call read_file on "${relativePath}", then apply_diff again with a SHORT unique exact substring copied from the file.\n` +
-          `If this file is small (HTML/CSS/short script), use write_file overwrite=true with the full corrected content instead of retrying a long hunk.\n` +
-          `Do not claim the environment forbids shell operators — use cwd=… or PowerShell ";".\n\n` +
-          `--- file preview (first ~1200 chars) ---\n${preview}`,
-        error: applied.error
+        content: '',
+        error: `${relativePath}: file not found. list_directory / read_file the real path, then apply_diff on that file.`
       }
     }
 
-    this.rememberEdit(relativePath, true, original)
-    await fs.writeFile(abs, applied.content, 'utf8')
-    this.notifyChange(relativePath)
-    const pathKey = relativePath.replace(/\\/g, '/')
+    const htmlComplete =
+      /\.html?$/i.test(effectivePath) &&
+      /<\/html\s*>/i.test(original) &&
+      original.length >= 1500
+
+    if (htmlComplete && fullRewriteIntent && !searchBlock.trim()) {
+      return {
+        id: '',
+        name: 'apply_diff',
+        ok: false,
+        content: '',
+        error:
+          'SURGICAL_EDIT: instruction asks to replace the entire HTML landing. Forbidden on a complete file. ' +
+          'Use a SHORT surgical instruction (one CSS/FAQ tweak) or search_block+replace_block. ' +
+          'Then open preview / summarize — do NOT rewrite the whole page.'
+      }
+    }
+
+    if (searchBlock) {
+      const applied = applySearchReplaceFuzzy(
+        original,
+        searchBlock,
+        replaceBlock,
+        replaceAll
+      )
+      if (applied.ok) {
+        this.rememberEdit(effectivePath, true, original)
+        await fs.writeFile(abs, applied.content, 'utf8')
+        this.notifyChange(effectivePath)
+        const pathKey = effectivePath.replace(/\\/g, '/')
+        const redirNote =
+          effectivePath !== relativePath
+            ? ` (retargeted from ${relativePath} — single-file page, CSS/JS is inline)`
+            : ''
+        const countNote =
+          applied.replacements > 1
+            ? ` (${applied.replacements} replacements)`
+            : ''
+        return {
+          id: '',
+          name: 'apply_diff',
+          ok: true,
+          content: `Applied diff to ${effectivePath}${applied.normalized ? ' (normalized newlines)' : ''}${countNote}${redirNote}`,
+          editReview: { path: pathKey, status: 'pending' }
+        }
+      }
+      if (/replace_all=true|matched \d+ times/i.test(applied.error)) {
+        return {
+          id: '',
+          name: 'apply_diff',
+          ok: false,
+          content: '',
+          error: applied.error
+        }
+      }
+    }
+
+    const instruction =
+      instructionArg ||
+      (searchBlock
+        ? `Replace the following exact snippet with the replacement.\n\nSEARCH:\n${searchBlock}\n\nREPLACE:\n${replaceBlock}`
+        : '')
+
+    return this.smartApplyToFile({
+      toolName: 'apply_diff',
+      relativePath: effectivePath,
+      abs,
+      original,
+      instruction,
+      timeoutMs:
+        typeof args.timeout_ms === 'number' && args.timeout_ms > 0
+          ? Math.min(90_000, Math.floor(args.timeout_ms))
+          : undefined,
+      maxAttempts:
+        typeof args.max_attempts === 'number' && args.max_attempts >= 1
+          ? Math.min(2, Math.floor(args.max_attempts))
+          : undefined,
+      retargetNote:
+        effectivePath !== relativePath
+          ? ` (retargeted from ${relativePath})`
+          : ''
+    })
+  }
+
+  /**
+   * Morph-style edit via coresident apply model when fuzzy/search fails.
+   */
+  private async smartApplyToFile(opts: {
+    toolName: 'apply_diff' | 'apply_patch'
+    relativePath: string
+    abs: string
+    original: string
+    instruction: string
+    retargetNote?: string
+    /** Cap apply wait (default 60s). Keep short for parse-fail fallbacks. */
+    timeoutMs?: number
+    /** 1 = no retry (fail fast). Default 2. */
+    maxAttempts?: number
+  }): Promise<AgentToolResult> {
+    const baseUrl = this.getApplyBaseUrl?.() ?? null
+    if (!baseUrl) {
+      return {
+        id: '',
+        name: opts.toolName,
+        ok: false,
+        content: '',
+        error:
+          'APPLY_UNAVAILABLE: apply model is not loaded (Settings → Apply model → Load). ' +
+          'Do NOT re-read or full-rewrite; ask the user to Load chat+apply, or summarize failure.'
+      }
+    }
+    if (!opts.instruction.trim()) {
+      return {
+        id: '',
+        name: opts.toolName,
+        ok: false,
+        content: '',
+        error: 'SMART_APPLY_FAIL: empty instruction'
+      }
+    }
+
+    const result = await fastApplyEdit({
+      baseUrl,
+      instruction: opts.instruction,
+      filePath: opts.relativePath,
+      content: opts.original,
+      timeoutMs: opts.timeoutMs ?? 60_000,
+      maxAttempts: opts.maxAttempts ?? 2
+    })
+
+    if (!result.ok) {
+      return {
+        id: '',
+        name: opts.toolName,
+        ok: false,
+        content: result.error,
+        error: result.error
+      }
+    }
+
+    this.rememberEdit(opts.relativePath, true, opts.original)
+    await fs.writeFile(opts.abs, result.content, 'utf8')
+    this.notifyChange(opts.relativePath)
+    const pathKey = opts.relativePath.replace(/\\/g, '/')
     return {
       id: '',
-      name: 'apply_diff',
+      name: opts.toolName,
       ok: true,
-      content: `Applied diff to ${relativePath}${applied.normalized ? ' (normalized newlines)' : ''}`,
+      content: `Applied via apply model (${result.applied} block(s)) to ${opts.relativePath}${opts.retargetNote ?? ''}`,
       editReview: { path: pathKey, status: 'pending' }
     }
   }
@@ -710,18 +952,50 @@ export class AgentToolRegistry {
     const patchText = String(args.patch ?? '')
     const parsed = parseApplyPatch(patchText)
     if (!parsed.ok) {
+      const guessed =
+        patchText.match(/\*\*\*\s*(?:Update|Add)\s+File:\s*([^\n*]+)/i)?.[1]?.trim() ||
+        ''
+      // Do NOT dump the whole malformed patch into the apply model — that often
+      // hangs 1–2 minutes after "*** End Patch" with no UI progress. Prefer a
+      // short +line intent, else fail fast to apply_diff.
+      const plusIntent = [...patchText.matchAll(/^\+(?!\+\+)(.*)$/gm)]
+        .map((m) => m[1] ?? '')
+        .join('\n')
+        .trim()
+        .slice(0, 2_500)
+      if (plusIntent.length >= 24 && guessed) {
+        try {
+          const abs = this.safeResolve(guessed)
+          const original = await fs.readFile(abs, 'utf8')
+          return this.smartApplyToFile({
+            toolName: 'apply_patch',
+            relativePath: guessed.replace(/\\/g, '/'),
+            abs,
+            original,
+            instruction:
+              `Apply ONLY this intended addition/change (malformed apply_patch):\n${plusIntent}`,
+            timeoutMs: 45_000
+          })
+        } catch {
+          /* fall through to fast fail */
+        }
+      }
       return {
         id: '',
         name: 'apply_patch',
         ok: false,
         content: '',
-        error: parsed.error ?? 'Invalid patch'
+        error:
+          `apply_patch parse error: ${parsed.error ?? 'invalid'}. ` +
+          'Prefer apply_diff (relative_path + short search_block or instruction); do not re-send the same malformed patch.'
       }
     }
 
     const changed: Array<{ path: string; action: string }> = []
     const errors: string[] = []
     let firstReviewPath: string | null = null
+    let lastFailedUpdate: { path: string; abs: string; original: string } | null =
+      null
 
     for (const op of parsed.ops) {
       try {
@@ -774,27 +1048,49 @@ export class AgentToolRegistry {
         }
 
         let original: string
+        let updateAbs = abs
+        let updatePath = pathKey
         try {
           original = await fs.readFile(abs, 'utf8')
         } catch {
-          errors.push(`${pathKey}: file not found for update`)
+          errors.push(`${pathKey}: file not found`)
           continue
         }
         const applied = applyHunksToText(original, op.hunks ?? [])
         if (!applied.ok || applied.content == null) {
-          errors.push(`${pathKey}: ${applied.error ?? 'hunk apply failed'}`)
+          errors.push(`${updatePath}: ${applied.error ?? 'hunk apply failed'}`)
+          lastFailedUpdate = { path: updatePath, abs: updateAbs, original }
           continue
         }
-        this.rememberEdit(pathKey, true, original)
-        await fs.writeFile(abs, applied.content, 'utf8')
-        this.notifyChange(pathKey)
-        changed.push({ path: pathKey, action: 'update' })
-        if (!firstReviewPath) firstReviewPath = pathKey
+        this.rememberEdit(updatePath, true, original)
+        await fs.writeFile(updateAbs, applied.content, 'utf8')
+        this.notifyChange(updatePath)
+        changed.push({ path: updatePath, action: 'update' })
+        if (!firstReviewPath) firstReviewPath = updatePath
       } catch (err) {
         errors.push(
           `${op.path}: ${err instanceof Error ? err.message : String(err)}`
         )
       }
+    }
+
+    if (changed.length === 0 && lastFailedUpdate) {
+      const plusIntent = [...patchText.matchAll(/^\+(?!\+\+)(.*)$/gm)]
+        .map((m) => m[1] ?? '')
+        .join('\n')
+        .trim()
+        .slice(0, 2_500)
+      return this.smartApplyToFile({
+        toolName: 'apply_patch',
+        relativePath: lastFailedUpdate.path,
+        abs: lastFailedUpdate.abs,
+        original: lastFailedUpdate.original,
+        instruction:
+          plusIntent.length >= 24
+            ? `Apply ONLY this intended change (hunks failed):\n${plusIntent}`
+            : `Apply this patch intent (deterministic hunks failed).\n\n${patchText.slice(0, 4_000)}`,
+        timeoutMs: 45_000
+      })
     }
 
     const content = formatApplyPatchResult(changed, errors)
@@ -929,6 +1225,19 @@ export class AgentToolRegistry {
     const command = normalized.command
     const cwdRel = normalized.cwdRel
 
+    if (looksLikeShellFileMutation(command) || looksLikeShellFileMutation(rawCommand)) {
+      return {
+        id: '',
+        name: 'execute_terminal_command',
+        ok: false,
+        content: '',
+        error:
+          'SHELL_EDIT_FORBIDDEN: shell text substitution cannot edit workspace files — ' +
+          'it bypasses the diff review, the file tree refresh and rewind (the change cannot be undone). ' +
+          'Global rename: apply_diff with replace_all=true. New file: write_file. Delete: delete_file.'
+      }
+    }
+
     // Intercept preview opens: workspace .html → file://; Vite localhost → that URL;
     // LLM API port (e.g. :8080) → never open llama UI, use workspace HTML instead.
     const openKind =
@@ -996,6 +1305,9 @@ export class AgentToolRegistry {
     let rel = extractOpenHtmlRelativePath(command, cwdRel)
       .replace(/\\/g, '/')
       .replace(/^\.\//, '')
+    if (isAfkllmInternalHtmlPath(rel) || /(?:^|\/)browser\.html$/i.test(rel)) {
+      rel = 'index.html'
+    }
     // Absolute paths outside the repo → force root index.html
     if (/^[a-zA-Z]:\//.test(rel) || rel.startsWith('/')) {
       const normRoot = normalize(this.projectRoot).toLowerCase()
@@ -1109,6 +1421,77 @@ export class AgentToolRegistry {
     return this.generateImageFn(args)
   }
 
+  private async verifyProject(args: Record<string, unknown>): Promise<AgentToolResult> {
+    const modeRaw = String(args.mode ?? 'build').toLowerCase()
+    const mode: VerifyMode =
+      modeRaw === 'test' || modeRaw === 'lint' || modeRaw === 'run' || modeRaw === 'build'
+        ? modeRaw
+        : 'build'
+    const override = String(args.command ?? '').trim()
+    let command = override
+    if (!command) {
+      const snap = await probeProjectStack(this.projectRoot)
+      for (const stack of snap.stacks) {
+        const cmd = commandForMode(stack, mode)
+        if (cmd) {
+          command = cmd
+          break
+        }
+      }
+    }
+    if (!command) {
+      return {
+        id: '',
+        name: 'verify_project',
+        ok: false,
+        content: '',
+        error:
+          `No ${mode} command for the detected stack. Pass command=… explicitly, or add a stack marker ` +
+          `(package.json, pom.xml, go.mod, Cargo.toml, CMakeLists.txt, *.csproj, requirements.txt).`
+      }
+    }
+    const result = await this.executeTerminal({
+      command,
+      cwd: typeof args.cwd === 'string' ? args.cwd : '.'
+    })
+    return {
+      ...result,
+      name: 'verify_project',
+      content: `verify_project mode=${mode}\ncommand: ${command}\n\n${result.content}`
+    }
+  }
+
+  private async getDiagnosticsTool(_args: Record<string, unknown>): Promise<AgentToolResult> {
+    const snap = this.getDiagnostics?.()
+    if (!snap) {
+      return {
+        id: '',
+        name: 'get_diagnostics',
+        ok: true,
+        content: 'No diagnostics snapshot yet (workspace not indexed / not run).'
+      }
+    }
+    const items = snap.items ?? []
+    if (items.length === 0) {
+      return {
+        id: '',
+        name: 'get_diagnostics',
+        ok: true,
+        content: `No diagnostics.${snap.note ? ` (${snap.note})` : ''}`
+      }
+    }
+    const lines = items.slice(0, 80).map((d) => {
+      return `${d.severity} ${d.path}:${d.line}:${d.column} [${d.source}] ${d.message}`
+    })
+    const extra = items.length > 80 ? `\n…and ${items.length - 80} more` : ''
+    return {
+      id: '',
+      name: 'get_diagnostics',
+      ok: true,
+      content: `${lines.join('\n')}${extra}`
+    }
+  }
+
   private formatShellResult(
     command: string,
     output: string,
@@ -1138,27 +1521,32 @@ export class AgentToolRegistry {
               : '')
       }
     }
-    if (exitCode === 130) {
+    if (isUserInterruptExit(exitCode)) {
+      const stopped = exitCode === 130
       return {
         id: '',
         name: 'execute_terminal_command',
-        ok: false,
-        content: `USER_STOPPED: command interrupted (exit_code=130)\ncommand: ${command}\n${noteLine}\n${body}`,
-        error: 'Interrupted by Stop'
+        ok: !stopped,
+        content: stopped
+          ? `USER_STOPPED: command interrupted (exit_code=130)\ncommand: ${command}\n${noteLine}\n${body}`
+          : `PROCESS_ENDED: interrupted by Ctrl+C / console close (exit_code=${exitCode})\n` +
+            `command: ${command}\n` +
+            `Do NOT rewrite or relaunch unless the user asks.\n` +
+            noteLine +
+            `\n${body}`,
+        error: stopped ? 'Interrupted by Stop' : undefined
       }
     }
-    // Windows Ctrl+C / console close (STATUS_CONTROL_C_EXIT)
-    if (
-      exitCode === 0xc000013a ||
-      exitCode === -1073741510 ||
-      exitCode === 3221225786
-    ) {
+
+    const focus = extractErrorFocus(body)
+    // GUI launch closed by the user (no compiler markers) — not a build failure.
+    if (!focus && looksLikeGuiLaunchCommand(command)) {
       return {
         id: '',
         name: 'execute_terminal_command',
         ok: true,
         content:
-          `PROCESS_ENDED: interrupted by Ctrl+C / console close (exit_code=${exitCode})\n` +
+          `PROCESS_ENDED: GUI/process closed (exit_code=${exitCode}) with no compiler/runtime traceback.\n` +
           `command: ${command}\n` +
           `Do NOT rewrite or relaunch unless the user asks.\n` +
           noteLine +
@@ -1166,30 +1554,21 @@ export class AgentToolRegistry {
       }
     }
 
-    const focus = extractErrorFocus(body)
-    // No error markers → user closed GUI / process finished; don't label TERMINAL_ERROR
-    // (that triggers rewrite/restart loops).
-    if (!focus) {
-      return {
-        id: '',
-        name: 'execute_terminal_command',
-        ok: true,
-        content:
-          `PROCESS_ENDED: process exited (exit_code=${exitCode}) with no compiler/runtime error traceback.\n` +
-          `command: ${command}\n` +
-          `This usually means the user closed the window or the program finished. ` +
-          `Do NOT rewrite the program, do NOT relaunch it, and do NOT treat this as a bug — wait for the user's next instruction.\n` +
-          noteLine +
-          `\n${body}`
-      }
-    }
-
+    const focusOrTail =
+      focus ||
+      body
+        .split(/\n/)
+        .slice(-40)
+        .join('\n')
+        .trim()
+        .slice(-4000) ||
+      '(no output)'
     const content =
       `TERMINAL_ERROR: command failed (exit_code=${exitCode})\n` +
       `command: ${command}\n` +
       noteLine +
       `\n` +
-      `ERROR_FOCUS (read and fix THIS — do not guess):\n${focus}\n\n` +
+      `ERROR_FOCUS (read and fix THIS — do not guess):\n${focusOrTail}\n\n` +
       `FULL_OUTPUT:\n${body}\n\n` +
       `REQUIRED: open the file/line named in the traceback (read_file), apply_diff to fix the stated cause, then re-run the SAME command (use cwd=… instead of bash &&). Do not rewrite the whole project or drop the tech stack.`
     return {
@@ -1380,38 +1759,6 @@ function stripAnsi(s: string): string {
     .replace(/\r/g, '')
 }
 
-/**
- * Pull the most actionable error slice (Python traceback, Error:, FAILED, etc.)
- * so the model fixes the real cause instead of guessing.
- * Returns null when there is no real error marker — do NOT fall back to "last N lines"
- * (that turns a user-closed GUI into a fake ERROR_FOCUS and triggers rewrite loops).
- */
-function extractErrorFocus(text: string): string | null {
-  const lines = text.split(/\n/)
-  const markers: number[] = []
-  for (let i = 0; i < lines.length; i++) {
-    const l = lines[i]!
-    if (
-      /Traceback \(most recent call last\)/i.test(l) ||
-      /^[A-Za-z_][\w.]*Error:/i.test(l) ||
-      /^Error:/i.test(l) ||
-      /Exception in thread/i.test(l) ||
-      /ModuleNotFoundError|ImportError|SyntaxError|NameError|TypeError|AttributeError|FileNotFoundError|IndentationError/i.test(
-        l
-      ) ||
-      /\berror:|cannot find symbol|package .+ does not exist|\bjavac\b.*error/i.test(l) ||
-      /\bFAILED\b|\bFAILURES!\b|AssertionError|Invoke-Expression|ParserError|not recognized/i.test(
-        l
-      )
-    ) {
-      markers.push(i)
-    }
-  }
-  if (markers.length === 0) return null
-  const start = markers[Math.max(0, markers.length - 3)]!
-  return lines.slice(start).join('\n').trim().slice(-4000)
-}
-
 function isTextLike(filename: string): boolean {
   const ext = filename.includes('.') ? filename.slice(filename.lastIndexOf('.')) : ''
   const textExts = new Set([
@@ -1437,9 +1784,19 @@ function isTextLike(filename: string): boolean {
     '.kt',
     '.cs',
     '.cpp',
+    '.cc',
+    '.cxx',
     '.c',
     '.h',
+    '.hh',
     '.hpp',
+    '.hxx',
+    '.m',
+    '.mm',
+    '.swift',
+    '.rb',
+    '.php',
+    '.lua',
     '.yml',
     '.yaml',
     '.toml',
@@ -1450,6 +1807,9 @@ function isTextLike(filename: string): boolean {
     '.bat',
     '.sql',
     '.graphql',
+    '.cmake',
+    '.gradle',
+    '.proto',
     '.env'
   ])
   return textExts.has(ext.toLowerCase()) || !ext

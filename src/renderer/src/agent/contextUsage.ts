@@ -167,6 +167,11 @@ export function estimateContextUsage(input: EstimateContextUsageInput): ContextU
           : prompt
     const live = localSum > 0 ? Math.round(localSum * (prompt / anchor)) : prompt
     used = Math.max(prompt, live)
+    // Tiny follow-up measures (title / FIM / short conclude) must not collapse the gauge
+    // when the local conversation estimate is already much larger.
+    if (localSum > 400 && prompt < localSum * 0.35) {
+      used = Math.max(used, localSum)
+    }
   } else {
     // Before server measure: grow with the thread only (tools/rules alone look like a fake spike).
     used =

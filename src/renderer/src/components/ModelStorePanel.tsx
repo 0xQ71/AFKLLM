@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
+  HF_APPLY_RECOMMENDED_MODELS,
   HF_IMAGE_GEN_CLIP_G_MODELS,
   HF_IMAGE_GEN_CLIP_L_MODELS,
   HF_IMAGE_GEN_LLM_MODELS,
@@ -67,6 +68,7 @@ function formatCount(n: number): string {
 function allStaffCatalogs() {
   return [
     ...HF_RECOMMENDED_MODELS,
+    ...HF_APPLY_RECOMMENDED_MODELS,
     ...HF_VISION_RECOMMENDED_MODELS,
     ...HF_IMAGE_GEN_RECOMMENDED_MODELS,
     ...HF_IMAGE_GEN_VAE_MODELS,
@@ -90,6 +92,8 @@ function repoTitle(id: string, preferredFile?: string): string {
 
 function storeSubtitleKey(target: StoreDownloadTarget): MessageKey {
   switch (target) {
+    case 'apply':
+      return 'store.subtitleApply'
     case 'vision':
       return 'store.subtitleVision'
     case 'mmproj':

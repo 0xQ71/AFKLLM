@@ -1,4 +1,6 @@
 ﻿import { parseReadFileMeta } from './agentPure'
+import { DEFAULT_UI_LANGUAGE } from '../../../shared/i18n'
+import { translate } from '../i18n/messages'
 
 export type ComposerActivityKind =
   | 'read'
@@ -471,13 +473,12 @@ export function aggregateActivityMessages(
     const count = slice.length
     let summary: string
     if (kind === 'search') {
-      summary = `${count} searches`
+      summary = translate(DEFAULT_UI_LANGUAGE, 'activity.group.nSearches', { n: count })
     } else if (kind === 'read') {
-      summary = count === 1 ? '1 file' : `Explored ${count} files`
-      summary = `Explored ${count} files`
+      summary = translate(DEFAULT_UI_LANGUAGE, 'activity.group.exploredFiles', { n: count })
     } else {
       const files = slice.reduce((acc, s) => acc + (s.activity.fileCount ?? 1), 0)
-      summary = `Explored ${files} files`
+      summary = translate(DEFAULT_UI_LANGUAGE, 'activity.group.exploredFiles', { n: files })
     }
 
     out.push({

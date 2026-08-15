@@ -1,6 +1,7 @@
 import type * as Monaco from 'monaco-editor'
 import type { QueueManager } from '../llm/queueManager'
 import type { FimContext } from '../../../shared/types'
+import { isAgentGenerationBusy, onAgentGenerationBusy } from '../agent/agentBusyGate'
 
 export interface FimProviderOptions {
   queue: QueueManager
@@ -71,6 +72,12 @@ export function registerMonacoFimProvider(
       _context: Monaco.languages.InlineCompletionContext,
       token: Monaco.CancellationToken
     ): Promise<Monaco.languages.InlineCompletions | null> {
+      // Never steal the LLM queue while an agent turn is running.
+      if (isAgentGenerationBusy()) {
+        activeAbort?.abort('agent_busy')
+        return null
+      }
+
       const uri = model.uri.toString()
 
       // Cached stream for same caret (eager / refresh)
@@ -224,9 +231,18 @@ export function registerMonacoFimProvider(
   }
 
   const disposable = monaco.languages.registerInlineCompletionsProvider({ pattern: '**' }, provider)
+  const unsubBusy = onAgentGenerationBusy((next) => {
+    if (!next) return
+    generation++
+    activeAbort?.abort('agent_busy')
+    activeAbort = null
+    cache = null
+    options.queue.abortFim()
+  })
 
   return {
     dispose(): void {
+      unsubBusy()
       if (debounceTimer) clearTimeout(debounceTimer)
       if (refreshTimer) clearTimeout(refreshTimer)
       activeAbort?.abort('disposed')

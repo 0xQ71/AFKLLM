@@ -32,6 +32,8 @@ export interface LlamaProcessOptions {
   ctxCheckpoints?: number
   loadMode?: LoadMode
   contextShift?: boolean
+  /** Apply slot: disable Qwen thinking so content is not empty. */
+  disableReasoning?: boolean
 }
 
 export type LlamaProcessState = 'stopped' | 'starting' | 'ready' | 'error'
@@ -229,6 +231,10 @@ export class LlamaProcessManager extends EventEmitter {
       this.options.fitHardware ? 'on' : 'off',
       '--jinja'
     ]
+
+    if (this.options.disableReasoning) {
+      args.push('--reasoning', 'off', '--reasoning-budget', '0')
+    }
 
     if (useMtp) {
       args.push('--spec-type', 'draft-mtp', '--spec-draft-n-max', String(draftN))

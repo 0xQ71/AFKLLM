@@ -61,6 +61,13 @@ export function formatTelemetryLogLine(ev: TelemetryEvent): string {
     ev.message.replace(/\s+/g, ' ')
   ].filter(Boolean)
   let line = parts.join(' ')
+  if (ev.extra && Object.keys(ev.extra).length) {
+    try {
+      line += ` ${JSON.stringify(ev.extra)}`
+    } catch {
+      /* ignore */
+    }
+  }
   if (ev.stack) line += `\n  ${ev.stack.split('\n').slice(0, 12).join('\n  ')}`
   return line + '\n'
 }

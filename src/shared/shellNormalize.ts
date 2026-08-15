@@ -1,6 +1,6 @@
 /**
  * Normalize agent shell for host (PowerShell on Windows).
- * Models often emit bash `cd x && cmd` which fails on PS5.
+ * Models often emit bash `cd x && cmd`, `/dev/null`, `find | head` which fail on PS5.
  */
 
 export interface NormalizedShell {
@@ -44,6 +44,51 @@ export function rewriteBashOperators(command: string): string {
   return out.replace(/\s*;\s*/g, '; ').trim()
 }
 
+/**
+ * Rewrite common Unixisms that break PowerShell:
+ * - 2>/dev/null, >/dev/null → 2>$null / >$null
+ * - find . -name "x" -type f → Get-ChildItem …
+ * - | head -N → | Select-Object -First N
+ * - | tail -N → | Select-Object -Last N
+ * - | grep → | Select-String (best-effort)
+ */
+export function rewriteUnixismsForPowerShell(command: string): string {
+  let cmd = command.trim()
+
+  // find . -name "pattern" [-type f] [| head -N]
+  const findHead = cmd.match(
+    /^find\s+(\.|\.\/|"[^"]+"|'[^']+'|\S+)\s+-name\s+("[^"]+"|'[^']+'|\S+)(?:\s+-type\s+f)?(?:\s+2?>\s*\/dev\/null)?(?:\s*\|\s*head\s+-n?\s*(\d+))?\s*$/i
+  )
+  if (findHead) {
+    const name = findHead[2]!.replace(/^["']|["']$/g, '')
+    const n = findHead[3]
+    const base = `Get-ChildItem -Recurse -File -Filter ${JSON.stringify(name)} | Select-Object -ExpandProperty FullName`
+    return n ? `${base} | Select-Object -First ${n}` : base
+  }
+
+  // Redirects to /dev/null (PowerShell otherwise resolves D:\dev\null)
+  cmd = cmd
+    .replace(/\s+2>&1\s*>\s*\/dev\/null\b/gi, ' 2>&1 >$null')
+    .replace(/\s+2>\s*\/dev\/null\b/gi, ' 2>$null')
+    .replace(/\s+>\s*\/dev\/null\b/gi, ' >$null')
+    .replace(/\s+1>\s*\/dev\/null\b/gi, ' >$null')
+
+  // Pipes: head / tail / grep (simple cases)
+  cmd = cmd.replace(/\|\s*head\s+-n?\s*(\d+)\b/gi, '| Select-Object -First $1')
+  cmd = cmd.replace(/\|\s*tail\s+-n?\s*(\d+)\b/gi, '| Select-Object -Last $1')
+  cmd = cmd.replace(
+    /\|\s*grep\s+(?:-E\s+)?(?:"([^"]+)"|'([^']+)'|(\S+))/gi,
+    (_m, a, b, c) => `| Select-String -Pattern ${JSON.stringify(a || b || c || '')}`
+  )
+
+  // Bare `ls -la` → Get-ChildItem (ls alone is fine as PS alias)
+  if (/^ls\s+-[laRh]+\b/i.test(cmd)) {
+    cmd = cmd.replace(/^ls\s+-[laRh]+\b/i, 'Get-ChildItem')
+  }
+
+  return cmd.trim()
+}
+
 /** Peel `cd dir && rest` into cwd + rest when cwdRel is `.` / empty. */
 export function peelLeadingCd(
   command: string,
@@ -81,10 +126,15 @@ export function normalizeAgentShellCommand(
   cwd = peeled.cwdRel
 
   if (platform === 'win32') {
-    const before = cmd
+    const beforeOps = cmd
     cmd = rewriteBashOperators(cmd)
-    if (cmd !== before) {
+    if (cmd !== beforeOps) {
       notes.push('rewrote bash &&/|| to PowerShell ;')
+    }
+    const beforeUnix = cmd
+    cmd = rewriteUnixismsForPowerShell(cmd)
+    if (cmd !== beforeUnix) {
+      notes.push('rewrote Unix shell for PowerShell')
     }
   }
 

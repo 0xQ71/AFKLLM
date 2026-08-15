@@ -204,6 +204,12 @@ const en = {
     'Paused after {rounds} tool rounds ({tools} tools). Say "continue" to keep going — I will resume from existing files, not restart.',
   'chat.agent.genTimeout':
     '⏱ Generation timed out (soft queue limit). Partial tool output was discarded — send "continue" or raise max tokens / model speed.',
+  'chat.agent.recoveringTools':
+    '↻ Recovering from repeated tools — trying a different approach…',
+  'chat.agent.recoveringPath':
+    '↻ Recovering: set relative_path on write_file / create_directory and continue…',
+  'chat.diff.writing': 'Writing…',
+  'chat.diff.show': 'Show diff',
   'chat.reverb.edit': 'Edit task',
   'chat.reverb.save': 'Save & continue',
   'chat.reverb.cancel': 'Cancel',
@@ -279,6 +285,7 @@ const en = {
 
   'settings.model': 'Model',
   'settings.model.gguf': 'Model (.gguf)',
+  'settings.model.applyGguf': 'Apply model (.gguf)',
   'settings.model.none': 'No models found — browse…',
   'settings.model.browse': 'Browse',
   'settings.model.browseFolder': 'Open models folder',
@@ -290,6 +297,8 @@ const en = {
   'settings.model.load': 'Load',
   'settings.model.unload': 'Unload',
   'settings.model.loading': 'Cancel load…',
+  'settings.model.applyStatus': 'Apply status',
+  'settings.model.applyStatusHint': 'Set an apply GGUF above — Load starts it with chat in the same VRAM',
   'settings.model.store': '── Model store (Hugging Face) ──',
   'settings.model.storeShort': 'Store',
 
@@ -355,6 +364,7 @@ const en = {
 
   'store.title': 'Explore models',
   'store.subtitle': 'Hugging Face · GGUF',
+  'store.subtitleApply': 'Hugging Face · Apply GGUF',
   'store.subtitleVision': 'Hugging Face · Vision GGUF',
   'store.subtitleMmproj': 'Hugging Face · mmproj',
   'store.subtitleImageGen': 'Hugging Face · Image gen',
@@ -492,12 +502,12 @@ const en = {
 
   'settings.diag': 'Logs',
   'settings.diag.note':
-    'AFKLLM never uploads logs. When enabled, errors are appended to a local file under userData.',
+    'AFKLLM never uploads logs. When enabled, errors and agent diagnostics are appended to a local file under userData.',
   'settings.diag.collectLogs': 'Collect logs to file',
   'settings.diag.telemetry': 'Collect logs to file',
   'settings.diag.openLog': 'Open logs folder',
   'settings.diag.console': 'Console log',
-  'settings.diag.consoleDesc': 'Local errors and diagnostics. Never uploaded.',
+  'settings.diag.consoleDesc': 'Local errors and agent diagnostics. Never uploaded.',
   'settings.diag.refreshLog': 'Refresh',
   'settings.diag.clearLog': 'Clear',
   'settings.diag.consoleEmpty': 'No log entries yet.',
@@ -658,6 +668,8 @@ const en = {
   'chat.thought.briefly': 'Thought:',
   'chat.thought.forDuration': 'Thought:',
   'chat.thought.waiting': 'Gathering thoughts…',
+  'chat.thought.planLead': 'Planning:',
+  'chat.thought.planning': 'Planning:',
   'chat.newAgentTitle': 'New agent',
 
   'activity.verb.reading': 'Reading',
@@ -692,6 +704,8 @@ const en = {
   'activity.suffix.nFiles': '{n} files',
   'activity.target.oneFile': '1 file',
   'activity.target.nFiles': '{n} files',
+  'activity.group.exploredFiles': 'Explored {n} files',
+  'activity.group.nSearches': '{n} searches',
 
   'stats.generation': 'Generation {duration}',
   'stats.tokensPerSec': '{n} tokens/sec',
@@ -920,6 +934,12 @@ const ru: Record<MessageKey, string> = {
     'Пауза после {rounds} раундов инструментов ({tools} вызовов). Напишите «продолжи», чтобы продолжить — продолжу с существующих файлов, без перезапуска.',
   'chat.agent.genTimeout':
     '⏱ Генерация прервана по лимиту очереди. Частичный вывод инструмента отброшен — напишите «продолжи» или увеличьте max tokens / скорость модели.',
+  'chat.agent.recoveringTools':
+    '↻ Выхожу из повтора инструментов — пробую другой подход…',
+  'chat.agent.recoveringPath':
+    '↻ Восстановление: укажи relative_path у write_file / create_directory и продолжай…',
+  'chat.diff.writing': 'Пишу…',
+  'chat.diff.show': 'Показать diff',
   'chat.reverb.edit': 'Изменить задание',
   'chat.reverb.save': 'Сохранить и продолжить',
   'chat.reverb.cancel': 'Отмена',
@@ -997,6 +1017,7 @@ const ru: Record<MessageKey, string> = {
 
   'settings.model': 'Модель',
   'settings.model.gguf': 'Модель (.gguf)',
+  'settings.model.applyGguf': 'Apply-модель (.gguf)',
   'settings.model.none': 'Модели не найдены — выберите…',
   'settings.model.browse': 'Обзор',
   'settings.model.browseFolder': 'Открыть папку моделей',
@@ -1008,6 +1029,9 @@ const ru: Record<MessageKey, string> = {
   'settings.model.load': 'Загрузить',
   'settings.model.unload': 'Выгрузить',
   'settings.model.loading': 'Отменить загрузку…',
+  'settings.model.applyStatus': 'Статус Apply',
+  'settings.model.applyStatusHint':
+    'Выберите apply GGUF выше — Загрузить поднимет её вместе с chat в тот же VRAM',
   'settings.model.store': '── Магазин моделей (Hugging Face) ──',
   'settings.model.storeShort': 'Магазин',
 
@@ -1073,6 +1097,7 @@ const ru: Record<MessageKey, string> = {
 
   'store.title': 'Обзор моделей',
   'store.subtitle': 'Hugging Face · GGUF',
+  'store.subtitleApply': 'Hugging Face · Apply GGUF',
   'store.subtitleVision': 'Hugging Face · Vision GGUF',
   'store.subtitleMmproj': 'Hugging Face · mmproj',
   'store.subtitleImageGen': 'Hugging Face · Генерация изображений',
@@ -1210,12 +1235,12 @@ const ru: Record<MessageKey, string> = {
 
   'settings.diag': 'Логи',
   'settings.diag.note':
-    'AFKLLM никогда не отправляет логи. При включении ошибки дописываются в локальный файл в userData.',
+    'AFKLLM никогда не отправляет логи. При включении ошибки и диагностика агента дописываются в локальный файл в userData.',
   'settings.diag.collectLogs': 'Собирать логи в файл',
   'settings.diag.telemetry': 'Собирать логи в файл',
   'settings.diag.openLog': 'Открыть папку логов',
   'settings.diag.console': 'Консоль-лог',
-  'settings.diag.consoleDesc': 'Локальные ошибки и диагностика. Никуда не отправляются.',
+  'settings.diag.consoleDesc': 'Локальные ошибки и диагностика агента. Никуда не отправляются.',
   'settings.diag.refreshLog': 'Обновить',
   'settings.diag.clearLog': 'Очистить',
   'settings.diag.consoleEmpty': 'Записей пока нет.',
@@ -1376,6 +1401,8 @@ const ru: Record<MessageKey, string> = {
   'chat.thought.briefly': 'Думал:',
   'chat.thought.forDuration': 'Думал:',
   'chat.thought.waiting': 'Набираю мысль…',
+  'chat.thought.planLead': 'Планирую:',
+  'chat.thought.planning': 'Планирую:',
   'chat.newAgentTitle': 'Новый агент',
 
   'activity.verb.reading': 'Читаю',
@@ -1410,6 +1437,8 @@ const ru: Record<MessageKey, string> = {
   'activity.suffix.nFiles': 'файлов: {n}',
   'activity.target.oneFile': '1 файл',
   'activity.target.nFiles': 'файлов: {n}',
+  'activity.group.exploredFiles': 'Просмотрено файлов: {n}',
+  'activity.group.nSearches': 'поисков: {n}',
 
   'stats.generation': 'Генерация {duration}',
   'stats.tokensPerSec': '{n} ток/с',

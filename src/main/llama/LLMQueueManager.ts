@@ -24,7 +24,9 @@ const PRIORITY_RANK: Record<QueuePriority, number> = {
 
 /**
  * Priority queue for llama-server.
- * HIGH (FIM) preempts in-flight LOW/NORMAL; NORMAL = chat/agent; LOW = compact.
+ * HIGH (FIM / short title) may preempt in-flight LOW only — never NORMAL agent/chat,
+ * otherwise autocomplete aborts the agent mid-turn ("silence after plan").
+ * NORMAL = chat/agent; LOW = compact.
  */
 export class LLMQueueManager {
   private queue: QueuedJob[] = []
@@ -77,7 +79,7 @@ export class LLMQueueManager {
       if (
         request.priority === 'HIGH' &&
         this.active &&
-        this.active.request.priority !== 'HIGH'
+        this.active.request.priority === 'LOW'
       ) {
         this.active.controller.abort('preempted_by_fim')
       }
@@ -376,17 +378,6 @@ export class LLMQueueManager {
       }
     }
 
-    if (signal.aborted) {
-      onChunk({ id, done: true })
-      return {
-        id,
-        text: '',
-        aborted: true,
-        error: String(signal.reason ?? 'aborted'),
-        finishReason: 'abort'
-      }
-    }
-
     const toolCalls =
       toolAcc.size > 0
         ? [...toolAcc.entries()]
@@ -397,6 +388,19 @@ export class LLMQueueManager {
               function: { name: t.name, arguments: t.arguments }
             }))
         : undefined
+
+    if (signal.aborted) {
+      onChunk({ id, done: true })
+      const userStop = /user_stop/i.test(String(signal.reason ?? ''))
+      return {
+        id,
+        text: userStop ? '' : text,
+        aborted: true,
+        error: String(signal.reason ?? 'aborted'),
+        finishReason: 'abort',
+        ...(userStop ? {} : { toolCalls, usage: usage ?? usageFromTimings(timings), timings })
+      }
+    }
 
     const resolvedUsage = usage ?? usageFromTimings(timings)
     onChunk({ id, done: true, usage: resolvedUsage, timings })

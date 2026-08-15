@@ -23,7 +23,7 @@ import type {
 import {
   AGENT_CHECKLIST_MSG_ID,
   AGENT_PLAN_MSG_ID,
-  AGENT_TODO_MSG_ID,
+  isAgentTodoMessageId,
   FILES_CHANGED_TOOL,
   parseThinkBlocks,
   runAgentTurn,
@@ -31,13 +31,15 @@ import {
   stripPlanStatus,
   type TurnFileChange
 } from '../agent/runAgentTurn'
+import { runAgentTurnV2 } from '../agent/loop/runTurn'
 import { parseChecklistUiContent, parseTodoUiContent, liveThinkProse, displayThinkProse, stripThinkTags, isJunkPlanStep, isEllipsisOnly } from '../agent/agentPure'
 import type { QueueManager } from '../llm/queueManager'
 import type { ChatSession, PersistedChatMessage } from '../../../shared/chats'
 import {
   DEFAULT_WELCOME_MESSAGE,
   deriveChatTitle,
-  isDefaultChatTitle
+  isDefaultChatTitle,
+  pickChatTitle
 } from '../../../shared/chats'
 import { ComposerQueue, type QueuedFollowUp } from './ComposerQueue'
 import { EditReviewDiff } from './EditReviewDiff'
@@ -331,6 +333,8 @@ export function ChatPanel({
   const bottomRef = useRef<HTMLDivElement>(null)
   const feedScrollRef = useRef<HTMLDivElement>(null)
   const stickToBottomRef = useRef(true)
+  /** Ignore onScroll while we programmatically pin to bottom (content growth otherwise clears stick). */
+  const ignoreFeedScrollRef = useRef(false)
   const codeStickRef = useRef(new Map<string, boolean>())
   const codeEndRefs = useRef<Map<string, HTMLPreElement>>(new Map())
   const abortRef = useRef<AbortController | null>(null)
@@ -470,8 +474,18 @@ export function ChatPanel({
     if (!el) {
       // Still allow sticky code previews when feed isn't ready.
     } else if (stickToBottomRef.current) {
-      // Do NOT ignore user scroll events — that re-pinned the feed during token floods.
+      // Pin after layout — content growth fires onScroll mid-frame and would
+      // otherwise clear stickToBottomRef before we scroll.
+      ignoreFeedScrollRef.current = true
       el.scrollTop = el.scrollHeight
+      requestAnimationFrame(() => {
+        if (feedScrollRef.current && stickToBottomRef.current) {
+          feedScrollRef.current.scrollTop = feedScrollRef.current.scrollHeight
+        }
+        requestAnimationFrame(() => {
+          ignoreFeedScrollRef.current = false
+        })
+      })
     }
 
     for (const m of messages) {
@@ -493,10 +507,12 @@ export function ChatPanel({
   }, [messages])
 
   const onFeedScroll = (): void => {
+    if (ignoreFeedScrollRef.current) return
     const el = feedScrollRef.current
     if (!el) return
     const dist = el.scrollHeight - el.scrollTop - el.clientHeight
-    stickToBottomRef.current = dist < 64
+    // Wider sticky zone so frequent plan-card upserts don't detach while near bottom.
+    stickToBottomRef.current = dist < 120
   }
 
   const onFeedWheelCapture = (e: WheelEvent<HTMLDivElement>): void => {
@@ -708,7 +724,11 @@ export function ChatPanel({
       if (sessionIdRef.current !== forSession) return
       setLastStats((prev) => {
         // Rounds often report timings without prompt_tokens — never wipe a known measure.
-        const promptTokens = stats.promptTokens ?? prev?.promptTokens
+        // Never shrink promptTokens: tiny follow-ups (title/FIM/conclude) must not reset the gauge.
+        const promptTokens =
+          stats.promptTokens != null && stats.promptTokens > 0
+            ? Math.max(stats.promptTokens, prev?.promptTokens ?? 0)
+            : prev?.promptTokens
         const completionTokens = stats.completionTokens ?? prev?.completionTokens
         const totalTokens =
           stats.totalTokens ??
@@ -811,34 +831,60 @@ export function ChatPanel({
     if (!opts?.fromQueue && !opts?.reverb) setInput('')
     stickToBottomRef.current = true
     const turnId = ++turnGenRef.current
-    setBusy(true)
-    busyRef.current = true
-    const ac = new AbortController()
-    abortRef.current = ac
     const split = splitComposerFiles(composerFiles)
     if (!opts?.fromQueue && !opts?.reverb) {
       setComposerFiles([])
     }
 
-    // Name the chat once from the first real prompt (short keyword).
+    // Instant heuristic in the UI; persist once after a short model attempt
+    // (ChatStore freezes the first non-default title).
     const prevTitle =
       sessionList.find((s) => s.id === activeSession)?.title ?? 'New agent'
-    if (isDefaultChatTitle(prevTitle)) {
-      const autoTitle = deriveChatTitle(sendText)
-      if (autoTitle && activeSession) {
-        const renamedList = sessionList.map((s) =>
-          s.id === activeSession ? { ...s, title: autoTitle } : s
-        )
-        setSessionList(renamedList)
-        onSessionsChange?.(renamedList, activeSession)
-        void window.api.chats
-          .updateMessages(
-            activeSession,
-            history.map(toPersisted),
+    if (isDefaultChatTitle(prevTitle) && activeSession) {
+      const sessionIdForTitle = activeSession
+      const historyForTitle = history.map(toPersisted)
+      const heuristic = deriveChatTitle(sendText)
+      if (heuristic) {
+        setSessionList((prev) => {
+          const cur = prev.find((s) => s.id === sessionIdForTitle)
+          if (!cur || !isDefaultChatTitle(cur.title)) return prev
+          const next = prev.map((s) =>
+            s.id === sessionIdForTitle ? { ...s, title: heuristic } : s
+          )
+          onSessionsChange?.(next, sessionIdForTitle)
+          return next
+        })
+      }
+      let autoTitle = heuristic
+      try {
+        const modelTitle = await Promise.race([
+          queue.generateChatTitle(sendText, lang),
+          new Promise<string>((resolve) => {
+            window.setTimeout(() => resolve(''), 2500)
+          })
+        ])
+        if (modelTitle) autoTitle = pickChatTitle(sendText, modelTitle)
+      } catch {
+        /* keep heuristic */
+      }
+      if (autoTitle) {
+        setSessionList((prev) => {
+          const cur = prev.find((s) => s.id === sessionIdForTitle)
+          if (!cur) return prev
+          if (!isDefaultChatTitle(cur.title) && cur.title !== heuristic) return prev
+          const next = prev.map((s) =>
+            s.id === sessionIdForTitle ? { ...s, title: autoTitle } : s
+          )
+          onSessionsChange?.(next, sessionIdForTitle)
+          return next
+        })
+        try {
+          const snap = await window.api.chats.updateMessages(
+            sessionIdForTitle,
+            historyForTitle,
             autoTitle
           )
-          .then((snap) => {
-            if (!snap?.sessions) return
+          if (snap?.sessions) {
             const list = snap.sessions
               .map(({ id, title, createdAt, updatedAt }) => ({
                 id,
@@ -847,15 +893,39 @@ export function ChatPanel({
                 updatedAt
               }))
               .sort((a, b) => b.updatedAt - a.updatedAt)
-            setSessionList(list)
-            onSessionsChange?.(list, activeSession)
-          })
-          .catch(console.error)
+            setSessionList((prev) => {
+              const cur = prev.find((s) => s.id === sessionIdForTitle)
+              if (cur && cur.title === autoTitle) {
+                onSessionsChange?.(list, sessionIdForTitle)
+                return list
+              }
+              onSessionsChange?.(
+                list.map((s) =>
+                  s.id === sessionIdForTitle && cur ? { ...s, title: cur.title } : s
+                ),
+                sessionIdForTitle
+              )
+              return list.map((s) =>
+                s.id === sessionIdForTitle && cur ? { ...s, title: cur.title } : s
+              )
+            })
+          }
+        } catch (err) {
+          console.error(err)
+        }
       }
     }
 
+    setBusy(true)
+    busyRef.current = true
+    const ac = new AbortController()
+    abortRef.current = ac
+
     try {
-      await runAgentTurn({
+      const settings = await window.api.settings.get()
+      const run =
+        settings.agentLoopV2 !== false ? runAgentTurnV2 : runAgentTurn
+      await run({
         queue,
         history,
         userText: sendText,
@@ -1014,14 +1084,15 @@ export function ChatPanel({
 
   const ctxLimit = ctxSize && ctxSize > 0 ? ctxSize : null
   const measuredPromptTokens = useMemo(() => {
+    let max = 0
     if (lastStats?.promptTokens != null && lastStats.promptTokens > 0) {
-      return lastStats.promptTokens
+      max = Math.max(max, lastStats.promptTokens)
     }
-    for (let i = messages.length - 1; i >= 0; i--) {
+    for (let i = 0; i < messages.length; i++) {
       const p = messages[i]?.stats?.promptTokens
-      if (p != null && p > 0) return p
+      if (p != null && p > 0) max = Math.max(max, p)
     }
-    return null
+    return max > 0 ? max : null
   }, [lastStats?.promptTokens, messages])
 
   const contextEstimateBase = useMemo(
@@ -1052,11 +1123,12 @@ export function ChatPanel({
     [contextEstimateBase]
   )
 
-  // Snap local sum when a new server prompt_tokens arrives so the gauge can grow live afterward.
+  // Snap local sum when a new *higher* server prompt_tokens arrives so the gauge
+  // can grow live afterward — never re-anchor to a smaller follow-up measure.
   useEffect(() => {
     if (measuredPromptTokens == null || measuredPromptTokens <= 0) return
     setContextAnchor((prev) => {
-      if (prev?.prompt === measuredPromptTokens) return prev
+      if (prev && prev.prompt >= measuredPromptTokens) return prev
       return {
         prompt: measuredPromptTokens,
         local: Math.max(1, localContextSum)
@@ -1069,9 +1141,11 @@ export function ChatPanel({
       ...contextEstimateBase,
       promptTokens: measuredPromptTokens,
       anchorLocalSum:
-        contextAnchor && contextAnchor.prompt === measuredPromptTokens
+        contextAnchor && measuredPromptTokens != null && contextAnchor.prompt === measuredPromptTokens
           ? contextAnchor.local
-          : null
+          : contextAnchor && measuredPromptTokens != null && contextAnchor.prompt > 0
+            ? contextAnchor.local * (measuredPromptTokens / contextAnchor.prompt)
+            : null
     }),
     [contextEstimateBase, measuredPromptTokens, contextAnchor]
   )
@@ -1081,7 +1155,7 @@ export function ChatPanel({
     sessionList.find((s) => s.id === sessionId)?.title || deriveThreadTitle(messages)
   const threadTitle = isDefaultChatTitle(rawTitle) ? t('chat.newAgent') : rawTitle
 
-  const feedItems = buildComposerFeed(visibleMessages)
+  const feedItems = buildComposerFeed(visibleMessages, t)
 
   const displayContent = (m: ChatMessage): string => {
     if (m.id === 'welcome') {
@@ -1233,7 +1307,7 @@ export function ChatPanel({
                 onOpenImage={(path, name) => void openChatImage(path, name)}
               />
             ) : null}
-            {!m.toolName && m.id === AGENT_TODO_MSG_ID && m.content?.trim() ? (
+            {!m.toolName && isAgentTodoMessageId(m.id) && m.content?.trim() ? (
               <AgentTodoCard content={m.content} />
             ) : !m.toolName && m.id === AGENT_CHECKLIST_MSG_ID && m.content?.trim() ? (
               <AgentChecklistCard content={m.content} />
@@ -1422,7 +1496,7 @@ export function ChatPanel({
                       strokeLinejoin="round"
                     />
                   </svg>
-                  {m.streaming ? 'Writing…' : 'Show diff'}
+                  {m.streaming ? t('chat.diff.writing') : t('chat.diff.show')}
                 </summary>
                 <pre
                   ref={(el) => {
@@ -2339,7 +2413,10 @@ type ComposerFeedItem =
   | { type: 'message'; message: ChatMessage }
   | { type: 'group'; summary: string; messageIds: string[] }
 
-function buildComposerFeed(messages: ChatMessage[]): ComposerFeedItem[] {
+function buildComposerFeed(
+  messages: ChatMessage[],
+  t: (key: import('../i18n/messages').MessageKey, vars?: Record<string, string | number>) => string
+): ComposerFeedItem[] {
   const out: ComposerFeedItem[] = []
   let i = 0
   while (i < messages.length) {
@@ -2379,11 +2456,11 @@ function buildComposerFeed(messages: ChatMessage[]): ComposerFeedItem[] {
     }
 
     let summary: string
-    if (kind === 'search') summary = `${batch.length} searches`
+    if (kind === 'search') summary = t('activity.group.nSearches', { n: batch.length })
     else if (kind === 'explore') {
       const files = batch.reduce((acc, x) => acc + (resolveActivity(x).fileCount ?? 1), 0)
-      summary = `Explored ${files} files`
-    } else summary = `Explored ${batch.length} files`
+      summary = t('activity.group.exploredFiles', { n: files })
+    } else summary = t('activity.group.exploredFiles', { n: batch.length })
 
     out.push({
       type: 'group',
@@ -2496,7 +2573,7 @@ function fileExtLabel(name: string): string {
 }
 
 function isVisibleChatMessage(m: ChatMessage): boolean {
-  if (m.id === AGENT_TODO_MSG_ID) return Boolean(m.content?.trim())
+  if (isAgentTodoMessageId(m.id)) return Boolean(m.content?.trim())
   if (m.id === AGENT_CHECKLIST_MSG_ID) return Boolean(m.content?.trim())
   if (m.id === 'welcome') return true
   const hasText = Boolean(m.content?.trim())
@@ -2519,7 +2596,7 @@ function formatDuration(ms: number): string {
 
 function messageRowClass(m: ChatMessage): string {
   if (
-    m.id === AGENT_TODO_MSG_ID ||
+    isAgentTodoMessageId(m.id) ||
     m.id === AGENT_CHECKLIST_MSG_ID ||
     m.id === AGENT_PLAN_MSG_ID
   ) {

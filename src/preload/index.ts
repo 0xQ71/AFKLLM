@@ -30,6 +30,7 @@ import type {
   CodebaseQueryResult,
   ContextIndexStatus,
   ProjectRulesSnapshot,
+  ProjectStackSnapshot,
   RepoMapSnapshot
 } from '../shared/context'
 import type {
@@ -239,7 +240,9 @@ const api = {
     indexStatus: (): Promise<ContextIndexStatus> =>
       ipcRenderer.invoke('context:index-status'),
     projectRules: (): Promise<ProjectRulesSnapshot> =>
-      ipcRenderer.invoke('context:project-rules')
+      ipcRenderer.invoke('context:project-rules'),
+    stack: (): Promise<ProjectStackSnapshot> =>
+      ipcRenderer.invoke('context:stack')
   },
 
   terminal: {

@@ -38,11 +38,24 @@ import {
   contentLooksStructurallyComplete,
   parseReadFileMeta,
   reconcileTodosWithContent,
+  progressTodosFromContent,
   displayThinkProse,
   extractThinkInner,
   pendingPlanWork,
   isBrowserPlanStep,
   isJunkPlanStep,
+  isSoftLayoutPlanStep,
+  coerceProductPlan,
+  looksLikeToolOrientedPlan,
+  isToolOrientedPlanStep,
+  isFalseSuccessProse,
+  isAgentChatNoise,
+  parseGlobalRenameIntent,
+  wantsOpenAfterEdit,
+  replaceAllCi,
+  countOccurrencesCi,
+  isFullRewriteFallbackPlanStep,
+  evaluateAcceptanceGate,
   stripCodeLeakFromThink,
   extractAssistantHtmlDump,
   looksLikeAssistantHtmlDump,
@@ -54,8 +67,14 @@ import {
   estimateLocalContextSum
 } from '../src/renderer/src/agent/contextUsage'
 import { AgentToolRegistry } from '../src/main/agent/AgentToolRegistry'
+import { looksLikeShellFileMutation } from '../src/shared/shellErrors'
 import {
   CHAT_MAX_CONTENT_CHARS,
+  deriveChatTitle,
+  extractBrandFromPrompt,
+  isAwkwardChatTitle,
+  pickChatTitle,
+  sanitizeModelChatTitle,
   sanitizePersistedMessages,
   THREAD_SUMMARY_MSG_ID,
   type PersistedChatMessage
@@ -66,8 +85,17 @@ import {
   formatPlanExecutePrompt,
   getPlanStatus,
   setPlanStatus,
-  stripPlanStatus
+  stripPlanStatus,
+  shouldSkipThinkPlanCeremony,
+  looksLikeOpenLandingOnly
 } from '../src/renderer/src/agent/runAgentTurn'
+import {
+  maybeRecordToolEvidence,
+  laterSuccessAfterFail,
+  type StepEvidence
+} from '../src/renderer/src/agent/loop/evidence'
+import { honestClosingNote } from '../src/renderer/src/agent/loop/report'
+import { truncationGuardMessage } from '../src/shared/writeThresholds'
 
 describe('looksLikeToolMarkupLeak', () => {
   it('detects channel / tool_call leaks', () => {
@@ -128,21 +156,23 @@ describe('looksLikeToolMarkupLeak', () => {
     assert.equal(coerceToolRelativePath({ path: './styles.css' }), './styles.css')
   })
 
-  it('infers write path from content', () => {
+  it('infers write path only for full HTML documents', () => {
     assert.equal(
       inferWritePathFromContent('<!DOCTYPE html><html><body></body></html>'),
       'index.html'
     )
     assert.equal(
       inferWritePathFromContent('body { color: #222; }\n.main { margin: 0; }'),
-      'styles.css'
+      null
     )
     assert.equal(
       inferWritePathFromContent(
         'document.querySelector(".nav").addEventListener("click", () => {})'
       ),
-      'app.js'
+      null
     )
+    assert.equal(inferWritePathFromContent('{"ok": true}'), null)
+    assert.equal(inferWritePathFromContent('# Title\n\nHello'), null)
     assert.equal(
       resolveWriteFilePath({
         content: '<!DOCTYPE html>\n<html lang="en"></html>'
@@ -568,6 +598,227 @@ describe('checklist UI payload', () => {
 })
 
 describe('agent todo plan', () => {
+  it('rejects tool-name plans; does not invent a landing template', () => {
+    assert.equal(
+      isToolOrientedPlanStep('execute_terminal_command для проверки синтаксиса HTML'),
+      true
+    )
+    assert.equal(isToolOrientedPlanStep('Закрыть'), true)
+    const raw = parsePlanBlock(
+      '<plan>\n' +
+        '- execute_terminal_command для проверки синтаксиса HTML\n' +
+        '- Start-Process для открытия index.html в AFKLLM Browser\n' +
+        '- Визуальная проверка верстки и исправление ошибок\n' +
+        '- Закрыть\n' +
+        '</plan>'
+    )
+    assert.equal(looksLikeToolOrientedPlan(raw ?? []), false)
+    const coerced = coerceProductPlan(raw, {
+      userText:
+        'Сделай одностраничный лендинг Bootstrap 5: Navbar, Hero, Features, FAQ, Footer'
+    })
+    assert.ok(!coerced.some((s) => isToolOrientedPlanStep(s.text)))
+    assert.ok(
+      !coerced.some((s) => /Navbar|Hero|Features|Footer/i.test(s.text)),
+      'must not invent a landing template'
+    )
+    assert.ok(coerced.some((s) => /визуальн|вёрст|верст/i.test(s.text)))
+  })
+
+  it('keeps model plan rows like verify and user-summary', () => {
+    const raw = parsePlanBlock(
+      '<plan>\n- Написать index.html\n- Проверить вёрстку\n- Сообщить пользователю о результате\n</plan>'
+    )
+    const coerced = coerceProductPlan(raw, { userText: 'сделай лендинг' })
+    assert.ok(coerced.some((s) => /Проверить/i.test(s.text)))
+    assert.ok(coerced.some((s) => /Сообщить пользователю/i.test(s.text)))
+  })
+
+  it('surgical FAQ fix plan keeps the model section rows', () => {
+    const raw = parsePlanBlock(
+      '<plan>\n' +
+        '- Найти FAQ в index.html\n' +
+        '- Заменить белые стили на серые\n' +
+        '- Секция: Navbar\n' +
+        '- Секция: Hero\n' +
+        '- Секция: Features\n' +
+        '- Секция: Footer\n' +
+        '- Открыть в браузере\n' +
+        '</plan>'
+    )
+    const user =
+      'В FAQ блок «Какие модели» не в тему сайта — белая тема, нужен такой же серый'
+    const coerced = coerceProductPlan(raw, { userText: user, surgical: true })
+    assert.ok(coerced.some((s) => /FAQ|стил|серы|бел/i.test(s.text)))
+    assert.ok(coerced.some((s) => /Navbar/i.test(s.text)))
+    assert.ok(coerced.some((s) => /Hero/i.test(s.text)))
+    assert.ok(!coerced.some((s) => /toggle|переключ/i.test(s.text)))
+  })
+
+  it('garbage surgical plan returns empty instead of a stock template', () => {
+    const raw = parsePlanBlock(
+      '<plan>\n' +
+        '- *План хирургического вмешательства:**\n' +
+        "- Секция: 'navbar'\n" +
+        "- Секция: 'card'\n" +
+        "- Секция: 'btn-primary'\n" +
+        "- Секция: 'accordion-button'\n" +
+        "- Секция: 'badge'\n" +
+        '</plan>'
+    )
+    const user = 'текст плохо читаемый, сделай его белым если страница тёмная'
+    const coerced = coerceProductPlan(raw, { userText: user, surgical: true })
+    assert.equal(coerced.length, 0)
+  })
+
+  it('coerceProductPlan does not auto-surgical from keywords without opts.surgical', () => {
+    const raw = parsePlanBlock(
+      '<plan>\n- Найти FAQ\n- Поправить цвет текста\n- Открыть в браузере\n</plan>'
+    )
+    const user = 'текст плохо читаемый, сделай его белым если страница тёмная'
+    const coerced = coerceProductPlan(raw, { userText: user })
+    assert.ok(coerced.some((s) => /FAQ|цвет|текст|стил/i.test(s.text)))
+    assert.ok(!coerced.some((s) => /переключ|toggle/i.test(s.text)))
+  })
+
+  it('strips full-rewrite fallback plan steps', () => {
+    assert.equal(
+      isFullRewriteFallbackPlanStep(
+        'Если патч не сработал — переписать файл целиком; иначе закрыть.'
+      ),
+      true
+    )
+    assert.equal(isJunkPlanStep('Если патч не сработал — переписать файл целиком'), true)
+    const raw = parsePlanBlock(
+      '<plan>\n- Поправить FAQ на тёмный\n- Если патч не сработал — переписать файл целиком; иначе закрыть.\n- Открыть в браузере\n</plan>'
+    )
+    const coerced = coerceProductPlan(raw, {
+      userText: 'раздел FAQ сайта должен быть темным',
+      surgical: true
+    })
+    assert.ok(!coerced.some((s) => /переписать\s+файл|целик|если\s+патч/i.test(s.text)))
+    assert.ok(coerced.some((s) => /FAQ|тёмн|темн|стил|разметк/i.test(s.text)))
+  })
+
+  it('evaluateAcceptanceGate rejects done when any edit failed', () => {
+    const gate = evaluateAcceptanceGate({
+      finalText: 'Сделано. FAQ тёмный.',
+      userWantsNodeTest: false,
+      userWantsWebSearch: false,
+      userWantsCli: false,
+      lastNodeTestOk: null,
+      usedWebSearch: false,
+      ranCliSmoke: false,
+      incompleteCount: 0,
+      failedCount: 0,
+      completedTools: 3,
+      mutatingEditOk: true,
+      mutatingEditFailed: true
+    })
+    assert.equal(gate.claimsDone, true)
+    assert.equal(gate.looksPrematureDone, true)
+    assert.ok(gate.hardMissing.length > 0)
+  })
+
+  it('shouldSkipThinkPlanCeremony only for micro confirms with prior work', () => {
+    const landing =
+      'Сделай качественный одностраничный лендинг на Bootstrap 5 с Navbar Hero FAQ Footer'
+    assert.equal(shouldSkipThinkPlanCeremony(landing, []), false)
+    assert.equal(
+      shouldSkipThinkPlanCeremony('сделай текст белым', []),
+      false
+    )
+    assert.equal(
+      shouldSkipThinkPlanCeremony('сделай текст белым', [
+        { id: 'agent-todo-1', role: 'assistant', content: '{}' }
+      ]),
+      false,
+      'feature follow-ups must still think'
+    )
+    assert.equal(
+      shouldSkipThinkPlanCeremony('сделай переключатель темы темная/светлая', [
+        { id: 'agent-todo-1', role: 'assistant', content: '{}' }
+      ]),
+      false
+    )
+    assert.equal(
+      shouldSkipThinkPlanCeremony('ок', [
+        { id: 'agent-todo-1', role: 'assistant', content: '{}' }
+      ]),
+      true
+    )
+    assert.equal(
+      shouldSkipThinkPlanCeremony('продолжи', [
+        {
+          id: 't1',
+          role: 'assistant',
+          content: 'wrote',
+          toolName: 'write_file'
+        }
+      ]),
+      true
+    )
+  })
+
+  it('looksLikeOpenLandingOnly matches Cyrillic «открой лендинг» (no \\b)', () => {
+    assert.equal(looksLikeOpenLandingOnly('открой лендинг'), true)
+    assert.equal(looksLikeOpenLandingOnly('Открой лендинг'), true)
+    assert.equal(looksLikeOpenLandingOnly('open index.html'), true)
+    assert.equal(looksLikeOpenLandingOnly('сделай лендинг с нуля'), false)
+    assert.equal(looksLikeOpenLandingOnly('открой'), false)
+    assert.equal(looksLikeOpenLandingOnly('поменяй названия моделей'), false)
+    assert.equal(looksLikeOpenLandingOnly('открой лендинг и поменяй цвет'), false)
+    assert.equal(looksLikeOpenLandingOnly('исправь FAQ overflow'), false)
+    assert.equal(
+      looksLikeOpenLandingOnly(
+        'везде измени название с NorthLine на AFKLLM, затем открой его'
+      ),
+      false
+    )
+  })
+
+  it('parseGlobalRenameIntent + false-success / junk plan filters', () => {
+    const r = parseGlobalRenameIntent(
+      'везде измени название с NorthLine на AFKLLM, затем открой его'
+    )
+    assert.deepEqual(r, { from: 'NorthLine', to: 'AFKLLM' })
+    assert.equal(
+      wantsOpenAfterEdit(
+        'везде измени название с NorthLine на AFKLLM, затем открой его'
+      ),
+      true
+    )
+    assert.equal(replaceAllCi('NorthLine and northline', 'NorthLine', 'AFKLLM'), 'AFKLLM and AFKLLM')
+    assert.equal(countOccurrencesCi('NorthLine x NorthLine', 'NorthLine'), 2)
+    assert.equal(
+      isFalseSuccessProse(
+        'Готово! Все упоминания NorthLine заменены на AFKLLM в index.html. Страница открыта в браузере.'
+      ),
+      true
+    )
+    assert.equal(isJunkPlanStep('*Что изменилось:**'), true)
+    assert.equal(isJunkPlanStep('Как проверить:'), true)
+    assert.equal(
+      isJunkPlanStep(
+        'Готово! Все упоминания NorthLine заменены на AFKLLM в index.html.'
+      ),
+      true
+    )
+    assert.equal(isJunkPlanStep('Заменить NorthLine → AFKLLM'), false)
+    assert.equal(
+      isAgentChatNoise('↻ index.html уже полный — точечная правка, не rewrite…'),
+      true
+    )
+    assert.equal(
+      isAgentChatNoise(
+        '⏹ Модель выдала план, но так и не вызвала tools. Остановил цикл.'
+      ),
+      true
+    )
+    assert.equal(isAgentChatNoise('Открыто.'), true)
+    assert.equal(isAgentChatNoise('Заменить NorthLine → AFKLLM в navbar'), false)
+  })
+
   it('parses <plan> into steps and advances on tools', () => {
     assert.equal(hasThinkBlock('<think>x</think>'), true)
     assert.equal(hasThinkBlock('nope'), false)
@@ -577,7 +828,9 @@ describe('agent todo plan', () => {
     assert.equal(steps?.length, 2)
     assert.equal(steps![0]!.status, 'in_progress')
     assert.equal(steps![1]!.status, 'pending')
-    const advanced = advanceTodosOnTool(steps!, 'write_file', true)
+    const advanced = advanceTodosOnTool(steps!, 'write_file', true, {
+      path: 'index.html'
+    })
     assert.equal(advanced[0]!.status, 'done')
     assert.equal(advanced[1]!.status, 'in_progress')
     const ui = formatTodoUiContent(advanced)
@@ -592,7 +845,7 @@ describe('agent todo plan', () => {
     const steps = parsePlanBlock(
       '<plan>\n- [ ] Написать index.html со всеми секциями (navbar, hero, features, how it works, social proof, FAQ, footer)\n- [ ] Открыть в браузере\n</plan>'
     )
-    assert.ok((steps?.length ?? 0) >= 5)
+    assert.equal(steps?.length, 2)
     assert.equal(
       thinkBodyLooksLikeCodeDump(
         '<think>\n<!DOCTYPE html><html><style>:root{}</style>\n</think>'
@@ -603,7 +856,7 @@ describe('agent todo plan', () => {
     const mega = parsePlanBlock(
       '<plan>\n- [ ] Write index.html — полный лендинг Northline с Bootstrap 5, встроенным CSS, SVG-иллюстрациями и семантической разметкой.\n- [ ] Открыть в браузере\n</plan>'
     )
-    assert.ok((mega?.length ?? 0) >= 6)
+    assert.equal(mega?.length, 2)
     assert.equal(sanitizeThinkProse('<think>\n<!DOCTYPE html><html></html>\n</think>'), '')
     assert.match(wrapThinkForUi('<!DOCTYPE html>'), /<\s*think\s*>\s*<\s*\/\s*think\s*>/i)
     assert.match(wrapThinkForUi('Цель: лендинг. Дальше write_file.'), /Цель: лендинг/)
@@ -625,6 +878,10 @@ describe('agent todo plan', () => {
     const shown = displayThinkProse(`<think>\n${deep}\n</think>`)
     assert.ok(shown.length > 800, 'DeepThink-length prose must not be capped at 800')
     assert.match(shown, /Bootstrap 5/)
+    const planning = wrapThinkForUi('Планирую:\n- Написать index.html\n- Проверить вёрстку')
+    assert.match(planning, /Планирую:/)
+    assert.match(planning, /Написать index\.html/)
+    assert.match(sanitizeThinkProse(planning), /Проверить/)
   })
 
   it('streams live think prose without waiting for sanitize', () => {
@@ -656,7 +913,8 @@ describe('agent todo plan', () => {
       '<plan>\n- Секция: navbar\n- Секция: hero\n- Отредактировать при необходимости.\n- Открыть в браузере\n</plan>'
     )
     assert.ok(steps)
-    assert.ok(!steps!.some((s) => /необходимост/i.test(s.text)))
+    assert.ok(steps!.some((s) => /необходимост/i.test(s.text)))
+    assert.equal(pendingPlanWork(steps!).some((s) => /необходимост/i.test(s.text)), false)
     assert.ok(steps!.some((s) => /navbar/i.test(s.text)))
     assert.ok(steps!.some((s) => /браузер|browser|открыть/i.test(s.text)))
     const mdPlan = parsePlanBlock('[Plan]\n- Navbar\n- Hero\n- Features\n- Open in browser')
@@ -685,36 +943,46 @@ describe('agent todo plan', () => {
     assert.equal(looksLikeAssistantHtmlDump('just prose about a landing'), false)
   })
 
-  it('marks multiple plan sections done from one HTML write', () => {
+  it('does not tick plan rows from HTML shape alone (evidence required)', () => {
     const steps = parsePlanBlock(
-      '<plan>\n- Секция: navbar\n- Секция: hero\n- Секция: features\n- Секция: trust\n- Секция: FAQ\n- Секция: footer\n- Открыть index.html в браузере\n</plan>'
+      '<plan>\n- Каркас HTML + CSS\n- Navbar\n- Hero\n- Features\n- FAQ\n- Footer\n- Открыть в браузере\n</plan>'
     )
     assert.ok(steps)
-    const html = `
-<!DOCTYPE html><html><body>
-<nav class="navbar">n</nav>
-<section id="hero">h</section>
-<section id="features"><div class="feature-card">f</div></section>
-<section id="trust">t</section>
-<section id="faq">q</section>
-<footer id="footer">f</footer>
+    const cssOnly = progressTodosFromContent(
+      steps!,
+      '<!DOCTYPE html><html><head><style>.navbar{}.hero{}</style></head><body>'
+    )
+    assert.equal(cssOnly.changed, false)
+    assert.ok(cssOnly.steps.every((s) => s.status !== 'done' || isBrowserPlanStep(s.text)))
+    const withNav = progressTodosFromContent(
+      steps!,
+      '<!DOCTYPE html><html><body><nav class="navbar"><a href="#">Home</a></nav></body></html>'
+    )
+    assert.equal(withNav.changed, false)
+    assert.ok(!withNav.steps.some((s) => /Navbar|Hero/i.test(s.text) && s.status === 'done'))
+  })
+
+  it('write_file ticks the matching file step, not every section', () => {
+    const steps = parsePlanBlock(
+      '<plan>\n- Написать index.html\n- Секция: FAQ\n- Открыть index.html в браузере\n</plan>'
+    )
+    assert.ok(steps)
+    const html = `<!DOCTYPE html><html><body>
+<nav class="navbar">nav</nav>
+<section id="faq"><h2>FAQ</h2><p>Answer</p></section>
 </body></html>`
-    const advanced = advanceTodosOnTool(steps!, 'write_file', true, { content: html })
-    const done = advanced.filter((s) => s.status === 'done').map((s) => s.text)
-    assert.ok(done.some((t) => /navbar/i.test(t)))
-    assert.ok(done.some((t) => /hero/i.test(t)))
-    assert.ok(done.some((t) => /features/i.test(t)))
-    assert.ok(done.some((t) => /trust/i.test(t)))
-    assert.ok(done.some((t) => /faq/i.test(t)))
-    assert.ok(done.some((t) => /footer/i.test(t)))
+    const advanced = advanceTodosOnTool(steps!, 'write_file', true, {
+      content: html,
+      path: 'index.html'
+    })
+    assert.ok(advanced.some((s) => /index\.html/i.test(s.text) && s.status === 'done'))
+    assert.ok(advanced.some((s) => /FAQ/i.test(s.text) && s.status !== 'done'))
     assert.ok(advanced.some((s) => /браузер/i.test(s.text) && s.status !== 'done'))
     const afterShell = advanceTodosOnTool(advanced, 'execute_terminal_command', true, {
-      command: 'Start-Process (Resolve-Path .\\index.html)'
+      command: 'Start-Process (Resolve-Path .\\index.html)',
+      content: 'PREVIEW_URL: file:///index.html (opened in AFKLLM Browser)\nexit_code=0'
     })
     assert.ok(afterShell.filter((s) => /браузер/i.test(s.text)).every((s) => s.status === 'done'))
-    assert.equal(pendingPlanWork(advanced).length, 0)
-    const reconciled = reconcileTodosWithContent(steps!, html)
-    assert.ok(reconciled.filter((s) => s.status === 'done').length >= 6)
   })
 
   it('closes mega write plan step after complete HTML write', () => {
@@ -722,18 +990,33 @@ describe('agent todo plan', () => {
       '<plan>\n- Написать полный single-file index.html (Navbar + Hero + Features + How it works + Social proof + FAQ + Footer) с Bootstrap 5 CDN\n- Открыть index.html в браузере\n</plan>'
     )
     assert.ok(steps)
-    const html = `<!DOCTYPE html><html><body>
-<nav class="navbar"></nav>
-<section id="hero"></section>
-<section id="features"></section>
-<section id="how-it-works"></section>
-<section id="trust"></section>
-<section id="faq"></section>
-<footer id="footer"></footer>
+    const html = `<!DOCTYPE html><html><head><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css"></head><body>
+<nav class="navbar"><a class="nav-link" href="#">Home</a><a class="nav-link" href="#features">Features</a></nav>
+<section id="hero"><h1>Product hero</h1><p>Lead paragraph with enough copy for the hero section.</p><a class="btn btn-primary" href="#">CTA</a></section>
+<section id="features"><div class="feature-card">Feature one with details here</div><div class="feature-card">Feature two with details here</div></section>
+<section id="how-it-works"><h2>How it works</h2><p>Step by step explanation of the product flow.</p></section>
+<section id="trust"><p>Trusted by teams — real social proof quote here.</p></section>
+<section id="faq"><h2>FAQ</h2><p>Question and a clear answer for users.</p></section>
+<footer id="footer">Copyright and footer links</footer>
 </body></html>`
-    const advanced = advanceTodosOnTool(steps!, 'write_file', true, { content: html })
-    assert.equal(pendingPlanWork(advanced).length, 0)
+    const advanced = advanceTodosOnTool(steps!, 'write_file', true, {
+      content: html,
+      path: 'index.html'
+    })
+    assert.ok(
+      advanced.some(
+        (s) => /index\.html|напис|write/i.test(s.text) && s.status === 'done'
+      )
+    )
     assert.ok(advanced.some((s) => isBrowserPlanStep(s.text) && s.status !== 'done'))
+    const productOpen = advanced.filter(
+      (s) => !isBrowserPlanStep(s.text) && s.status !== 'done'
+    )
+    assert.equal(
+      productOpen.length,
+      0,
+      'the mega write row closes on a successful index.html write; browser stays open'
+    )
   })
 
   it('does not close the whole plan on incomplete HTML (no </html>)', () => {
@@ -761,26 +1044,132 @@ describe('agent todo plan', () => {
       '<plan>\n- Секция: Navbar\n- Секция: Hero\n- Подтвердить отсутствие ошибок и корректность отображения.\n- Дать краткую сводку пользователю на русском языке.\n- Открыть в браузере\n</plan>'
     )
     assert.ok(steps)
-    // Meta rows should be dropped at parse time.
-    assert.ok(!steps!.some((s) => /подтвердить|сводк/i.test(s.text)))
-    const withMeta = [
-      ...steps!,
+    assert.ok(steps!.some((s) => /подтвердить|сводк/i.test(s.text)))
+    const html = `<!DOCTYPE html><html><body>
+<nav class="navbar"><a href="#">Home</a> Brand</nav>
+<section id="hero"><h1>Hero</h1><p>Enough hero body copy for the section.</p></section>
+</body></html>`
+    const reconciled = reconcileTodosWithContent(steps!, html)
+    assert.ok(pendingPlanWork(reconciled).length > 0)
+    assert.ok(!pendingPlanWork(reconciled).some((s) => /подтвердить|сводк/i.test(s.text)))
+    assert.ok(reconciled.some((s) => isBrowserPlanStep(s.text) && s.status !== 'done'))
+  })
+
+  it('точечно исправить стили/разметку is soft — does not block pendingPlanWork', () => {
+    const steps = [
+      { id: '1', text: 'Найти нужный блок в существующем файле', status: 'done' as const },
       {
-        id: 'm1',
-        text: 'Подтвердить отсутствие ошибок и корректность отображения.',
+        id: '2',
+        text: 'Точечно исправить стили/разметку (без переписи всего файла)',
         status: 'pending' as const
       },
-      {
-        id: 'm2',
-        text: 'Дать краткую сводку пользователю на русском языке.',
-        status: 'pending' as const
-      }
+      { id: '3', text: 'Открыть в браузере и проверить', status: 'pending' as const }
     ]
-    const html = `<!DOCTYPE html><html><body>
-<nav class="navbar"></nav><section id="hero"></section></body></html>`
-    const reconciled = reconcileTodosWithContent(withMeta, html)
-    assert.equal(pendingPlanWork(reconciled).length, 0)
-    assert.ok(reconciled.some((s) => isBrowserPlanStep(s.text) && s.status !== 'done'))
+    assert.ok(isSoftLayoutPlanStep(steps[1]!.text))
+    assert.equal(pendingPlanWork(steps).length, 0)
+  })
+
+  it('Найти FAQ в существующем файле is soft (Cyrillic, no \\b)', () => {
+    const findFaq = 'Найти FAQ в существующем файле'
+    assert.ok(isSoftLayoutPlanStep(findFaq))
+    const steps = [
+      { id: '1', text: findFaq, status: 'pending' as const },
+      {
+        id: '2',
+        text: 'Точечно исправить стили/разметку (без переписи всего файла)',
+        status: 'pending' as const
+      },
+      { id: '3', text: 'Открыть в браузере и проверить', status: 'pending' as const }
+    ]
+    assert.equal(pendingPlanWork(steps).length, 0)
+  })
+
+  it('status / falseSuccess lines are junk plan steps', () => {
+    assert.equal(
+      isJunkPlanStep(
+        'В плане ещё есть незакрытые шаги: Каркас HTML + CSS; Navbar; Hero. Задача не выполнена — не рапортуем успех.'
+      ),
+      true
+    )
+    assert.equal(isJunkPlanStep('↻ Checking for missing files before finishing…'), true)
+    assert.equal(isJunkPlanStep('Готово! Лендинг Northline открыт в браузере.'), true)
+    assert.equal(isJunkPlanStep('Navbar'), false)
+  })
+
+  it('keeps model Navbar/Hero rows instead of inventing a template', () => {
+    const steps = parsePlanBlock(`<plan>
+- Каркас HTML + CSS
+- Navbar
+- Hero
+- Features
+- How it works
+- Social proof
+- FAQ
+- Footer
+- Реализовать Navbar с логотипом Northline, ссылками Features / How it works / FAQ и CTA-кнопкой.
+- Написать Hero-секцию с крупным заголовком, подзаголовком и двумя кнопками, добавить SVG-иллюстрацию редактора кода.
+</plan>`)
+    assert.ok(steps)
+    const coerced = coerceProductPlan(steps, {
+      userText: 'Сделай лендинг Northline Bootstrap 5'
+    })
+    assert.ok(coerced.some((s) => /navbar|логотип/i.test(s.text)))
+    assert.ok(coerced.some((s) => /hero/i.test(s.text)))
+    assert.ok(!coerced.some((s) => /write_file|execute_terminal/i.test(s.text)))
+  })
+
+  it('keeps the visual desktop/mobile plan row from the model', () => {
+    const steps = parsePlanBlock(
+      '<plan>\n- Navbar\n- Hero\n- Визуальная проверка на desktop + mobile\n</plan>'
+    )
+    assert.ok(steps)
+    const coerced = coerceProductPlan(steps, {
+      userText: 'Сделай лендинг Northline на Bootstrap 5'
+    })
+    assert.ok(coerced.some((s) => /desktop\s*\+|визуальн/i.test(s.text)))
+    assert.ok(!coerced.some((s) => /^Открыть index\.html/i.test(s.text)))
+  })
+
+  it('unchecks plan rows when a rewrite is only CSS', () => {
+    const steps = parsePlanBlock(
+      '<plan>\n- Navbar\n- Hero\n- Footer\n- Открыть в браузере\n</plan>'
+    )
+    assert.ok(steps)
+    const full = progressTodosFromContent(
+      steps!,
+      `<!DOCTYPE html><html><body>
+<nav class="navbar"><a href="#">Home</a> Brand</nav>
+<section id="hero"><h1>Hero</h1><p>Enough hero body copy for the section.</p></section>
+<footer>Copyright</footer>
+</body></html>`
+    )
+    assert.equal(full.changed, false)
+    assert.ok(!full.steps.some((s) => /Navbar|Hero/i.test(s.text) && s.status === 'done'))
+  })
+})
+
+describe('chat titles', () => {
+  it('uses nominative task + brand, rejects genitive model titles', () => {
+    const prompt =
+      'Сделай лендинг Northline. Без AI-градиентов. Bootstrap 5, navbar, hero, faq.'
+    const t = deriveChatTitle(prompt)
+    assert.match(t, /Лендинг/i)
+    assert.match(t, /Northline/)
+    assert.doesNotMatch(t, /градиентов/i)
+    assert.equal(isAwkwardChatTitle('Лендинг - AI-градиентов'), true)
+    assert.equal(sanitizeModelChatTitle('Лендинг - AI-градиентов'), '')
+    assert.equal(sanitizeModelChatTitle('Лендинг Northline'), 'Лендинг Northline')
+  })
+
+  it('prefers Northline over Icons / Features junk titles', () => {
+    const prompt =
+      'Лендинг Northline. SVG icons в Hero. Features, FAQ. Без AI-градиентов.'
+    assert.equal(extractBrandFromPrompt(prompt), 'Northline')
+    assert.equal(deriveChatTitle(prompt), 'Лендинг Northline')
+    assert.equal(isAwkwardChatTitle('Лендинг Icons'), true)
+    assert.equal(pickChatTitle(prompt, 'Лендинг Icons'), 'Лендинг Northline')
+    assert.equal(pickChatTitle(prompt, 'Лендинг Features'), 'Лендинг Northline')
+    assert.equal(pickChatTitle(prompt, 'Лендинг Northline'), 'Лендинг Northline')
   })
 })
 
@@ -855,6 +1244,54 @@ describe('AgentToolRegistry edit review', () => {
     }
   })
 
+  it('apply_diff on a missing styles.css does not silently retarget to index.html', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'afkllm-redirect-'))
+    try {
+      const reg = new AgentToolRegistry({ projectRoot: root })
+      await fs.writeFile(
+        path.join(root, 'index.html'),
+        '<!DOCTYPE html><html><head><style>\n.faq { background: #fff; color: #000; }\n</style></head><body><section id="faq" class="faq">Q</section></body></html>',
+        'utf8'
+      )
+      const res = await reg.invoke({
+        id: '1',
+        name: 'apply_diff',
+        arguments: {
+          relative_path: 'styles.css',
+          search_block: '.faq { background: #fff; color: #000; }',
+          replace_block: '.faq { background: #111; color: #fff; }'
+        }
+      })
+      assert.equal(res.ok, false)
+      assert.match(res.error ?? '', /file not found/i)
+      const html = await fs.readFile(path.join(root, 'index.html'), 'utf8')
+      assert.match(html, /background: #fff; color: #000/)
+      await assert.rejects(() => fs.access(path.join(root, 'styles.css')))
+    } finally {
+      await fs.rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('apply_diff on a truly missing file (no index.html) returns clear guidance', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'afkllm-missing-'))
+    try {
+      const reg = new AgentToolRegistry({ projectRoot: root })
+      const res = await reg.invoke({
+        id: '1',
+        name: 'apply_diff',
+        arguments: {
+          relative_path: 'styles.css',
+          search_block: 'a',
+          replace_block: 'b'
+        }
+      })
+      assert.equal(res.ok, false)
+      assert.match(res.error ?? '', /file not found/i)
+    } finally {
+      await fs.rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('reject deletes newly created file', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'afkllm-edit-new-'))
     try {
@@ -881,7 +1318,7 @@ describe('AgentToolRegistry edit review', () => {
       const rel = 'index.html'
       await fs.writeFile(
         path.join(root, rel),
-        '<!DOCTYPE html><html><body><h1>landing</h1><p>hello world page</p></body></html>\n',
+        '<!DOCTYPE html><html><head><title>x</title></head><body><h1>hi there landing',
         'utf8'
       )
       const blocked = await reg.invoke({
@@ -907,7 +1344,38 @@ describe('AgentToolRegistry edit review', () => {
     }
   })
 
-  it('FILE_EXISTS on large landing HTML still suggests overwrite=true', async () => {
+  it('FILE_COMPLETE HTML is not clobbered by incomplete overwrite', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'afkllm-complete-html-'))
+    try {
+      const reg = new AgentToolRegistry({ projectRoot: root })
+      const rel = 'index.html'
+      const done = '<!DOCTYPE html><html><body><h1>Northline</h1></body></html>\n'
+      await fs.writeFile(path.join(root, rel), done, 'utf8')
+      const noFlag = await reg.invoke({
+        id: '1',
+        name: 'write_file',
+        arguments: { relative_path: rel, content: '<style>.x{}</style>' }
+      })
+      assert.equal(noFlag.ok, false)
+      assert.match(noFlag.error ?? '', /FILE_COMPLETE/)
+      const clobber = await reg.invoke({
+        id: '2',
+        name: 'write_file',
+        arguments: {
+          relative_path: rel,
+          content: '<style>.navbar{}</style>',
+          overwrite: true
+        }
+      })
+      assert.equal(clobber.ok, false)
+      assert.match(clobber.error ?? '', /FILE_COMPLETE/)
+      assert.equal(await fs.readFile(path.join(root, rel), 'utf8'), done)
+    } finally {
+      await fs.rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('complete medium landing HTML may overwrite; incomplete still blocked', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'afkllm-landing-exists-'))
     try {
       const reg = new AgentToolRegistry({ projectRoot: root })
@@ -924,8 +1392,58 @@ describe('AgentToolRegistry edit review', () => {
         arguments: { relative_path: rel, content: big + '<!-- v2 -->\n' }
       })
       assert.equal(blocked.ok, false)
-      assert.match(blocked.error ?? '', /overwrite=true/)
-      assert.doesNotMatch(blocked.error ?? '', /apply_diff/)
+      assert.match(blocked.error ?? '', /FILE_COMPLETE/)
+      assert.doesNotMatch(blocked.error ?? '', /overwrite=true/)
+
+      const overwritten = await reg.invoke({
+        id: '2',
+        name: 'write_file',
+        arguments: {
+          relative_path: rel,
+          content: big.replace('Northline', 'Northline Dark'),
+          overwrite: true
+        }
+      })
+      assert.equal(overwritten.ok, true, overwritten.error ?? overwritten.content)
+      assert.match(await fs.readFile(path.join(root, rel), 'utf8'), /Northline Dark/)
+    } finally {
+      await fs.rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('huge complete HTML still needs allow_full_rewrite', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'afkllm-huge-html-'))
+    try {
+      const reg = new AgentToolRegistry({ projectRoot: root })
+      const rel = 'index.html'
+      const huge =
+        '<!DOCTYPE html><html><head><title>Big</title></head><body>' +
+        'x'.repeat(41_000) +
+        '</body></html>\n'
+      await fs.writeFile(path.join(root, rel), huge, 'utf8')
+      const blocked = await reg.invoke({
+        id: '1',
+        name: 'write_file',
+        arguments: {
+          relative_path: rel,
+          content: huge.replace('Big', 'Bigger'),
+          overwrite: true
+        }
+      })
+      assert.equal(blocked.ok, false)
+      assert.match(blocked.error ?? '', /FILE_COMPLETE|apply_diff/)
+      const allowed = await reg.invoke({
+        id: '2',
+        name: 'write_file',
+        arguments: {
+          relative_path: rel,
+          content: huge.replace('Big', 'Bigger'),
+          overwrite: true,
+          allow_full_rewrite: true
+        }
+      })
+      assert.equal(allowed.ok, true, allowed.error ?? allowed.content)
+      assert.match(await fs.readFile(path.join(root, rel), 'utf8'), /Bigger/)
     } finally {
       await fs.rm(root, { recursive: true, force: true })
     }
@@ -960,6 +1478,42 @@ describe('AgentToolRegistry edit review', () => {
       assert.equal(diff.ok, true)
       assert.equal(diff.previous, 'old\n')
       assert.equal(diff.current, 'new\n')
+    } finally {
+      await fs.rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('TRUNCATION_GUARD blocks shrinking a complete HTML file', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'afkllm-trunc-'))
+    try {
+      const reg = new AgentToolRegistry({ projectRoot: root })
+      const rel = 'index.html'
+      const existing =
+        '<!DOCTYPE html><html><body>' + 'x'.repeat(17000) + '</body></html>\n'
+      const smaller =
+        '<!DOCTYPE html><html><body>' + 'y'.repeat(10000) + '</body></html>\n'
+      await fs.writeFile(path.join(root, rel), existing, 'utf8')
+      const blocked = await reg.invoke({
+        id: '1',
+        name: 'write_file',
+        arguments: { relative_path: rel, content: smaller, overwrite: true }
+      })
+      assert.equal(blocked.ok, false)
+      assert.match(blocked.error ?? '', /TRUNCATION_GUARD/)
+      assert.equal(await fs.readFile(path.join(root, rel), 'utf8'), existing)
+
+      const allowed = await reg.invoke({
+        id: '2',
+        name: 'write_file',
+        arguments: {
+          relative_path: rel,
+          content: smaller,
+          overwrite: true,
+          allow_full_rewrite: true
+        }
+      })
+      assert.equal(allowed.ok, true, allowed.error ?? allowed.content)
+      assert.equal(await fs.readFile(path.join(root, rel), 'utf8'), smaller)
     } finally {
       await fs.rm(root, { recursive: true, force: true })
     }
@@ -1037,4 +1591,237 @@ describe('contextUsage live gauge', () => {
     assert.ok(after.used > prompt, 'live used must exceed last measured prompt')
     assert.equal(after.measured, true)
   })
+
+  it('does not collapse gauge when a tiny follow-up prompt_tokens arrives', () => {
+    const msgs = [
+      { id: 'welcome', role: 'system' as const, content: 'welcome' },
+      {
+        id: 'u1',
+        role: 'user' as const,
+        content: 'Build a full landing page. ' + 'x'.repeat(2000)
+      },
+      {
+        id: 'a1',
+        role: 'assistant' as const,
+        content: 'Here is the landing HTML. ' + 'y'.repeat(4000)
+      }
+    ]
+    const local = estimateLocalContextSum({
+      messages: msgs,
+      ctxLimit: 65536,
+      agentAutoApprove: true
+    })
+    assert.ok(local > 1000)
+    const collapsed = estimateContextUsage({
+      messages: msgs,
+      ctxLimit: 65536,
+      agentAutoApprove: true,
+      promptTokens: 186,
+      anchorLocalSum: 200
+    })
+    assert.ok(
+      collapsed.used >= local * 0.9,
+      `used=${collapsed.used} should stay near local=${local}, not 186`
+    )
+  })
 })
+
+describe('honest evidence and truncation helpers', () => {
+  it('synthetic tool results are not recorded as evidence', () => {
+    const empty: StepEvidence[] = []
+    const skipped = maybeRecordToolEvidence(empty, true, {
+      name: 'execute_terminal_command',
+      ok: false,
+      command: 'Start-Process index.html',
+      content: 'TOOL_LOOP: HTML preview already opened'
+    })
+    assert.equal(skipped.length, 0)
+
+    const recorded = maybeRecordToolEvidence(empty, false, {
+      name: 'execute_terminal_command',
+      ok: true,
+      command: 'Start-Process index.html',
+      content: 'PREVIEW_URL http://127.0.0.1:9/index.html\nOpened AFKLLM Browser'
+    })
+    assert.equal(recorded.length, 1)
+    assert.equal(recorded[0]!.kind, 'preview_ok')
+  })
+
+  it('honestClosingNote omits exit_code=? and drops the claim after a later shell/preview ok', () => {
+    const failOnly: StepEvidence[] = [
+      {
+        kind: 'shell_fail',
+        tool: 'execute_terminal_command',
+        ok: false,
+        command: 'dir',
+        at: 1
+      }
+    ]
+    const afterFail = honestClosingNote({
+      mutatingEditOk: true,
+      mutatingEditFailed: false,
+      evidence: failOnly,
+      previewOpened: false,
+      claimsVisualOk: false,
+      lang: 'ru'
+    })
+    assert.ok(afterFail)
+    assert.doesNotMatch(afterFail ?? '', /exit_code=\?/)
+
+    const recovered: StepEvidence[] = [
+      ...failOnly,
+      {
+        kind: 'preview_ok',
+        tool: 'execute_terminal_command',
+        ok: true,
+        command: 'Start-Process index.html',
+        at: 2
+      }
+    ]
+    assert.equal(laterSuccessAfterFail(recovered), true)
+    const note = honestClosingNote({
+      mutatingEditOk: true,
+      mutatingEditFailed: false,
+      evidence: recovered,
+      previewOpened: true,
+      claimsVisualOk: false,
+      lang: 'ru'
+    })
+    assert.equal(note, null)
+  })
+
+  it('truncationGuardMessage fires below 70% and respects allow_full_rewrite', () => {
+    const msg = truncationGuardMessage({
+      relativePath: 'index.html',
+      existingBytes: 17398,
+      newBytes: 10372,
+      existingComplete: true
+    })
+    assert.ok(msg)
+    assert.match(msg ?? '', /TRUNCATION_GUARD/)
+    assert.match(msg ?? '', /index\.html/)
+    assert.equal(
+      truncationGuardMessage({
+        relativePath: 'index.html',
+        existingBytes: 17398,
+        newBytes: 10372,
+        existingComplete: true,
+        allowFullRewrite: true
+      }),
+      null
+    )
+  })
+})
+
+describe('apply_diff replace_all', () => {
+  it('without the flag, a 12-way match tells the model to pass replace_all=true', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'afkllm-rename-'))
+    try {
+      const rel = 'index.html'
+      const original = Array.from({ length: 12 }, () => 'Northline').join(' ')
+      await fs.writeFile(path.join(root, rel), original, 'utf8')
+      const reg = new AgentToolRegistry({ projectRoot: root })
+      const blocked = await reg.invoke({
+        id: '1',
+        name: 'apply_diff',
+        arguments: {
+          relative_path: rel,
+          search_block: 'Northline',
+          replace_block: 'AFKLLM'
+        }
+      })
+      assert.equal(blocked.ok, false)
+      assert.match(blocked.error ?? '', /replace_all=true/)
+      assert.match(blocked.error ?? '', /12/)
+      assert.equal(await fs.readFile(path.join(root, rel), 'utf8'), original)
+    } finally {
+      await fs.rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('replace_all replaces every occurrence, returns editReview, and reject restores', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'afkllm-rename-all-'))
+    try {
+      const rel = 'index.html'
+      const original = Array.from({ length: 12 }, () => 'Northline').join(' ')
+      await fs.writeFile(path.join(root, rel), original, 'utf8')
+      const reg = new AgentToolRegistry({ projectRoot: root })
+      const ok = await reg.invoke({
+        id: '1',
+        name: 'apply_diff',
+        arguments: {
+          relative_path: rel,
+          search_block: 'Northline',
+          replace_block: 'AFKLLM',
+          replace_all: true
+        }
+      })
+      assert.equal(ok.ok, true)
+      assert.match(ok.content, /12 replacements/)
+      assert.equal(ok.editReview?.status, 'pending')
+      const after = await fs.readFile(path.join(root, rel), 'utf8')
+      assert.equal((after.match(/AFKLLM/g) ?? []).length, 12)
+      assert.doesNotMatch(after, /Northline/)
+      const rejected = await reg.rejectEdit(rel)
+      assert.equal(rejected.ok, true)
+      assert.equal(await fs.readFile(path.join(root, rel), 'utf8'), original)
+    } finally {
+      await fs.rm(root, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('SHELL_EDIT_FORBIDDEN', () => {
+  it('flags sed -i / Set-Content and lets npm test, git status, Start-Process through', () => {
+    assert.equal(looksLikeShellFileMutation("sed -i 's/A/B/g' index.html"), true)
+    assert.equal(
+      looksLikeShellFileMutation(
+        "(Get-Content index.html -Raw) -replace 'Northline','AFKLLM' | Set-Content index.html"
+      ),
+      true
+    )
+    assert.equal(looksLikeShellFileMutation('npm test'), false)
+    assert.equal(looksLikeShellFileMutation('git status'), false)
+    assert.equal(looksLikeShellFileMutation('Start-Process index.html'), false)
+  })
+
+  it('blocks sed -i and Set-Content without touching the file', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'afkllm-shell-edit-'))
+    try {
+      const rel = 'index.html'
+      const original = 'Northline'
+      await fs.writeFile(path.join(root, rel), original, 'utf8')
+      const reg = new AgentToolRegistry({ projectRoot: root })
+      const sed = await reg.invoke({
+        id: '1',
+        name: 'execute_terminal_command',
+        arguments: { command: "sed -i 's/A/B/g' index.html" }
+      })
+      assert.equal(sed.ok, false)
+      assert.match(sed.error ?? '', /SHELL_EDIT_FORBIDDEN/)
+      const sc = await reg.invoke({
+        id: '2',
+        name: 'execute_terminal_command',
+        arguments: {
+          command:
+            "(Get-Content index.html -Raw) -replace 'Northline','AFKLLM' | Set-Content index.html"
+        }
+      })
+      assert.equal(sc.ok, false)
+      assert.match(sc.error ?? '', /SHELL_EDIT_FORBIDDEN/)
+      assert.equal(await fs.readFile(path.join(root, rel), 'utf8'), original)
+
+      for (const command of ['npm test', 'git status', 'Start-Process index.html']) {
+        const res = await reg.invoke({
+          id: command,
+          name: 'execute_terminal_command',
+          arguments: { command }
+        })
+        assert.doesNotMatch(res.error ?? '', /SHELL_EDIT_FORBIDDEN/)
+      }
+    } finally {
+      await fs.rm(root, { recursive: true, force: true })
+    }
+  })
+})
+

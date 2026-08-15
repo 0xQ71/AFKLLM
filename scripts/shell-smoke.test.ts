@@ -46,6 +46,21 @@ describe('shellNormalize', () => {
     assert.equal(r.cwdRel, 'Calculator')
     assert.match(r.command, /cd other/)
   })
+
+  it('rewrites find|head and /dev/null for PowerShell', () => {
+    const find = normalizeAgentShellCommand(
+      'find . -name "index.html" -type f 2>/dev/null | head -5',
+      '.',
+      'win32'
+    )
+    assert.match(find.command, /Get-ChildItem/)
+    assert.match(find.command, /Select-Object -First 5/)
+    assert.doesNotMatch(find.command, /\/dev\/null/)
+    assert.ok(find.note)
+
+    const nullRedir = normalizeAgentShellCommand('dir 2>/dev/null', '.', 'win32')
+    assert.match(nullRedir.command, /2>\$null/)
+  })
 })
 
 describe('localPreview', () => {
@@ -115,6 +130,13 @@ describe('localPreview', () => {
     )
     assert.equal(
       extractOpenHtmlRelativePath('Start-Process (Resolve-Path .\\index.html)', '.'),
+      'index.html'
+    )
+    assert.equal(
+      extractOpenHtmlRelativePath(
+        'Start-Process "D:\\projects\\afkllm\\afkllm\\dist\\browser.html"',
+        '.'
+      ),
       'index.html'
     )
   })

@@ -1,4 +1,21 @@
 ﻿import { AGENT_TOOL_SCHEMAS, type AgentToolName, type AgentToolResult } from '../../../shared/types'
+import { allowsFullOverwrite } from '../../../shared/writeThresholds'
+import type { ProjectStack } from '../../../shared/projectStack'
+import {
+  AGENT_RULES_V2,
+  SYSTEM_CORE_V2,
+  SYSTEM_CONFIRM_CORE_V2,
+  buildStackSystemSection
+} from './loop/prompts'
+import { honestClosingNote } from './loop/report'
+import { type StepEvidence } from './loop/evidence'
+import { advanceTodosOnEvidence } from './loop/plan'
+import {
+  userAskedVerify,
+  inferredVerifyMode,
+  formatVerifyNudge,
+  verifyAlreadyRan
+} from './loop/verify'
 import { THREAD_SUMMARY_MSG_ID } from '../../../shared/chats'
 import {
   DEFAULT_UI_LANGUAGE,
@@ -10,6 +27,7 @@ import { translate } from '../i18n/messages'
 import {
   AGENT_CHECKLIST_MSG_ID,
   AGENT_TODO_MSG_ID,
+  isAgentTodoMessageId,
   applyToolToChecklist,
   advanceTodosOnTool,
   buildChecklistFromHistory,
@@ -35,16 +53,16 @@ import {
   findPlanLeakIndex,
   findCodeLeakIndex,
   stripCodeLeakFromThink,
-  defaultLandingPlanSteps,
+  coerceProductPlan,
   thinkBodyLooksLikeCodeDump,
   thinkLooksLikeChecklist,
   packReadFileForAgent,
   contentLooksStructurallyComplete,
   wrapThinkForUi,
-  reconcileTodosWithContent,
   todosAllDone,
   pendingPlanWork,
   looksLikeOpenHtmlCommand,
+  looksLikeLandingBuildTask,
   evaluateAcceptanceGate,
   fingerprintToolCall,
   looksLikeToolMarkupLeak,
@@ -53,9 +71,11 @@ import {
   inferWritePathFromContent,
   extractAssistantHtmlDump,
   looksLikeAssistantHtmlDump,
-  isMetaOrSummaryPlanStep,
   isBrowserPlanStep,
-  rebalanceTodoStatuses,
+  isJunkPlanStep,
+  isFalseSuccessProse,
+  isAgentChatNoise,
+  parseGlobalRenameIntent,
   apiContentText,
   mergeChecklistIntoSystem,
   type AgentChecklist,
@@ -69,6 +89,7 @@ import {
   type ComposerActivity
 } from './composerActivity'
 import { diffStatFromCodePreview } from '../../../shared/diffStat'
+import { isAfkllmInternalHtmlPath } from '../../../shared/localPreview'
 
 const RECENT_TURNS_WITH_SUMMARY = 12
 
@@ -78,6 +99,18 @@ function normPath(p: string): string {
 
 function loopPathKey(p: string): string {
   return normPath(p).toLowerCase()
+}
+
+/**
+ * Push a transient "↻ …" status bubble, skipping it when the last message is an
+ * identical status line. Prevents duplicates like two "Доделываю план по порядку".
+ */
+function pushStatusBubble(messages: ChatMessage[], content: string): void {
+  const last = messages[messages.length - 1]
+  if (last && last.role === 'assistant' && !last.toolName && last.content === content) {
+    return
+  }
+  messages.push({ id: uid(), role: 'assistant', content })
 }
 
 function clearPlanningRows(messages: ChatMessage[]): void {
@@ -133,6 +166,7 @@ export type { AgentChecklist }
 export {
   AGENT_CHECKLIST_MSG_ID,
   AGENT_TODO_MSG_ID,
+  isAgentTodoMessageId,
   applyToolToChecklist,
   advanceTodosOnTool,
   buildChecklistFromHistory,
@@ -312,59 +346,7 @@ async function describeImagesWithVision(params: {
   }
 }
 
-const AGENT_RULES = `
-Rules for multi-file work (critical):
-- Paths MUST be relative to the project root (e.g. engineering_calc/main.py). Never use absolute paths like D:\\...
-- Finish ONE file completely before starting another. INCOMPLETE_WRITE → append=true on the SAME path. FILE_EXISTS on a small file → overwrite=true with the full file; on a large file → apply_patch / append=true. Never invent a sibling filename.
-- Small files (< ~150 lines / ~6KB, e.g. index.html, styles.css, short scripts): prefer write_file with overwrite=true for edits — full rewrite is cheaper and more reliable than patch.
-- Large files: write_file on an existing non-empty file is REJECTED unless append=true (or rare overwrite=true). Prefer apply_patch for edits (multi-hunk / multi-file); apply_diff for a single unique replace.
-- Corrections / bugfixes / "это не так" / pointing out mistakes (critical):
-  1) read_file (or search_codebase) the existing file first — do NOT guess from memory.
-  2) Small files → write_file overwrite=true with the full corrected content.
-  3) Large files → Change ONLY the broken part with apply_patch (Codex *** Begin Patch hunks) or apply_diff (small unique search_block → replace_block).
-  4) Or append missing pieces with write_file append=true.
-  FORBIDDEN on corrections for LARGE files: recreating the whole file/page/app from scratch, inventing duplicate filenames.
-  Full overwrite of large files is allowed ONLY if the user explicitly asks to rewrite/regenerate the entire file, OR after two failed apply_patch/apply_diff attempts on that path.
-- If apply_patch / apply_diff fails twice on the same path: switch to write_file overwrite=true (especially for small HTML/CSS). Do NOT keep retrying the same broken hunk.
-- Unclear repo layout or “where is X?”: call explore_subagent with a clear goal before large edits (read-only research report).
-- NEVER invent duplicate modules (thermodynamic.py vs thermodynamics.py). list_directory / read_file first.
-- Small HTML/CSS/scripts: one full write_file (overwrite=true if the file already exists). Large files only: modest chunks (~1200–1500 chars) then append=true until syntactically complete.
-- Do not say the task is done while required files from the user's structure are still missing — create the next missing file.
-- Execute the UI plan IN ORDER. Do not skip ahead to Start-Process, opening index.html, or a closing summary while earlier plan steps are still open.
-- Terminal (Windows): shell is PowerShell in a real PTY (visible IDE Terminal). NEVER use bash && or ||. Prefer ONE command + cwd="subdir" (e.g. command="javac Calculator.java", cwd="Calculator/src"). Chain only with "; " if needed. Do NOT pass unquoted globs like *.java to javac/java — PowerShell does not expand them for native exes; list files explicitly or use Get-ChildItem. Interactive CLI prompts (y/n): the user can type in the Terminal; when Auto-approve is ON, AFKLLM may auto-confirm yes. Prefer non-interactive flags when available (npm --yes, CI=1). Avoid hanging forever on password prompts. Preview: static HTML → Start-Process (Resolve-Path .\\index.html) opens the workspace file in AFKLLM Browser (file://). Vite/npm run dev → use the printed Local: URL (e.g. http://localhost:5173) — that localhost is correct. NEVER open the LLM API port (usually :8080) as the site.
-- Terminal errors (critical): when execute_terminal_command fails with TERMINAL_ERROR / ERROR_FOCUS, READ that focus, fix the exact file/line with read_file + apply_patch (or apply_diff), then re-run the SAME command. Never claim "environment forbids &&" — use cwd/; instead. Never drop JavaFX/GUI mid-task without explaining; for simple Java GUI prefer javax.swing (no modules) first, get javac/java working, then discuss .exe (jpackage) as a later step.
-- PROCESS_ENDED (critical): if the tool result says PROCESS_ENDED, the user closed the window or the program finished — this is NOT a bug. Do NOT rewrite code, do NOT relaunch, do NOT "fix" anything. Briefly acknowledge and wait for the next user message.
-- Tests / shell honesty (critical): NEVER say "tests pass", "Task completed" for a test task, or claim green unless the latest execute_terminal_command for that test returned ok (exit 0). If you see TERMINAL_ERROR / fail ✖ / exit_code≠0 with an error traceback, fix and re-run first — do not summarize success from an earlier run.
-- When running Python packages: use "python -m" from the project root.
-- When the user says "continue" / "продолжи", inspect what already exists and only create missing pieces.
-- When the user includes @codebase, relevant repo snippets are already attached — use them; still call tools if you need more.
-- Prefer @codebase for “where is X / which file?” before spamming search_codebase.
-- When the user includes @file or @selection, that file/snippet is already attached — use it before re-reading unless you suspect it is stale.
-- Attached chat files / PDFs / DOCX (critical):
-  1) Blocks labeled [Document: …] or [File: …] ARE the document the user shared — treat them as the real content, not a "preview for analysis".
-  2) Answer the user's question directly. FORBIDDEN openers: "The user attached…", "Given the context…", "The task is to…", "Документ представляет собой…", or restating the prompt.
-  3) Reply in the SAME language as the user's message. If they only attached a file with no question, reply in the document's language (prefer Russian if the document is Russian).
-  4) When asked what a document is / to summarize: lead with what the product/system is and what the doc is for (1–3 sentences), then a short useful overview. Do NOT dump the table of contents or rename every section heading unless the user asked for the outline.
-  5) Be concise. Prefer substance over bureaucratic section lists. Do NOT dump bilingual EN↔RU glossaries unless asked.
-  6) If the extract ends with a truncation marker, answer from what is present; mention incompleteness only when it matters.
-- Web / docs (critical):
-  1) If the user asks you to search the web, cite docs, add a Refs/link from search, or names a query for web_search — you MUST call the web_search tool at least once before finishing. Do NOT invent URLs from memory.
-  2) Otherwise call web_search for up-to-date docs, package APIs, stack-overflow-style fixes, or facts not in the repo. Prefer search_codebase for local code. Use a precise query (library + error text + language).
-- Node.js tests (when the user asks for node:test / npm test):
-  1) Use import { describe, it } from 'node:test' and assert from 'node:assert' (or node:assert/strict).
-  2) Wrap cases in describe/it — do NOT rely on bare top-level assert calls as the only tests.
-  3) Import and assert every exported helper the user named (e.g. normalize), not only indirect coverage via another function.
-  4) After writing/fixing tests, run the exact test command the user gave (usually node --test …) via execute_terminal_command and fix until green.
-- CLI / scripts verification (when you create a CLI):
-  1) Implement BOTH stdin and argv/first-arg paths if the user required them — argv must actually print the result, not only parse-and-return.
-  2) Before claiming done, run at least one execute_terminal_command smoke for the CLI (e.g. node src/cli.js "[10,90]" and/or echo pipe) and confirm JSON output looks right.
-- Acceptance / "Task completed":
-  1) Only claim Task completed after required tools ran (tests green, web_search if required, tree verified).
-  2) If the user gave an exact acceptance format, follow it; cite a web_ref URL that came from a web_search tool result, not a guessed link.
-- Local web preview: when you start a landing/dev server (vite, npm run dev, python -m http.server, etc.), AFKLLM auto-opens the in-app Browser on the Local/localhost URL from the terminal — do not ask the user to open an external browser.
-- Images / photos (critical):
-  1) To UNDERSTAND a user-attached photo: only the built-in vision attach path (images on the user message). Never read_file images (.png/.jpg/.webp/.gif/…).
-- Do NOT ask for permission in chat — call tools.`
+const AGENT_RULES = AGENT_RULES_V2
 
 const IMAGE_GEN_RULES_ON = `
 - Image generation (Image mode ON):
@@ -389,23 +371,9 @@ const IMAGE_GEN_RULES_OFF = `
 /** Exported for Context Usage estimates (without embedding in SYSTEM twice). */
 export { AGENT_RULES, IMAGE_GEN_RULES_ON, IMAGE_GEN_RULES_OFF }
 
-const SYSTEM_CORE = `You are AFKLLM, a local coding agent inside a desktop IDE.
-You can read/write/delete files, create directories, search code, search the web (web_search: DuckDuckGo + Bing + Brave + Wikipedia + SO + HN), run shell commands, and call connected MCP tools (names starting with mcp__). Prefer built-in filesystem/shell tools over MCP equivalents.
-- Small files (< ~150 lines / HTML, CSS, short scripts): prefer write_file overwrite=true for edits. apply_patch / apply_diff only for large files.
-- Prefer apply_patch for large-file edits (apply_diff for one small replace). Be concise.
-- When done (after tools or Q&A), always write a short closing summary for the user: what changed, key paths, how to verify. Match their language.
-- Existing files (critical): if index.html / styles.css / the requested page already exists and roughly matches the task, FIX it (small file → overwrite; large → apply_patch) — do NOT invent extra pages (pricing.html, contact.html) unless the user asked.
-- Match the user's language in replies (Russian ↔ Russian, English ↔ English).
-IMPORTANT: Do NOT ask the user for permission to use tools. Call tools immediately when needed.`
+const SYSTEM_CORE = SYSTEM_CORE_V2
 
-const SYSTEM_CONFIRM_CORE = `You are AFKLLM, a local coding agent inside a desktop IDE.
-You can read/write/delete files, create folders, search code, search the web (web_search: DuckDuckGo + Bing + Brave + Wikipedia + SO + HN), run shell commands, and call connected MCP tools (names starting with mcp__). Prefer built-in filesystem/shell tools over MCP equivalents.
-Shell commands open the IDE Terminal panel (visible). They may need a one-click confirm unless auto-approve is ON.
-Small files (< ~150 lines): prefer write_file overwrite=true. Large files: prefer apply_patch (apply_diff for one small replace). Be concise.
-When done, always write a short closing summary (what changed, paths, how to verify) in the user's language.
-- Existing files (critical): if the target files already exist, patch or overwrite them — do not add unrequested pages.
-Match the user's language in replies (Russian ↔ Russian, English ↔ English).
-Do not ask in chat for permission to read or edit files — use tools directly.`
+const SYSTEM_CONFIRM_CORE = SYSTEM_CONFIRM_CORE_V2
 
 const SYSTEM = `${SYSTEM_CORE}
 ${AGENT_RULES}`
@@ -429,8 +397,8 @@ const THINK_THROUGH = `
 Think-through protocol (mandatory — always on):
 The app first runs ONE short THINK-ONLY completion, then PLAN_ONLY, then tools.
 1) <think> — ONE compact DeepThink (4–8 sentences, not a novel) about THIS prompt: goal, constraints, approach, risks.
-   FORBIDDEN in think: <plan>, todos, HTML/CSS/JS, write_file.
-2) PLAN_ONLY: <plan> with 4–8 atomic steps.
+   FORBIDDEN in think: <plan>, todos, HTML/CSS/JS, write_file, claiming "Сделано"/"done" before tools succeed.
+2) PLAN_ONLY: <plan> with 3–6 atomic product steps. FORBIDDEN plan rows: "if patch fails rewrite whole file", tool names, CSS class dumps.
 After prelude: NEVER open another <think> or <plan>. Call tools immediately (write_file first for landings).
 Do NOT Start-Process / browser / done-summary until non-browser plan steps are done.
 `
@@ -442,31 +410,69 @@ export {
   THINK_THROUGH
 }
 
-/** Bug/inaccuracy phrasing → surgical edits only. */
-function looksLikeCorrection(text: string): boolean {
-  const t = text.trim()
-  if (t.length > 2500) return false
-  return /исправ|неточн|ошибк|баг|fix\b|wrong|bug\b|broken|instead|а не\b|не так|поправ|сломан|не работает|doesn't work|does not work|почему|зачем перепис|лишн|убери|удали\b|добавь|дополни|дописать|подправ|измени только|только.*(css|js|html|файл)|too much|перебор|не то\b|неправильн|криво|багфикс/i.test(
-    t
-  )
-}
-
-/** Explicit full-rewrite request → overwrite allowed. */
+/** Explicit full-rewrite request → overwrite of large files allowed. */
 function looksLikeExplicitRewrite(text: string): boolean {
-  return /перепиши\s+(весь|полностью|файл|лендинг|всё|все)|rewrite\s+(the\s+)?(whole|entire|full)|с\s*нуля|from\s+scratch|заново\s+весь|regenerate\s+(the\s+)?(page|file|landing)/i.test(
+  return /перепиши\s+(весь|полностью|файл|лендинг|всё|все)|rewrite\s+(the\s+)?(whole|entire|full)|с\s*нуля|from\s+scratch|заново\s+весь|regenerate\s+(the\s+)?(page|file|landing)|создай\/перезапиши|создай\s+или\s+перезапиши|сначала\s+создай/i.test(
     text
   )
 }
 
-const SURGICAL_EDIT_HINT = `
-[SURGICAL_EDIT — mandatory]
-The user is correcting existing work, not requesting a new project.
-1) read_file / search_codebase the relevant existing file(s) first.
-2) Small files (< ~150 lines / HTML, CSS): write_file overwrite=true with the full corrected content.
-3) Large files: Fix ONLY the inaccurate part with apply_diff (small exact search_block) or apply_patch.
-4) Missing pieces → write_file append=true on the SAME path.
-FORBIDDEN: inventing duplicate filenames; regenerating an entire multi-file project from scratch.
-`
+/** Open/show preview intent when index.html is already built — skip plan ceremony. */
+export function looksLikeOpenLandingOnly(text: string): boolean {
+  const t = text.trim()
+  if (!t || t.length > 80) return false
+  // Real edit/rename work is never "just open".
+  if (parseGlobalRenameIntent(t)) return false
+  if (
+    /помен|переимен|назван|бренд|northline|afkllm|цвет|theme|тем[аы]|faq|исправ|добав|убер|перепис|rewrite|accent|фиолет|ширин|overflow|стил|css|текст|измени/i.test(
+      t
+    )
+  ) {
+    return false
+  }
+  // Do NOT use \b after Cyrillic — JS treats it as non-word, so «открой лендинг» never matched.
+  return (
+    /^(открой|open|покажи|show)([\s\u00a0]|$)/i.test(t) &&
+    /лендинг|landing|index\.html|превью|preview|браузер|browser/i.test(t)
+  )
+}
+
+/**
+ * Cursor-style: skip forced think→plan ONLY for ultra-short confirms
+ * («ок», «продолжи»). Feature requests (theme toggle, etc.) always get think.
+ * Never use keywords like «исправ/белый» — only message shape.
+ */
+export function shouldSkipThinkPlanCeremony(
+  userText: string,
+  history: ChatMessage[]
+): boolean {
+  const t = userText.trim()
+  if (!t) return false
+  // Micro confirms / continue only — anything longer needs think.
+  // Note: JS \b is ASCII-only; do not use it for Cyrillic tokens.
+  if (t.length > 48) return false
+  if (
+    !/^(ок|ok|да|yes|ладно|продолжи|continue|ещё|еще|дальше|go)([!.…]*|\s.*)?$/i.test(
+      t
+    )
+  ) {
+    return false
+  }
+  if (looksLikeLandingBuildTask(t)) return false
+  if (looksLikeExplicitRewrite(t)) return false
+  let hasPriorWork = false
+  for (const m of history) {
+    if (isAgentTodoMessageId(m.id)) hasPriorWork = true
+    if (
+      m.toolName === 'write_file' ||
+      m.toolName === 'apply_diff' ||
+      m.toolName === 'apply_patch'
+    ) {
+      hasPriorWork = true
+    }
+  }
+  return hasPriorWork
+}
 
 const DEFAULT_MAX_ROUNDS = 64
 const TOOL_RESULT_CHARS = 6_000
@@ -484,12 +490,13 @@ const CTX_RESERVE_TOKENS = 900
 const MAX_INCOMPLETE_APPENDS_PER_PATH = 4
 /** Identical tool+args repeats before TOOL_LOOP nudge (turn continues). */
 const MAX_IDENTICAL_TOOL_CALLS = 2
-/** read_file same path — nudge re-verify loops (Think + edit). */
-const MAX_READS_PER_PATH = 2
+/** read_file same path — allow a few re-reads, with a turn-wide budget. */
+const MAX_READS_PER_PATH = 3
+const MAX_READS_TURN_BUDGET = 8
 /** Soft recovery threshold — never hard-stop the turn for the user. */
 const MAX_TOOL_LOOP_HITS = 2
 /** Successful apply_patch/apply_diff on one path before forcing overwrite finish. */
-const MAX_PATCH_OK_PER_PATH = 2
+const MAX_PATCH_OK_PER_PATH = 12
 const MAX_MARKUP_REPAIR_ATTEMPTS = 2
 /** Absolute safety cap for a single tool-arguments JSON blob. */
 const MAX_TOOL_ARG_CHARS = 96_000
@@ -499,19 +506,11 @@ const MAX_OVERFLOW_REPAIRS = 2
 /** Transient llama disconnects (fetch failed) before giving up the turn. */
 const MAX_FETCH_REPAIRS = 3
 /** Small-file overwrite is allowed even on correction turns. */
-const SMALL_FILE_OVERWRITE_CHARS = 6000
-/** Landing HTML often exceeds 6KB; still treat as a small-file overwrite. */
-const LANDING_OVERWRITE_CHARS = 40_000
-
 function allowsLandingOverwrite(relativePath: string, contentChars: number): boolean {
-  if (contentChars < SMALL_FILE_OVERWRITE_CHARS) return true
-  return (
-    /\.(html?|css|md|svg|js|ts|tsx|jsx)$/i.test(relativePath) &&
-    contentChars < LANDING_OVERWRITE_CHARS
-  )
+  return allowsFullOverwrite(relativePath, contentChars)
 }
 /** Failed apply_patch/apply_diff on one path before suggesting overwrite. */
-const MAX_PATCH_FAILS_BEFORE_OVERWRITE = 2
+const MAX_PATCH_FAILS_BEFORE_OVERWRITE = 4
 /** Hard cap for system prompt after compact. */
 const COMPACT_SYSTEM_MAX_CHARS = 6_000
 const COMPACT_TAIL_MAX_MSGS = 6
@@ -737,7 +736,16 @@ export interface TurnFileChange {
 function removeChecklistBubbles(messages: ChatMessage[]): void {
   for (let i = messages.length - 1; i >= 0; i--) {
     const id = messages[i]?.id
-    if (id === AGENT_CHECKLIST_MSG_ID || id === AGENT_TODO_MSG_ID) messages.splice(i, 1)
+    if (id === AGENT_CHECKLIST_MSG_ID) messages.splice(i, 1)
+  }
+}
+
+/** Keep prior-turn plan cards in history: rename live id so the next upsert cannot delete them. */
+function archiveLiveTodoBubble(messages: ChatMessage[]): void {
+  for (const m of messages) {
+    if (m.id === AGENT_TODO_MSG_ID) {
+      m.id = `${AGENT_TODO_MSG_ID}-${Date.now()}`
+    }
   }
 }
 
@@ -767,7 +775,7 @@ function upsertTodoBubble(
       if (
         m.id === AGENT_CHECKLIST_MSG_ID ||
         m.id === AGENT_PLAN_MSG_ID ||
-        m.id === AGENT_TODO_MSG_ID
+        isAgentTodoMessageId(m.id)
       ) {
         continue
       }
@@ -780,6 +788,7 @@ function upsertTodoBubble(
 
 function logAgentToolEvent(message: string, extra?: Record<string, string | number | boolean | null>): void {
   try {
+    console.info('[agent:tool]', message, extra ?? '')
     void window.api.telemetry.report({
       kind: 'info',
       message,
@@ -1416,7 +1425,8 @@ async function buildApiMessages(
   selection?: EditorSelectionContext | null,
   attachments?: FileAttachment[],
   mode: AgentTurnMode = 'agent',
-  ctxSize = 8192
+  ctxSize = 8192,
+  stacks: ProjectStack[] = []
 ): Promise<ApiMessage[]> {
   let system =
     mode === 'plan'
@@ -1424,6 +1434,9 @@ async function buildApiMessages(
       : settings?.agentAutoApprove
         ? SYSTEM
         : SYSTEM_CONFIRM
+  if (stacks.length >= 0 && mode !== 'plan') {
+    system += buildStackSystemSection(stacks)
+  }
   if (settings?.systemPrompt?.trim()) {
     system += `\n\n${settings.systemPrompt.trim()}`
   }
@@ -1467,8 +1480,8 @@ async function buildApiMessages(
   for (const m of history) {
     if (
       m.id === 'welcome' ||
+      isAgentTodoMessageId(m.id) ||
       m.id === AGENT_CHECKLIST_MSG_ID ||
-      m.id === AGENT_TODO_MSG_ID ||
       m.id === THREAD_SUMMARY_MSG_ID
     ) {
       continue
@@ -1477,6 +1490,7 @@ async function buildApiMessages(
     if (m.toolName) continue
     if (m.role !== 'user' && m.role !== 'assistant') continue
     if (!m.content?.trim()) continue
+    if (m.role === 'assistant' && isAgentChatNoise(m.content)) continue
     eligible.push(m)
   }
   const kept = summaryContent
@@ -1562,13 +1576,8 @@ async function buildApiMessages(
     attachBlock = parts.join('\n') + '\n'
   }
 
-  const surgical =
-    looksLikeCorrection(mentions.cleanText) && !looksLikeExplicitRewrite(mentions.cleanText)
-      ? SURGICAL_EDIT_HINT
-      : ''
   const userPayload =
     mentions.cleanText +
-    surgical +
     attachBlock +
     fileBlock +
     selectionBlock +
@@ -1779,7 +1788,7 @@ function attachStatsToLastVisible(
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i]
     if (!m || m.id === 'welcome') continue
-    if (m.id === AGENT_TODO_MSG_ID || m.id === AGENT_CHECKLIST_MSG_ID) continue
+    if (isAgentTodoMessageId(m.id) || m.id === AGENT_CHECKLIST_MSG_ID) continue
     if (m.streaming) continue
     // Don't hang tool-round token stats on the think fold.
     if (hasThinkBlock(m.content) && !stripPlanBlock(m.content).replace(/<\s*\/?\s*(?:think|thinking)\s*>/gi, '').trim()) {
@@ -1842,6 +1851,8 @@ export async function runAgentTurn(params: {
   reverbContinue?: { messageId: string }
   /** UI language for user-facing pause / timeout hints */
   uiLanguage?: UiLanguage
+  /** 2 = honest language-agnostic loop (default via settings.agentLoopV2). */
+  loopVersion?: 1 | 2
 }): Promise<ChatMessage[]> {
   const isPlan = params.mode === 'plan'
   const maxRounds = isPlan ? 1 : (params.maxRounds ?? DEFAULT_MAX_ROUNDS)
@@ -1942,14 +1953,31 @@ export async function runAgentTurn(params: {
   const appSettings = await window.api.settings.get()
   params.queue.applySettings(appSettings)
   const ctxSize = appSettings.ctxSize > 0 ? appSettings.ctxSize : 8192
+  let stacks: ProjectStack[] = []
+  try {
+    const snap = await window.api.context.stack()
+    stacks = Array.isArray(snap?.stacks) ? snap.stacks : []
+  } catch {
+    stacks = []
+  }
+  const evidenceLog: StepEvidence[] = []
 
   let checklist = buildChecklistFromHistory(params.history)
   let todoSteps: AgentTodoStep[] = []
   let planFrozen = false
   let lastHtmlWrite = ''
+  let lastHtmlWritePath = 'index.html'
+  const completeHtmlByPath = new Set<string>()
   let planFinishNudges = 0
+  let sectionFillTried = true
+  /** A mutating edit (write_file / apply_diff / apply_patch) succeeded this turn. */
+  let mutatingEditOk = false
+  /** Last mutating edit failed (path / parse / apply) — used for honest failure summary. */
+  let mutatingEditFailed = false
+  let lastMutatingFailDetail = ''
   let bestLiveProse = ''
   let thinkBubbleId: string | null = null
+  archiveLiveTodoBubble(messages)
   removeChecklistBubbles(messages)
   if (!isPlan) {
     params.onUpdate([...messages])
@@ -2036,7 +2064,8 @@ export async function runAgentTurn(params: {
     params.selection,
     preparedAttachments,
     isPlan ? 'plan' : 'agent',
-    ctxSize
+    ctxSize,
+    stacks
   )
 
   // Only compact before the first call if we are already near the hard ceiling.
@@ -2073,27 +2102,61 @@ export async function runAgentTurn(params: {
   let missingPathHits = 0
   let loopRecoveryWarned = false
   let concludeAsked = false
-  let thinkGateHits = 0
+  /** Nudge when model paints "writing…" then returns zero tools after think/plan. */
+  let emptyToolNudges = 0
   /** Once the model emits <think> this turn, later tool rounds may skip re-thinking. */
   let thinkSatisfied = false
+  const coercePlan = (plan: AgentTodoStep[] | null | undefined): AgentTodoStep[] =>
+    coerceProductPlan(plan, { userText: params.userText }).filter(
+      (s) => !isJunkPlanStep(s.text)
+    )
+  const paintTodo = (
+    steps: AgentTodoStep[],
+    opts?: { afterId?: string }
+  ): void => {
+    const clean = steps.filter((s) => !isJunkPlanStep(s.text))
+    if (clean.length === 0) {
+      archiveLiveTodoBubble(messages)
+      return
+    }
+    upsertTodoBubble(messages, clean, opts)
+  }
   let usedWebSearch = false
   /** null until a test command runs */
   let lastNodeTestOk: boolean | null = null
   let ranCliSmoke = false
   const incompleteAppendsByPath = new Map<string, number>()
   const identicalToolCounts = new Map<string, number>()
-  /** Failed apply_patch / apply_diff counts per path — unlock overwrite after 2. */
+  /** Failed apply_patch / apply_diff counts per path — unlock overwrite after 4. */
   const patchFailsByPath = new Map<string, number>()
+  /** Pathless patch failures (parse/format errors) — bound the endless loop. */
+  let patchParseFails = 0
   /** Successful patches per path — stop endless "add img again" loops. */
   const patchOkByPath = new Map<string, number>()
   /** read_file counts per path — stop Think re-verify loops. */
   const readCountsByPath = new Map<string, number>()
+  let readFileCalls = 0
   /** Hard cap — model must not restart image gen mid-turn (even with a tweaked prompt). */
   let generateImageCalls = 0
-  /** After first successful HTML preview open, block further Start-Process / open loops. */
-  let htmlPreviewOpened = false
-  const thinkThrough = !isPlan
+    /** After first successful HTML preview open, block further Start-Process / open loops. */
+    let htmlPreviewOpened = false
+    const readFileCache = new Map<string, string>()
+  /** FILE_COMPLETE redirects — escalate to overwrite, do not fake-stop. */
+  let fileCompleteHits = 0
+  /** SMART_APPLY_FAIL / APPLY_UNAVAILABLE — escalate to overwrite. */
+  let smartApplyFailHits = 0
+  let htmlOverwriteEscalated = false
+  /** After hard-stop, skip further tool rounds. */
+  let forceEndTurn = false
+  const skipCeremony =
+    !isPlan && shouldSkipThinkPlanCeremony(params.userText, params.history)
+  const thinkThrough = !isPlan && !skipCeremony
   const autoApprove = appSettings.agentAutoApprove === true
+
+  // Landing shortcuts (open preview / brand rename / adaptive-CSS inject) are gone:
+  // every edit must come from a real tool call so the UI cannot report instant fake success.
+  const openPreviewOnly = false as boolean
+
   const userWantsWebSearch =
     /web_search|cite\s+1\s+url|under a ["']?Refs|search the web|from search/i.test(
       params.userText
@@ -2145,9 +2208,11 @@ export async function runAgentTurn(params: {
     const thinkBudgetTok = appSettings.reasoningBudgetEnabled
       ? Math.min(Math.max(512, appSettings.reasoningBudget ?? 1024), 1536)
       : 1024
-    const thinkMaxTokens = Math.min(thinkBudgetTok, AGENT_MAX_TOKENS)
-    const minThinkChars = 100
-    const enoughThinkChars = 420
+    const thinkMaxTokens = openPreviewOnly
+      ? Math.min(384, AGENT_MAX_TOKENS)
+      : Math.min(thinkBudgetTok, AGENT_MAX_TOKENS)
+    const minThinkChars = openPreviewOnly ? 40 : 100
+    const enoughThinkChars = openPreviewOnly ? 120 : 420
 
     const paintThink = (raw: string): void => {
       const idx = messages.findIndex((m) => m.id === preludeId)
@@ -2246,15 +2311,20 @@ export async function runAgentTurn(params: {
       return { text, aborted: false }
     }
 
-    const thinkPrompt =
-      'THINK_ONLY (tools DISABLED). Output ONLY a <think>…</think> block — nothing after it.\n' +
-      'Write compact first-person reasoning in the USER\'s language (like Cursor / DeepSeek DeepThink):\n' +
-      '- 4–8 sentences (~80–200 words). Stream immediately — do not stay silent then dump.\n' +
-      '- Cover: goal, hard constraints (what is FORBIDDEN), structure, visuals, one risk, how you verify.\n' +
-      '- Tie points to THIS user message — no filler.\n' +
-      `Budget for THIS completion: ≤${thinkBudgetTok} tokens — stop once the point is clear.\n` +
-      'FORBIDDEN: <plan>, [Plan], todos, HTML/CSS/JS, code fences, write_file, tools.\n' +
-      'Stop right after </think>.'
+    const thinkPrompt = openPreviewOnly
+      ? 'THINK_ONLY (tools DISABLED). Output ONLY a short <think>…</think> — nothing after it.\n' +
+        '2–4 sentences in the USER\'s language: they asked to open/show the landing; note that index.html is already on disk; ' +
+        'you will open it in Browser with no rebuild and no plan.\n' +
+        'FORBIDDEN: <plan>, todos, code, tools, HTML.\n' +
+        'Stop right after </think>.'
+      : 'THINK_ONLY (tools DISABLED). Output ONLY a <think>…</think> block — nothing after it.\n' +
+        'Write compact first-person reasoning in the USER\'s language (like Cursor / DeepSeek DeepThink):\n' +
+        '- 4–8 sentences (~80–200 words). Stream immediately — do not stay silent then dump.\n' +
+        '- Cover: goal, hard constraints (what is FORBIDDEN), structure, visuals, one risk, how you verify.\n' +
+        '- Tie points to THIS user message — no filler.\n' +
+        `Budget for THIS completion: ≤${thinkBudgetTok} tokens — stop once the point is clear.\n` +
+        'FORBIDDEN: <plan>, [Plan], todos, HTML/CSS/JS, code fences, write_file, tools.\n' +
+        'Stop right after </think>.'
 
     pushUserMessage(apiMessages, thinkPrompt)
     apiMessages = normalizeApiMessages(apiMessages)
@@ -2280,12 +2350,13 @@ export async function runAgentTurn(params: {
         thinkBodyLooksLikeCodeDump(raw) ||
         looksLikeToolMarkupLeak(raw) ||
         thinkLooksLikeChecklist(prose) ||
+        isFalseSuccessProse(prose) ||
         prose.length < minThinkChars ||
         isStockThink(prose)
       )
     }
 
-    if (thinkWeak(thinkRound.text)) {
+    if (!openPreviewOnly && thinkWeak(thinkRound.text)) {
       // Same bubble stays open — user should see ONE continuous DeepThink, not two folds.
       const retryIdx = messages.findIndex((m) => m.id === preludeId)
       if (retryIdx !== -1) {
@@ -2326,25 +2397,19 @@ export async function runAgentTurn(params: {
             p &&
             !isEllipsisOnly(p) &&
             !isStockThink(p) &&
+            !isFalseSuccessProse(p) &&
             !thinkBodyLooksLikeCodeDump(p) &&
             !/^думаю над запросом|^thinking about the request/i.test(p.trim())
         )
         .sort((a, b) => b.length - a.length)[0] ?? ''
-    const richFallback =
+    const thinkMissingNote =
       uiLang === 'ru'
-        ? 'Пользователь просит одностраничный лендинг: сначала разберу ограничения (без AI-градиентов, один index.html, Bootstrap 5), ' +
-          'аудиторию и структуру секций, затем соберу чистую вёрстку с спокойной палитрой и лёгким motion, ' +
-          'проверю семантику/a11y и только после записи открою файл в браузере.'
-        : 'The user wants a single-file landing: I will unpack constraints (no AI-gradients, one index.html, Bootstrap 5), ' +
-          'audience and section structure, then build clean layout with a calm palette and light motion, ' +
-          'check semantics/a11y, and only after saving open it in the browser.'
-    const finalProse =
-      streamedBest.length >= minThinkChars
-        ? streamedBest
-        : streamedBest.length >= richFallback.length
-          ? streamedBest
-          : richFallback
-    const uiThink = formatLiveThinkContent(`<think>\n${finalProse}\n</think>`)
+        ? '↻ Модель не выдала рассуждение — перехожу к плану и tools.'
+        : '↻ Model produced no reasoning — continuing to plan and tools.'
+    const finalProse = streamedBest
+    const uiThink = finalProse
+      ? formatLiveThinkContent(`<think>\n${finalProse}\n</think>`)
+      : thinkMissingNote
     const pIdx = messages.findIndex((m) => m.id === preludeId)
     if (pIdx !== -1) {
       messages[pIdx] = {
@@ -2355,13 +2420,17 @@ export async function runAgentTurn(params: {
       params.onUpdate([...messages])
     }
 
-    apiMessages.push({ role: 'assistant', content: uiThink })
+    if (finalProse) {
+      apiMessages.push({ role: 'assistant', content: uiThink })
+    }
+
+    {
     pushUserMessage(
       apiMessages,
-      'PLAN_ONLY (tools still DISABLED). Output ONLY <plan>…</plan> with 4–8 ATOMIC checklist lines ' +
-        '(one action each: Navbar, Hero, Features, FAQ, Footer, open in browser). ' +
-        'FORBIDDEN: "edit if necessary" / «отредактировать при необходимости», mega-steps, code, <think>, tools. ' +
-        'Stop after </plan>.'
+      'PLAN_ONLY (tools still DISABLED). Output ONLY <plan>…</plan> with 3–9 ATOMIC steps from the user request ' +
+        'and your prior <think> (what to create/change, in order). ' +
+        'FORBIDDEN: tool names (execute_terminal_command, write_file, Start-Process, read_file), CSS class names as steps, ' +
+        'syntax-check shells, «Закрыть», mega-steps, code, <think>. Stop after </plan>.'
     )
     apiMessages = normalizeApiMessages(apiMessages)
 
@@ -2393,8 +2462,8 @@ export async function runAgentTurn(params: {
             : planAccum
         const livePlan = parsePlanBlock(bounded)
         if (livePlan?.length && !planFrozen) {
-          todoSteps = livePlan
-          upsertTodoBubble(messages, todoSteps, { afterId: preludeId })
+          todoSteps = coercePlan(livePlan)
+          paintTodo(todoSteps, { afterId: preludeId })
           params.onUpdate([...messages])
         }
       },
@@ -2408,36 +2477,54 @@ export async function runAgentTurn(params: {
       parsePlanBlock(planAccum) ||
       parsePlanBlock(`${planAccum}\n</plan>`) ||
       parsePlanBlock(`<plan>\n${planAccum}\n</plan>`)
-    // Always show a plan card — never leave think-only with a leaked "[Plan]".
-    if (!planFromPrelude?.length) {
-      planFromPrelude = defaultLandingPlanSteps()
-    }
+    // Always show a product plan (sections from think/prompt) — never tool-name fluff.
+    planFromPrelude = coercePlan(planFromPrelude)
     if (planFromPrelude?.length) {
       todoSteps = planFromPrelude
       planFrozen = true
-      upsertTodoBubble(messages, todoSteps, { afterId: preludeId })
+      paintTodo(todoSteps, { afterId: preludeId })
       params.onUpdate([...messages])
     }
 
-    apiMessages.push({
-      role: 'assistant',
-      content: planFromPrelude?.length
-        ? `${uiThink}\n<plan>\n${planFromPrelude.map((s) => `- [ ] ${s.text}`).join('\n')}\n</plan>`
-        : uiThink
-    })
+    if (planFromPrelude?.length) {
+      apiMessages.push({
+        role: 'assistant',
+        content: `<plan>\n${planFromPrelude.map((s) => `- [ ] ${s.text}`).join('\n')}\n</plan>`
+      })
+    }
     pushUserMessage(
       apiMessages,
       'Think/plan already recorded. Do NOT output another <think> or <plan>. ' +
-        'FIRST tool call NOW: write_file relative_path=index.html overwrite=true with the FULL landing HTML. ' +
-        'Then continue remaining plan steps IN ORDER. ' +
-        'Do not Start-Process / open a browser / write a done summary until every non-browser plan step is done.'
+        'Call tools NOW to execute the plan IN ORDER. YOU decide: create missing files with write_file; ' +
+        'edit existing files with apply_diff / apply_patch (complete HTML: never full rewrite for small tweaks). ' +
+        'Do not Start-Process / browser / done-summary until non-browser plan steps are done — ' +
+        'EXCEPT when index.html is already a complete landing on disk and the user wants it opened: then Start-Process first. ' +
+        'If a tool edit fails, say so honestly — never claim "Сделано" / "done" when the change did not apply.'
     )
     apiMessages = normalizeApiMessages(apiMessages)
     thinkSatisfied = true
+    } // end !openPreviewOnly plan phase
+  } else if (skipCeremony && !isPlan) {
+    // Ultra-short confirm with prior work — go straight to tools (Cursor-style).
+    thinkSatisfied = true
+    pushUserMessage(
+      apiMessages,
+      'Short confirm: skip another <think>/<plan>. Call tools NOW. ' +
+        'YOU decide from disk: create missing files with write_file; edit existing with apply_diff/apply_patch. ' +
+        'Never rewrite a finished HTML landing for a small tweak. Be honest if an edit fails.'
+    )
+    apiMessages = normalizeApiMessages(apiMessages)
   }
 
   for (let round = 0; round < maxRounds; round++) {
     if (params.signal?.aborted) return finishStopped()
+    if (forceEndTurn) break
+    logAgentToolEvent('round start', {
+      round,
+      thinkSatisfied,
+      completedTools,
+      loopV2: params.loopVersion === 2
+    })
     clearPlanningRows(messages)
 
     // Compact ONLY when truly near ctx — never after every successful file write.
@@ -2473,8 +2560,13 @@ export async function runAgentTurn(params: {
       messages.push({
         id: streamId,
         role: 'assistant',
-        content:
-          uiLang === 'ru' ? '↻ Пишу по плану…' : '↻ Writing from the plan…',
+        content: skipCeremony
+          ? uiLang === 'ru'
+            ? '↻ Правлю…'
+            : '↻ Editing…'
+          : uiLang === 'ru'
+            ? '↻ Пишу по плану…'
+            : '↻ Writing from the plan…',
         streaming: true
       })
       params.onUpdate([...messages])
@@ -2501,15 +2593,35 @@ export async function runAgentTurn(params: {
       streamAc.abort(reason)
     }
 
-    const result = await params.queue.chatStream({
+    let lastStreamActivity = Date.now()
+    let sawStreamActivity = false
+    const STREAM_IDLE_MS = 75_000
+    const idleWatch = setInterval(() => {
+      if (streamAc.signal.aborted) return
+      if (!sawStreamActivity) return
+      if (Date.now() - lastStreamActivity >= STREAM_IDLE_MS) {
+        abortStream('stream_idle')
+      }
+    }, 5_000)
+
+    let result: Awaited<ReturnType<typeof params.queue.chatStream>>
+    try {
+      result = await params.queue.chatStream({
       messages: normalizeApiMessages(apiMessages),
       ...(isPlan ? {} : { tools: agentTools }),
+      // Small local models drift into prose after the think/plan completions.
+      // Until the first tool actually runs, make a function call mandatory.
+      ...(isPlan || completedTools > 0
+        ? {}
+        : { toolChoice: 'required' as const }),
       maxTokens: appSettings.limitResponseLength
         ? appSettings.maxTokens
         : AGENT_MAX_TOKENS,
       signal: streamAc.signal,
       onToken: (token) => {
         if (streamAc.signal.aborted) return
+        sawStreamActivity = true
+        lastStreamActivity = Date.now()
         clearPlanningRows(messages)
         ensureStreamBubble()
         const idx = messages.findIndex((m) => m.id === streamId)
@@ -2521,12 +2633,10 @@ export async function runAgentTurn(params: {
         if (messages[idx].toolName === 'write_file' && messages[idx].codePreview != null) {
           const nextCode = (messages[idx].codePreview ?? '') + token
           const path =
-            messages[idx].filePath ||
-            inferWritePathFromContent(nextCode) ||
-            'index.html'
+            messages[idx].filePath || inferWritePathFromContent(nextCode) || undefined
           messages[idx] = {
             ...messages[idx],
-            content: `✎ writing ${path}`,
+            content: path ? `✎ writing ${path}` : '✎ writing…',
             toolName: 'write_file',
             filePath: path,
             codePreview: nextCode,
@@ -2536,22 +2646,9 @@ export async function runAgentTurn(params: {
           return
         }
         const nextContent = base + token
-        // Prelude DeepThink is immutable — never absorb late <think> into it; strip & abort.
+        // Native-thinking models often emit another <think> before tool_calls.
+        // Never abort the HTTP stream for that — aborting drops the tools that follow.
         if (thinkThrough && thinkSatisfied && hasThinkBlock(nextContent)) {
-          const extra = liveThinkProse(nextContent)
-          if (extra.length >= 100 || nextContent.length >= 220) {
-            messages[idx] = {
-              ...messages[idx],
-              content:
-                uiLang === 'ru'
-                  ? '↻ Think уже был — перехожу к write_file…'
-                  : '↻ Think already done — switching to write_file…',
-              streaming: true
-            }
-            params.onUpdate([...messages])
-            abortStream('redundant_think')
-            return
-          }
           messages[idx] = {
             ...messages[idx],
             content:
@@ -2564,10 +2661,10 @@ export async function runAgentTurn(params: {
         // Model dumped HTML as plain text instead of write_file — show live code stream.
         if (!isPlan && looksLikeAssistantHtmlDump(nextContent)) {
           const code = extractAssistantHtmlDump(nextContent) || nextContent
-          const path = inferWritePathFromContent(code) || 'index.html'
+          const path = inferWritePathFromContent(code) || undefined
           messages[idx] = {
             ...messages[idx],
-            content: `✎ writing ${path}`,
+            content: path ? `✎ writing ${path}` : '✎ writing…',
             toolName: 'write_file',
             filePath: path,
             codePreview: code,
@@ -2587,7 +2684,7 @@ export async function runAgentTurn(params: {
           const livePlan = parsePlanBlock(nextContent)
           if (livePlan?.length) {
             todoSteps = livePlan
-            upsertTodoBubble(messages, todoSteps, { afterId: thinkBubbleId ?? undefined })
+            paintTodo(todoSteps, { afterId: thinkBubbleId ?? undefined })
           }
         }
         params.onUpdate([...messages])
@@ -2596,6 +2693,8 @@ export async function runAgentTurn(params: {
         ? undefined
         : (delta) => {
             if (streamAc.signal.aborted) return
+            sawStreamActivity = true
+            lastStreamActivity = Date.now()
             clearPlanningRows(messages)
             const prev = toolDraft.get(delta.index) ?? { name: '', arguments: '' }
             if (delta.name) prev.name += delta.name
@@ -2614,36 +2713,8 @@ export async function runAgentTurn(params: {
               abortStream('tool_args_too_large')
               return
             }
-            // Think ON: cut ASAP if tools start with no think (don't burn a full write_file).
-            // After one nudge (thinkGateHits>=1), allow tools through (fail-open).
-            const streamBubble = messages.find((m) => m.id === streamId)
-            const mayShowTools =
-              !thinkThrough ||
-              thinkSatisfied ||
-              thinkGateHits >= 1 ||
-              hasThinkBlock(streamBubble?.content)
-            if (!mayShowTools) {
-              ensureStreamBubble()
-              const idx = messages.findIndex((m) => m.id === streamId)
-              if (idx !== -1 && !hasThinkBlock(messages[idx]!.content)) {
-                const toolHint = (prev.name || 'tool').replace(/[<>]/g, '')
-                const tip =
-                  uiLang === 'ru'
-                    ? `↻ Tools без рассуждения (${toolHint}) — обрываю, прошу think и повтор…`
-                    : `↻ Tools without think (${toolHint}) — aborting early, asking for think…`
-                messages[idx] = {
-                  ...messages[idx]!,
-                  content: tip,
-                  streaming: true
-                }
-                params.onUpdate([...messages])
-              }
-              // Abort after a few chars of tool draft — never wait for 14KB HTML JSON.
-              if (prev.name.length >= 3 || prev.arguments.length >= 16) {
-                abortStream('think_required_early')
-              }
-              return
-            }
+            // Think already ran as a separate completion. Never abort tool
+            // deltas to "force think" — that discarded the only real work.
             if (!prev.name && !parsed.label.replace(/^[▸▹✎]+\s*/, '').trim()) return
 
             // Drop the temporary «Пишу по плану…» status bubble once real tools stream.
@@ -2709,77 +2780,28 @@ export async function runAgentTurn(params: {
           },
       priority: 'NORMAL'
     })
+    } finally {
+      clearInterval(idleWatch)
+    }
     params.signal?.removeEventListener('abort', onOuterAbort)
 
-    // Soft stream guards: size runaway OR early think cut (discard partial tools).
+    // Soft stream guards: size runaway or stall — keep any tool draft.
     const softAbort =
       streamAbortReason === 'tool_args_too_large' ||
-      streamAbortReason === 'think_required_early' ||
-      streamAbortReason === 'redundant_think'
+      streamAbortReason === 'stream_idle'
 
     if (softAbort) {
       result.aborted = false
       result.error = undefined
     }
 
-    if (streamAbortReason === 'redundant_think') {
-      for (const id of toolMsgByIndex.values()) {
-        const i = messages.findIndex((m) => m.id === id)
-        if (i !== -1) messages.splice(i, 1)
-      }
-      toolDraft.clear()
-      toolMsgByIndex.clear()
-      result.toolCalls = undefined
-      const si = messages.findIndex((m) => m.id === streamId)
-      if (si !== -1) {
-        messages[si] = {
-          ...messages[si]!,
-          streaming: false,
-          content:
-            uiLang === 'ru'
-              ? '↻ Think уже был — сразу write_file…'
-              : '↻ Think already done — write_file next…'
-        }
-      }
-      params.onUpdate([...messages])
-      pushUserMessage(
-        apiMessages,
-        'STOP: do NOT output <think> again — think/plan are already done. ' +
-          'Your FIRST action must be a structured write_file tool call: ' +
-          'relative_path=index.html, overwrite=true, content=<full HTML landing>. No markdown fences.'
-      )
-      apiMessages = normalizeApiMessages(apiMessages)
-      continue
-    }
-
-    if (streamAbortReason === 'think_required_early') {
-      thinkGateHits++
-      for (const id of toolMsgByIndex.values()) {
-        const i = messages.findIndex((m) => m.id === id)
-        if (i !== -1) messages.splice(i, 1)
-      }
-      toolDraft.clear()
-      toolMsgByIndex.clear()
-      result.toolCalls = undefined
-      const gateUi =
-        uiLang === 'ru'
-          ? '↻ Сначала рассуждение (think), потом tools — перезапускаю (без повторной генерации всего файла)…'
-          : '↻ Need think before tools — retrying (cut early, not after a full write)…'
-      const si = messages.findIndex((m) => m.id === streamId)
-      if (si !== -1) {
-        messages[si] = { ...messages[si]!, streaming: false, content: gateUi }
-      } else {
-        messages.push({ id: uid(), role: 'assistant', content: gateUi })
-      }
-      params.onUpdate([...messages])
-      pushUserMessage(
-        apiMessages,
-        'THINK_REQUIRED: You started tool calls with no <think>…</think> text first. ' +
-          'Reply again starting with a short <think> (goal + next action), optional <plan> if 2+ steps, THEN the same tools. ' +
-          'Do not emit tool calls as the first tokens.'
-      )
-      apiMessages = normalizeApiMessages(apiMessages)
-      continue
+    if (streamAbortReason) {
+      logAgentToolEvent('stream abort', {
+        round,
+        reason: streamAbortReason,
+        draft: toolDraft.size,
+        toolCalls: result.toolCalls?.length ?? 0
+      })
     }
 
     // Never treat internal llama/queue aborts as the user hitting Stop.
@@ -2912,7 +2934,7 @@ export async function runAgentTurn(params: {
       const errText = result.error ?? 'aborted'
       // Internal stream guards must never surface as fatal chat errors
       if (
-        /write_file_missing_path|tool_args_too_large|tool_markup_in_content/i.test(
+        /write_file_missing_path|tool_args_too_large|tool_markup_in_content|stream_idle/i.test(
           errText
         )
       ) {
@@ -3033,7 +3055,7 @@ export async function runAgentTurn(params: {
         : isOverflow
           ? 'Context was compacted to fit. Answer from the compressed document/notes still in this prompt. Do not dump a table of contents. Never read .png/.jpg/.webp as text.'
           : `Previous model response failed: ${errText.slice(0, 240)}\n` +
-            'Continue the unfinished task. Small HTML/CSS → write_file overwrite=true with the full file. Large files → apply_patch / apply_diff or append=true. Keep relative_path set.'
+            'Continue the unfinished task. Existing HTML → apply_diff (search_block or instruction). New files → write_file. Keep relative_path set.'
       if (last?.role === 'tool') {
         appendToolHint(apiMessages, repairHint)
       } else {
@@ -3084,6 +3106,17 @@ export async function runAgentTurn(params: {
     }
 
     const toolCalls = result.toolCalls
+    logAgentToolEvent('round result', {
+      round,
+      toolCalls: toolCalls?.length ?? 0,
+      draft: toolDraft.size,
+      finishReason: String(result.finishReason ?? ''),
+      aborted: Boolean(result.aborted),
+      abortReason: streamAbortReason ?? '',
+      error: String(result.error ?? '').slice(0, 120),
+      textLen: (result.text ?? '').length,
+      textHead: (result.text ?? '').slice(0, 120).replace(/\n/g, ' ')
+    })
     if (
       !toolCalls?.length &&
       looksLikeToolMarkupLeak(result.text ?? '') &&
@@ -3142,70 +3175,14 @@ export async function runAgentTurn(params: {
     }
 
     if (toolCalls?.length) {
-      // Think gate backup: if a full tool reply still has no think…
-      // - first miss: reject once (prefer early-abort path above)
-      // - after one nudge: FAIL OPEN — never discard a finished write_file again
-      if (thinkThrough && !thinkSatisfied && !hasThinkBlock(result.text)) {
-        if (thinkGateHits < 1) {
-          thinkGateHits++
-          for (const id of toolMsgByIndex.values()) {
-            const i = messages.findIndex((m) => m.id === id)
-            if (i !== -1) messages.splice(i, 1)
-          }
-          const gateUi =
-            uiLang === 'ru'
-              ? '↻ Сначала рассуждение (think), потом tools — перезапускаю…'
-              : '↻ Need a think block before tools — retrying…'
-          const si = messages.findIndex((m) => m.id === streamId)
-          if (si !== -1) {
-            messages[si] = {
-              ...messages[si]!,
-              streaming: false,
-              content: gateUi
-            }
-          } else {
-            messages.push({
-              id: uid(),
-              role: 'assistant',
-              content: gateUi
-            })
-          }
-          params.onUpdate([...messages])
-          pushUserMessage(
-            apiMessages,
-            'THINK_REQUIRED: Your previous reply called tools without a <think>…</think> block. ' +
-              'Reply again: (1) <think>…</think> with goal + whether a multi-step <plan> is needed, ' +
-              '(2) optional <plan>- [ ] steps -</plan> if 2+ work items, (3) then the same tool calls. ' +
-              'Do not skip <think>.'
-          )
-          apiMessages = normalizeApiMessages(apiMessages)
-          continue
-        }
-        thinkSatisfied = true
-        const skipNote =
-          uiLang === 'ru'
-            ? '💭 Модель снова без think — не жгу GPU по кругу, выполняю tools.'
-            : '💭 Model skipped think again — running tools (no GPU retry loop).'
-        const si = messages.findIndex((m) => m.id === streamId)
-        if (si !== -1) {
-          const prev = (messages[si]!.content ?? '').trim()
-          messages[si] = {
-            ...messages[si]!,
-            streaming: false,
-            content: prev && !/^↻ |^💭 /.test(prev) ? `${skipNote}\n\n${prev}` : skipNote
-          }
-        } else {
-          messages.push({ id: uid(), role: 'assistant', content: skipNote })
-        }
-        params.onUpdate([...messages])
-      }
-      if (thinkThrough && hasThinkBlock(result.text)) thinkSatisfied = true
+      // Think already ran as a separate completion. Never discard real tool calls.
+      thinkSatisfied = true
 
       const parsedPlan = parsePlanBlock(result.text)
       if (parsedPlan?.length && !planFrozen) {
-        todoSteps = parsedPlan
+        todoSteps = coercePlan(parsedPlan)
         planFrozen = true
-        upsertTodoBubble(messages, todoSteps, { afterId: thinkBubbleId ?? undefined })
+        paintTodo(todoSteps, { afterId: thinkBubbleId ?? undefined })
         params.onUpdate([...messages])
       }
 
@@ -3214,6 +3191,23 @@ export async function runAgentTurn(params: {
         content: result.text?.trim() ? result.text : null,
         tool_calls: toolCalls
       })
+
+      // Clear sticky «Правлю…» / placeholder stream bubble once real tools start.
+      {
+        const siClear = messages.findIndex((m) => m.id === streamId)
+        if (siClear !== -1) {
+          const prev = messages[siClear]!
+          const placeholder =
+            prev.streaming === true &&
+            (/^↻\s*(Правлю|Editing|Пишу)/i.test((prev.content ?? '').trim()) ||
+              !(result.text ?? '').trim())
+          if (placeholder && !(result.text ?? '').trim()) {
+            messages.splice(siClear, 1)
+          } else if (prev.streaming) {
+            messages[siClear] = { ...prev, streaming: false }
+          }
+        }
+      }
 
       for (const [index, call] of toolCalls.entries()) {
         const name = call.function.name as AgentToolName
@@ -3224,6 +3218,20 @@ export async function runAgentTurn(params: {
             ? resolveWriteFilePath(args)
             : coerceToolRelativePath(args)
         if (resolvedPath) args.relative_path = resolvedPath
+
+        // Unlock full rewrite only for explicit rewrite asks, or non-HTML after patch-fail limit.
+        // Finished HTML landings must never auto-escalate to whole-file overwrite.
+        if (name === 'write_file' && resolvedPath) {
+          const pk = loopPathKey(resolvedPath)
+          const fails = pk ? (patchFailsByPath.get(pk) ?? 0) : 0
+          const isHtml = /\.html?$/i.test(resolvedPath)
+          if (
+            looksLikeExplicitRewrite(params.userText) ||
+            (!isHtml && fails >= MAX_PATCH_FAILS_BEFORE_OVERWRITE)
+          ) {
+            args.allow_full_rewrite = true
+          }
+        }
 
         const codePreview =
           typeof args.content === 'string'
@@ -3251,7 +3259,12 @@ export async function runAgentTurn(params: {
           messages.push({
             id: statusId,
             role: 'assistant',
-            content: formatActivityLabel(runningActivity),
+            content:
+              name === 'apply_patch' || name === 'apply_diff'
+                ? uiLang === 'ru'
+                  ? '✎ Применяю правку…'
+                  : '✎ Applying edit…'
+                : formatActivityLabel(runningActivity),
             toolName: name,
             streaming: true,
             filePath,
@@ -3263,7 +3276,12 @@ export async function runAgentTurn(params: {
           if (tIdx !== -1) {
             messages[tIdx] = {
               ...messages[tIdx],
-              content: formatActivityLabel(runningActivity),
+              content:
+                name === 'apply_patch' || name === 'apply_diff'
+                  ? uiLang === 'ru'
+                    ? '✎ Применяю правку…'
+                    : '✎ Applying edit…'
+                  : formatActivityLabel(runningActivity),
               toolName: name,
               streaming: true,
               filePath: filePath ?? messages[tIdx].filePath,
@@ -3291,6 +3309,7 @@ export async function runAgentTurn(params: {
 
         let exploreFileCount: number | undefined
         let toolResult: AgentToolResult
+        let syntheticResult = true
 
         const fp = fingerprintToolCall(name, args)
         const identicalCount = (identicalToolCounts.get(fp) ?? 0) + 1
@@ -3302,6 +3321,7 @@ export async function runAgentTurn(params: {
             pathKeyForLoop,
             (readCountsByPath.get(pathKeyForLoop) ?? 0) + 1
           )
+          readFileCalls++
         }
         const identicalLimit =
           name === 'generate_image'
@@ -3330,24 +3350,32 @@ export async function runAgentTurn(params: {
         } else if (
           name === 'read_file' &&
           pathKeyForLoop &&
-          readsOnPath > MAX_READS_PER_PATH
+          (readsOnPath > MAX_READS_PER_PATH || readFileCalls > MAX_READS_TURN_BUDGET)
         ) {
-          toolLoopHits++
+          const cached = readFileCache.get(pathKeyForLoop)
           toolResult = {
             id: call.id,
             name,
-            ok: false,
-            content: '',
-            error:
-              `TOOL_LOOP: read_file on "${filePath}" already ${MAX_READS_PER_PATH} times this turn. ` +
-              'Do NOT re-read and do NOT rewrite the file. The file on disk is the source of truth — ' +
-              'write a short user-facing summary and finish. Overwrite only if the user asked to fix specific content.'
+            ok: true,
+            content:
+              (cached ?? '') +
+              `\n[cached read_file: "${filePath}" already read this turn — do not re-read]`
           }
         } else if (
           name === 'execute_terminal_command' &&
           looksLikeOpenHtmlCommand(String(args.command ?? ''))
         ) {
-          if (htmlPreviewOpened) {
+          const cmd = String(args.command ?? '')
+          if (isAfkllmInternalHtmlPath(cmd) || /browser\.html/i.test(cmd)) {
+            toolResult = {
+              id: call.id,
+              name,
+              ok: false,
+              content: '',
+              error:
+                'REFUSED: that path is an AFKLLM internal file, not the workspace landing. Open the project index.html instead.'
+            }
+          } else if (htmlPreviewOpened) {
             toolLoopHits++
             toolResult = {
               id: call.id,
@@ -3357,56 +3385,13 @@ export async function runAgentTurn(params: {
               error:
                 'TOOL_LOOP: HTML preview already opened this turn. Do NOT Start-Process again — write a short user summary and finish.'
             }
-          } else if (todoSteps.length > 0) {
-            // Close verify/summary fluff so it cannot block the browser forever.
-            let metaClosed = 0
-            for (const s of todoSteps) {
-              if (s.status === 'done') continue
-              if (isMetaOrSummaryPlanStep(s.text)) {
-                s.status = 'done'
-                metaClosed++
-              }
-            }
-            if (metaClosed > 0) {
-              todoSteps = rebalanceTodoStatuses(todoSteps.map((s) => ({ ...s })))
-              upsertTodoBubble(messages, todoSteps, {
-                afterId: thinkBubbleId ?? undefined
-              })
-            }
-            // Last chance: if we already have a complete HTML write, close mega/work steps now.
-            if (lastHtmlWrite && contentLooksStructurallyComplete(lastHtmlWrite)) {
-              todoSteps = reconcileTodosWithContent(todoSteps, lastHtmlWrite)
-              upsertTodoBubble(messages, todoSteps, {
-                afterId: thinkBubbleId ?? undefined
-              })
-            }
-            const workLeft = pendingPlanWork(todoSteps)
-            if (workLeft.length > 0) {
-              const left = workLeft.map((s) => `- ${s.text}`).join('\n')
-              toolResult = {
-                id: call.id,
-                name,
-                ok: false,
-                content: '',
-                error:
-                  'PLAN_ORDER: do not open/start the page yet. Finish remaining plan steps IN ORDER first:\n' +
-                  left +
-                  '\nThen open index.html (Start-Process (Resolve-Path .\\index.html)) and write the summary.'
-              }
-            } else {
-              toolResult = await window.api.agent.invoke({
-                id: call.id,
-                name,
-                arguments: args
-              })
-              if (toolResult.ok) htmlPreviewOpened = true
-            }
           } else {
             toolResult = await window.api.agent.invoke({
               id: call.id,
               name,
               arguments: args
             })
+            syntheticResult = false
             if (toolResult.ok) htmlPreviewOpened = true
           }
         } else if (identicalCount > identicalLimit) {
@@ -3426,6 +3411,42 @@ export async function runAgentTurn(params: {
         } else if (
           (name === 'apply_patch' || name === 'apply_diff') &&
           pathKeyForLoop &&
+          (patchFailsByPath.get(pathKeyForLoop) ?? 0) >= MAX_PATCH_FAILS_BEFORE_OVERWRITE
+        ) {
+          toolLoopHits++
+          const isHtml = /\.html?$/i.test(filePath || pathKeyForLoop)
+          toolResult = {
+            id: call.id,
+            name,
+            ok: false,
+            content: '',
+            error: isHtml
+              ? `PATCH_FAIL_LIMIT: apply_patch/apply_diff already failed ${MAX_PATCH_FAILS_BEFORE_OVERWRITE}+ times on "${filePath}". ` +
+                'STOP calling apply_diff/apply_patch on this path. Write an honest short failure summary for the user (what you tried). Do NOT rewrite the whole HTML file.'
+              : `PATCH_FAIL_LIMIT: apply_patch/apply_diff already failed ${MAX_PATCH_FAILS_BEFORE_OVERWRITE}+ times on "${filePath}". ` +
+                'STOP retrying. One write_file overwrite=true with allow_full_rewrite=true if appropriate, or honest failure summary.'
+          }
+        } else if (
+          name === 'apply_diff' &&
+          !String(args.search_block ?? '').trim() &&
+          /replace\s+entire|entire\s+html|whole\s+(html|file|landing)|complete\s+single[- ]?page\s+landing|replace\s+.*\s+with\s+a\s+complete|полный\s+(html|файл|лендинг)|перепис\w*\s+(весь|целиком)/i.test(
+            String(args.instruction ?? '')
+          )
+        ) {
+          toolLoopHits++
+          toolResult = {
+            id: call.id,
+            name,
+            ok: false,
+            content: '',
+            error:
+              'SURGICAL_EDIT: instruction asks to replace the entire HTML. Forbidden. ' +
+              'If the landing is already done: open preview and summarize. ' +
+              'Otherwise one SHORT apply_diff (search_block or a one-line instruction). Never full rewrite via instruction.'
+          }
+        } else if (
+          (name === 'apply_patch' || name === 'apply_diff') &&
+          pathKeyForLoop &&
           (patchOkByPath.get(pathKeyForLoop) ?? 0) >= MAX_PATCH_OK_PER_PATH
         ) {
           toolLoopHits++
@@ -3436,7 +3457,7 @@ export async function runAgentTurn(params: {
             content: '',
             error:
               `PATCH_OK_LIMIT: already applied ${MAX_PATCH_OK_PER_PATH} successful patches to "${filePath}". ` +
-              'Stop patching. If still wrong, one write_file overwrite=true with the full file, then finish (no more read/patch loops).'
+              'Stop patching. Open preview if needed and write a short summary — no more read/patch loops. Do NOT rewrite the whole HTML landing.'
           }
         } else if (name === 'explore_subagent') {
           const explore = await runExploreSubagent({
@@ -3471,6 +3492,7 @@ export async function runAgentTurn(params: {
             content: explore.content,
             error: explore.error
           }
+          syntheticResult = false
         } else {
         const cutByLength = result.finishReason === 'length'
         const contentStr =
@@ -3547,6 +3569,7 @@ export async function runAgentTurn(params: {
               name,
               arguments: { ...args, content: cleaned }
             })
+            syntheticResult = false
             if (toolResult.ok) {
               toolResult = {
                 ...toolResult,
@@ -3564,25 +3587,6 @@ export async function runAgentTurn(params: {
                 'Call write_file again with ONLY the source file body and relative_path.'
             }
           }
-        } else if (
-          name === 'write_file' &&
-          args.overwrite === true &&
-          !args.append &&
-          looksLikeCorrection(params.userText) &&
-          !looksLikeExplicitRewrite(params.userText) &&
-          !allowsLandingOverwrite(pathStr, contentStr.length) &&
-          (patchFailsByPath.get(pathKey) ?? 0) < MAX_PATCH_FAILS_BEFORE_OVERWRITE &&
-          (patchOkByPath.get(pathKey) ?? 0) < MAX_PATCH_OK_PER_PATH
-        ) {
-          toolResult = {
-            id: call.id,
-            name,
-            ok: false,
-            content: '',
-            error:
-              'OVERWRITE_BLOCKED: this turn is a correction on a large file. Call read_file, then apply_patch (or apply_diff). ' +
-              'For small files (<6KB) overwrite=true is allowed; after two failed patches on this path, overwrite is also allowed.'
-          }
         } else if (name === 'write_file' && codeIncomplete && pathStr && contentStr) {
           const appendN = (incompleteAppendsByPath.get(pathKey) ?? 0) + 1
           incompleteAppendsByPath.set(pathKey, appendN)
@@ -3596,10 +3600,13 @@ export async function runAgentTurn(params: {
               append: Boolean(args.append) && !landing
             }
           })
+          syntheticResult = false
           let saved = partial
           if (
             !partial.ok &&
-            /FILE_EXISTS/i.test(partial.error ?? partial.content ?? '')
+            /FILE_EXISTS/i.test(partial.error ?? partial.content ?? '') &&
+            !completeHtmlByPath.has(pathKey) &&
+            !contentLooksStructurallyComplete(lastHtmlWrite)
           ) {
             saved = await window.api.agent.invoke({
               id: call.id,
@@ -3649,6 +3656,7 @@ export async function runAgentTurn(params: {
             name,
             arguments: args
           })
+          syntheticResult = false
           // Same-turn rewrite of a file we already started → append / landing overwrite
           if (
             name === 'write_file' &&
@@ -3696,16 +3704,60 @@ export async function runAgentTurn(params: {
                 }
               }
             } else if (landingRewrite || pathInFlight) {
-              // Full landing HTML rewrite without overwrite=true — auto-fix instead of "Правил ошибка".
-              const overwritten = await window.api.agent.invoke({
-                id: call.id,
-                name,
-                arguments: { ...args, overwrite: true, append: false }
-              })
-              if (overwritten.ok) {
+              // Already have a complete landing on disk — do not auto-clobber with a
+              // full rewrite (theme toggle / small tweaks) or incomplete content.
+              const priorComplete =
+                Boolean(lastHtmlWrite) &&
+                contentLooksStructurallyComplete(lastHtmlWrite!) &&
+                lastHtmlWrite!.length >= 1500
+              const incomingComplete = contentLooksStructurallyComplete(contentStr)
+              const incomingIncomplete =
+                !incomingComplete ||
+                contentStr.length < (lastHtmlWrite?.length ?? 0) * 0.85
+              const patchFails = pathKey
+                ? (patchFailsByPath.get(pathKey) ?? 0)
+                : 0
+              const allowFull =
+                looksLikeExplicitRewrite(params.userText) ||
+                (patchFails >= MAX_PATCH_FAILS_BEFORE_OVERWRITE &&
+                  !/\.html?$/i.test(pathStr))
+              if ((priorComplete || incomingComplete) && !allowFull) {
                 toolResult = {
-                  ...overwritten,
-                  content: `${overwritten.content} (auto-overwrite after FILE_EXISTS)`
+                  id: call.id,
+                  name,
+                  ok: false,
+                  content: '',
+                  error:
+                    'FILE_COMPLETE: index.html already ends with </html>. Do NOT rewrite the whole landing. ' +
+                    'Use apply_diff / apply_patch for the requested change only.'
+                }
+              } else if (priorComplete && incomingIncomplete && !allowFull) {
+                toolResult = {
+                  id: call.id,
+                  name,
+                  ok: false,
+                  content: '',
+                  error:
+                    'FILE_COMPLETE: index.html already ends with </html>. Do NOT rewrite the whole landing. ' +
+                    'Finish remaining plan steps with apply_diff / apply_patch, or open the page and write the summary.'
+                }
+              } else {
+                // Allowed full rewrite (explicit request or patch-fail limit).
+                const overwritten = await window.api.agent.invoke({
+                  id: call.id,
+                  name,
+                  arguments: {
+                    ...args,
+                    overwrite: true,
+                    append: false,
+                    allow_full_rewrite: true
+                  }
+                })
+                if (overwritten.ok) {
+                  toolResult = {
+                    ...overwritten,
+                    content: `${overwritten.content} (auto-overwrite after FILE_EXISTS)`
+                  }
                 }
               }
             }
@@ -3755,13 +3807,31 @@ export async function runAgentTurn(params: {
           )
             .replace(/\\/g, '/')
             .trim()
-          if (failPath) {
+          if (!failPath) {
+            // Parse/format failure (e.g. "*** Begin Patch ***" envelope, no path).
+            patchParseFails++
+            const hint =
+              patchParseFails >= MAX_PATCH_FAILS_BEFORE_OVERWRITE
+                ? 'PATCH_FAIL_LIMIT: apply_patch keeps failing to parse. STOP using apply_patch. ' +
+                  'Use apply_diff with relative_path + search_block/instruction (apply model helps). Do NOT full-rewrite HTML. ' +
+                  'Do NOT wrap the body in "*** Begin Patch ***".'
+                : 'apply_patch parse error. Prefer apply_diff (relative_path + search_block or instruction); do not re-send the same malformed patch.'
+            toolResult = {
+              ...toolResult,
+              content: `${toolResult.content || ''}\n${hint}`.trim(),
+              error: toolResult.error ? `${toolResult.error}\n${hint}` : hint
+            }
+          } else {
             const n = (patchFailsByPath.get(loopPathKey(failPath)) ?? 0) + 1
             patchFailsByPath.set(loopPathKey(failPath), n)
             if (n >= MAX_PATCH_FAILS_BEFORE_OVERWRITE) {
-              const hint =
-                `PATCH_FAIL_LIMIT: apply_patch/apply_diff failed ${n} times on "${failPath}". ` +
-                `NOW use write_file with overwrite=true and the full corrected file content. Do not retry the same hunk.`
+              const isHtml = /\.html?$/i.test(failPath)
+              const hint = isHtml
+                ? `PATCH_FAIL_LIMIT: apply_patch/apply_diff failed ${n} times on "${failPath}". ` +
+                  `STOP rewriting. Try ONE different apply_diff with a shorter unique search_block from the file on disk, ` +
+                  `or write an honest failure summary. Do NOT write_file the whole HTML landing.`
+                : `PATCH_FAIL_LIMIT: apply_patch/apply_diff failed ${n} times on "${failPath}". ` +
+                  `NOW use write_file with overwrite=true, allow_full_rewrite=true, and the full corrected file content. Do not retry the same hunk.`
               toolResult = {
                 ...toolResult,
                 content: `${toolResult.content || ''}\n${hint}`.trim(),
@@ -3790,36 +3860,128 @@ export async function runAgentTurn(params: {
         }
 
         applyToolToChecklist(checklist, name, args, toolResult)
+        if (
+          toolResult.ok &&
+          (name === 'write_file' || name === 'apply_diff' || name === 'apply_patch')
+        ) {
+          mutatingEditOk = true
+          mutatingEditFailed = false
+        } else if (
+          !toolResult.ok &&
+          (name === 'write_file' || name === 'apply_diff' || name === 'apply_patch')
+        ) {
+          mutatingEditFailed = true
+          const failPath =
+            (
+              toolResult.editReview?.path ||
+              (typeof args.relative_path === 'string' ? args.relative_path : '') ||
+              filePath ||
+              ''
+            )
+              .replace(/\\/g, '/')
+              .trim() || '(no path)'
+          const errBrief = String(toolResult.error || toolResult.content || 'edit failed')
+            .replace(/\s+/g, ' ')
+            .slice(0, 160)
+          lastMutatingFailDetail = `${failPath}: ${errBrief}`
+        }
         if (toolResult.ok && name === 'write_file' && typeof args.content === 'string') {
           const body = args.content
-          if (body.length > (lastHtmlWrite.length || 0) && /<html[\s>]|<!DOCTYPE/i.test(body)) {
-            lastHtmlWrite = body
+          if (/<html[\s>]|<!DOCTYPE/i.test(body) || contentLooksStructurallyComplete(body)) {
+            lastHtmlWrite = args.append ? `${lastHtmlWrite}${body}` : body
+            const wp =
+              filePath ||
+              (typeof args.relative_path === 'string' ? args.relative_path : '')
+            if (wp) lastHtmlWritePath = wp
+          }
+          if (
+            contentLooksStructurallyComplete(lastHtmlWrite)
+          ) {
+            const writtenKey = loopPathKey(
+              filePath ||
+                (typeof args.relative_path === 'string' ? args.relative_path : '')
+            )
+            if (writtenKey) completeHtmlByPath.add(writtenKey)
           }
         }
-        if (todoSteps.length > 0) {
-          todoSteps = advanceTodosOnTool(todoSteps, name, toolResult.ok, {
-            content:
-              typeof args.content === 'string'
-                ? args.content
-                : typeof args.replace_block === 'string'
-                  ? args.replace_block
-                  : typeof args.patch === 'string'
-                    ? args.patch
-                    : undefined,
-            command: typeof args.command === 'string' ? args.command : undefined,
-            path: filePath
-          })
-          if (lastHtmlWrite && (name === 'write_file' || name === 'apply_patch' || name === 'apply_diff')) {
-            todoSteps = reconcileTodosWithContent(todoSteps, lastHtmlWrite)
+        // Surgical HTML edits never pass full file as args.content — refresh from disk
+        // so later evidence can match the file the model actually patched.
+        if (
+          toolResult.ok &&
+          (name === 'apply_diff' || name === 'apply_patch') &&
+          /\.html?$/i.test(filePath || String(args.relative_path ?? ''))
+        ) {
+          const htmlPath =
+            filePath ||
+            (typeof args.relative_path === 'string' ? args.relative_path : '') ||
+            lastHtmlWritePath ||
+            'index.html'
+          try {
+            const disk = await window.api.workspace.readFile(htmlPath)
+            if (
+              disk.ok &&
+              typeof disk.content === 'string' &&
+              (/<html[\s>]|<!DOCTYPE/i.test(disk.content) ||
+                contentLooksStructurallyComplete(disk.content))
+            ) {
+              lastHtmlWrite = disk.content
+              lastHtmlWritePath = htmlPath
+              if (contentLooksStructurallyComplete(lastHtmlWrite)) {
+                const k = loopPathKey(htmlPath)
+                if (k) completeHtmlByPath.add(k)
+              }
+            }
+          } catch {
+            /* ignore — plan may still close via soft-step rules */
           }
-          upsertTodoBubble(messages, todoSteps, { afterId: thinkBubbleId ?? undefined })
+        }
+        if (
+          toolResult.ok &&
+          name === 'read_file' &&
+          pathKeyForLoop &&
+          !syntheticResult &&
+          typeof toolResult.content === 'string'
+        ) {
+          readFileCache.set(pathKeyForLoop, toolResult.content)
+        }
+        if (
+          toolResult.ok &&
+          name === 'read_file' &&
+          typeof toolResult.content === 'string' &&
+          !/^\[read_file (?:meta|range)\]/i.test(toolResult.content.trim()) &&
+          (/\.html?$/i.test(filePath || '') ||
+            /<html[\s>]|<!DOCTYPE/i.test(toolResult.content)) &&
+          contentLooksStructurallyComplete(toolResult.content)
+        ) {
+          lastHtmlWrite = toolResult.content
+          if (filePath) lastHtmlWritePath = filePath
+        }
+        if (!syntheticResult) {
+          const advanced = advanceTodosOnEvidence(todoSteps, evidenceLog, {
+            name,
+            ok: toolResult.ok,
+            path: filePath,
+            command: typeof args.command === 'string' ? args.command : undefined,
+            content: toolResult.content
+          })
+          todoSteps = advanced.steps
+          evidenceLog.splice(0, evidenceLog.length, ...advanced.evidence)
+          if (todoSteps.length > 0) {
+            paintTodo(todoSteps, { afterId: thinkBubbleId ?? undefined })
+          }
         }
         if (
           !toolResult.ok ||
-          /TOOL_LOOP|INCOMPLETE_WRITE_LIMIT|FILE_EXISTS|PATCH_OK_LIMIT|PATCH_FAIL_LIMIT|THINK_REQUIRED/i.test(
+          /TOOL_LOOP|INCOMPLETE_WRITE_LIMIT|FILE_EXISTS|FILE_COMPLETE|PATCH_OK_LIMIT|PATCH_FAIL_LIMIT|SMART_APPLY_FAIL|APPLY_UNAVAILABLE|THINK_REQUIRED|SURGICAL_EDIT/i.test(
             toolResult.error ?? toolResult.content ?? ''
           )
         ) {
+          if (/FILE_COMPLETE/i.test(toolResult.error ?? toolResult.content ?? '')) {
+            fileCompleteHits++
+          }
+          if (/SMART_APPLY_FAIL|APPLY_UNAVAILABLE/i.test(toolResult.error ?? toolResult.content ?? '')) {
+            smartApplyFailHits++
+          }
           logAgentToolEvent(
             `${name}: ${toolResult.error || toolResult.content || (toolResult.ok ? 'ok' : 'fail')}`.slice(
               0,
@@ -3951,9 +4113,24 @@ export async function runAgentTurn(params: {
             incomplete &&
             toolResult.ok &&
             !/INCOMPLETE_WRITE_LIMIT/i.test(content)
+          const softRedirect =
+            !toolResult.ok &&
+            /FILE_COMPLETE|FILE_EXISTS|OVERWRITE_BLOCKED|INLINE_ASSET|SURGICAL_EDIT/i.test(
+              toolResult.error ?? toolResult.content ?? content
+            )
           const reviewPath =
             toolResult.editReview?.path ??
             (filePath ? filePath.replace(/\\/g, '/') : undefined)
+          // Retarget styles.css → index.html: show the real path in the activity chip.
+          const displayPath =
+            reviewPath ||
+            (typeof args.relative_path === 'string' ? args.relative_path : undefined)
+          const activityArgs =
+            displayPath &&
+            typeof args.relative_path === 'string' &&
+            args.relative_path.replace(/\\/g, '/') !== displayPath
+              ? { ...args, relative_path: displayPath }
+              : args
           // Auto-approve: apply edits immediately (no Accept/Reject in thread)
           if (
             autoApprove &&
@@ -3980,19 +4157,25 @@ export async function runAgentTurn(params: {
             Boolean(reviewPath) &&
             toolResult.ok &&
             toolResult.editReview?.status === 'pending'
-          const doneActivity = activityForTool(name, args, {
+          const doneActivity = activityForTool(name, activityArgs, {
             streaming: false,
             ok: toolResult.ok,
-            partial: incompleteSaved,
+            partial: incompleteSaved || softRedirect,
             resultContent: content,
             fileCount: exploreFileCount
           })
           const errNote =
-            !toolResult.ok && (toolResult.error || toolResult.content)
+            !toolResult.ok &&
+            !softRedirect &&
+            (toolResult.error || toolResult.content)
               ? ` — ${(toolResult.error || toolResult.content)
                   .replace(/\s+/g, ' ')
                   .slice(0, name === 'generate_image' ? 400 : 140)}`
-              : ''
+              : softRedirect
+                ? uiLang === 'ru'
+                  ? ' — нужен apply_diff, не полная перепись'
+                  : ' — use apply_diff, not a full rewrite'
+                : ''
           messages[idx] = {
             ...messages[idx],
             content: formatActivityLabel(doneActivity) + errNote,
@@ -4007,6 +4190,7 @@ export async function runAgentTurn(params: {
                 : undefined,
             filePath:
               toolResult.filePath ||
+              displayPath ||
               filePath ||
               messages[idx].filePath,
             editReview: showReview
@@ -4124,26 +4308,55 @@ export async function runAgentTurn(params: {
             apiMessages,
             'INCOMPLETE_WRITE: next call MUST be write_file with append=true on the SAME path only. Do not start another file.'
           )
+        } else if (/FILE_COMPLETE/i.test(tc)) {
+          appendToolHint(
+            apiMessages,
+            'FILE_COMPLETE: the landing is already on disk. Do NOT write_file / overwrite / rewrite it. ' +
+              'Use apply_diff (replace_all=true for a global rename). Then open preview or summarize.'
+          )
+        } else if (/SMART_APPLY_FAIL|APPLY_UNAVAILABLE/i.test(tc)) {
+          appendToolHint(
+            apiMessages,
+            'SMART_APPLY_FAIL / APPLY_UNAVAILABLE: do not rewrite the file. ' +
+              'Call apply_diff with an exact search_block (replace_all=true for a global rename).'
+          )
         } else if (/FILE_EXISTS/i.test(tc)) {
           appendToolHint(
             apiMessages,
-            'FILE_EXISTS: for index.html / landing HTML/CSS under ~40KB call write_file with overwrite=true and the FULL file. ' +
-              'Do not apply_diff with a guessed search_block. Large non-HTML files → apply_patch / append=true.'
+            /index\.html|<\/html>|landing/i.test(tc) ||
+              (lastHtmlWrite && contentLooksStructurallyComplete(lastHtmlWrite))
+              ? 'FILE_EXISTS on complete HTML: do NOT overwrite. Use apply_diff (replace_all=true for a global rename).'
+              : 'FILE_EXISTS: for small non-HTML files you may write_file overwrite=true with the FULL file. ' +
+                  'For large files use apply_patch/apply_diff.'
+          )
+        } else if (/INLINE_ASSET/i.test(tc)) {
+          appendToolHint(
+            apiMessages,
+            'Decide from disk: if CSS is only inline in index.html and the tweak is small, apply_diff there. ' +
+              'If the user wants styles.css or a multi-file layout, create styles.css and link it — that is allowed.'
+          )
+        } else if (/SURGICAL_EDIT/i.test(tc)) {
+          appendToolHint(
+            apiMessages,
+            'SURGICAL_EDIT handled: apply_diff was auto-invoked with the user request. ' +
+              'If it failed, do NOT write_file the whole HTML. Summarize or one more apply_diff with a short instruction only.'
           )
         } else if (/OVERWRITE_BLOCKED/i.test(tc)) {
           appendToolHint(
             apiMessages,
-            'OVERWRITE_BLOCKED: for small files (<6KB / HTML/CSS) use write_file overwrite=true. For large files use apply_patch/apply_diff; after two failed patches, overwrite is allowed.'
+            'OVERWRITE_BLOCKED: prefer apply_diff/apply_patch. Full overwrite of complete HTML needs an explicit rewrite request (allow_full_rewrite). Never use patch-fail as an excuse to rewrite the landing.'
           )
         } else if (/PATCH_OK_LIMIT/i.test(tc)) {
           appendToolHint(
             apiMessages,
-            'PATCH_OK_LIMIT: stop apply_patch/apply_diff on that path. One write_file overwrite=true with the full corrected file if needed, then finish — no more read/verify loops.'
+            'PATCH_OK_LIMIT: stop apply_patch/apply_diff on that path. For HTML: finish with a short honest summary (do not full-rewrite). For non-HTML: one write_file with allow_full_rewrite=true if needed.'
           )
         } else if (/PATCH_FAIL_LIMIT/i.test(tc)) {
           appendToolHint(
             apiMessages,
-            'PATCH_FAIL_LIMIT: stop retrying apply_patch/apply_diff. Call write_file with overwrite=true and the full corrected content for that path.'
+            /html|landing|<\/html>/i.test(tc)
+              ? 'PATCH_FAIL_LIMIT on HTML: do NOT rewrite. Summarize failure and stop (apply model already tried if available).'
+              : 'PATCH_FAIL_LIMIT: stop retrying apply_patch/apply_diff. For non-HTML you may write_file with overwrite=true and allow_full_rewrite=true.'
           )
         } else if (/PROCESS_ENDED/i.test(tc)) {
           appendToolHint(
@@ -4166,13 +4379,33 @@ export async function runAgentTurn(params: {
         ) {
           appendToolHint(
             apiMessages,
-            'Tool failed: one short <think> with the cause and next step, then ONE corrective tool call (prefer write_file overwrite for small HTML/CSS). Do not re-read the same file in a loop.'
+            'Tool failed: one short <think> with the cause and next step, then ONE corrective tool call (prefer apply_diff for HTML tweaks). Do not re-read the same file in a loop.'
           )
         }
       }
       apiMessages = normalizeApiMessages(apiMessages)
       if (params.signal?.aborted) return finishStopped()
-      // Soft recovery only — never hard-stop for tool loops; user Stop aborts.
+
+      const htmlPatchFailHard = [...patchFailsByPath.entries()].some(
+        ([p, n]) =>
+          n >= MAX_PATCH_FAILS_BEFORE_OVERWRITE && /\.html?$/i.test(p)
+      )
+      if (
+        !htmlOverwriteEscalated &&
+        (fileCompleteHits >= 2 || smartApplyFailHits >= 2 || htmlPatchFailHard)
+      ) {
+        htmlOverwriteEscalated = true
+        fileCompleteHits = 0
+        smartApplyFailHits = 0
+        appendToolHint(
+          apiMessages,
+          'Apply/patch is stuck on this HTML file. Do NOT write_file / overwrite / rewrite the landing. ' +
+            'One apply_diff with replace_all=true if this is a rename, or a short honest summary of what failed.'
+        )
+        apiMessages = normalizeApiMessages(apiMessages)
+      }
+
+      // Soft recovery only for non-HTML tool loops; never prefer full HTML overwrite.
       if (toolLoopHits >= MAX_TOOL_LOOP_HITS || missingPathHits >= MAX_MISSING_PATH_HITS) {
         const missing = missingPathHits >= MAX_MISSING_PATH_HITS
         if (missing) missingPathHits = 0
@@ -4183,8 +4416,8 @@ export async function runAgentTurn(params: {
             id: uid(),
             role: 'assistant',
             content: missing
-              ? '↻ Recovering: set relative_path on write_file / create_directory and continue…'
-              : '↻ Recovering from repeated tools — trying a different approach…'
+              ? translate(uiLang, 'chat.agent.recoveringPath')
+              : translate(uiLang, 'chat.agent.recoveringTools')
           })
           params.onUpdate([...messages])
         }
@@ -4192,7 +4425,7 @@ export async function runAgentTurn(params: {
           apiMessages,
           missing
             ? 'CRITICAL: previous writes had no relative_path. Call write_file/create_directory WITH relative_path (e.g. index.html). Then continue the task.'
-            : 'CRITICAL recovery: do NOT repeat the same tool+args. Prefer write_file overwrite=true for HTML/CSS/MD under ~40KB with the FULL file. Or apply_patch once. Then finish with a short user-facing summary. Do not stop.'
+            : 'CRITICAL recovery: do NOT repeat the same tool+args. For existing HTML use apply_diff (replace_all=true for a rename). Do not write_file the whole landing.'
         )
         apiMessages = normalizeApiMessages(apiMessages)
       }
@@ -4203,19 +4436,154 @@ export async function runAgentTurn(params: {
 
     // Final assistant text must enter apiMessages before any follow-up user nudge
     const rawFinal = (result.text ?? '').trim()
+
+    // Think+plan done but no tool call. Nudge a few times, then stop honestly.
+    // We never "apply the edit ourselves" — that produced instant fake success.
+    const emptyNudgeLimit = 3
+    if (
+      !toolCalls?.length &&
+      thinkSatisfied &&
+      completedTools === 0 &&
+      emptyToolNudges < emptyNudgeLimit &&
+      round < maxRounds - 1
+    ) {
+      emptyToolNudges++
+      const si = messages.findIndex((m) => m.id === streamId)
+      if (si !== -1) {
+        messages[si] = {
+          ...messages[si]!,
+          streaming: false,
+          content:
+            uiLang === 'ru'
+              ? '↻ Плана мало — жду реальный вызов инструментов…'
+              : '↻ A plan is not enough — waiting for a real tool call…'
+        }
+      }
+      params.onUpdate([...messages])
+      pushUserMessage(
+        apiMessages,
+        'You produced text but NO tool call, so nothing changed on disk. Act now with a structured tool call: ' +
+          'list_directory / read_file to inspect, then write_file for a missing file or apply_diff / apply_patch for an existing one. ' +
+          `User request: «${params.userText.trim().slice(0, 240)}». ` +
+          'Never answer "Готово" / "Done" — a completion claim without a successful tool call is a lie.'
+      )
+      apiMessages = normalizeApiMessages(apiMessages)
+      continue
+    }
+
+    if (
+      !toolCalls?.length &&
+      thinkSatisfied &&
+      completedTools === 0 &&
+      emptyToolNudges >= emptyNudgeLimit
+    ) {
+      const siStop = messages.findIndex((m) => m.id === streamId)
+      if (siStop !== -1) {
+        messages[siStop] = {
+          ...messages[siStop]!,
+          streaming: false,
+          content:
+            uiLang === 'ru'
+              ? '⏹ Модель не вызвала ни одного инструмента.'
+              : '⏹ Model never called a single tool.'
+        }
+      }
+      messages.push({
+        id: uid(),
+        role: 'assistant',
+        content:
+          uiLang === 'ru'
+            ? 'Ничего не изменено: модель не вызвала ни одного инструмента, файлы на диске нетронуты. Задача не выполнена — переформулируй запрос или назови конкретный файл.'
+            : 'Nothing changed: the model never called a tool, so files on disk are untouched. Task not completed — rephrase or name the exact file.'
+      })
+      params.onUpdate([...messages])
+      return finishWithTiming(messages)
+    }
+
     const planOnly = parsePlanBlock(rawFinal)
     if (planOnly?.length && todoSteps.length === 0) {
-      todoSteps = planOnly
+      todoSteps = coercePlan(planOnly)
       planFrozen = true
-      upsertTodoBubble(messages, todoSteps, { afterId: thinkBubbleId ?? undefined })
+      paintTodo(todoSteps, { afterId: thinkBubbleId ?? undefined })
     }
-    const finalText = stripPlanBlock(promoteThinkOnlyAnswer(rawFinal))
+    let finalText = stripPlanBlock(promoteThinkOnlyAnswer(rawFinal))
+    const claimsEditSuccess =
+      /сделано|готово|исправлен|fixed|done\.|task completed|визуально проверен/i.test(finalText)
+    const claimsVisualOk = /визуально проверен|visually verified|проверено в (браузер|browser)|opened in.*browser/i.test(
+      finalText
+    )
+    const asksFaqShade =
+      /прошу уточнить|please clarify|какой именно фон|bg-primary|bg-tertiary|--bg-primary|--bg-tertiary/i.test(
+        finalText
+      ) &&
+      /faq|accordion|т[её]мн|бел/i.test(params.userText)
+    const planStillOpen = pendingPlanWork(todoSteps).length > 0
+    const falseSuccess =
+      claimsEditSuccess &&
+      (planStillOpen || mutatingEditFailed || (!mutatingEditOk && completedTools > 0))
+    if (falseSuccess) {
+      const why =
+        planStillOpen
+          ? uiLang === 'ru'
+            ? `В плане ещё есть незакрытые шаги: ${pendingPlanWork(todoSteps)
+                .map((s) => s.text)
+                .slice(0, 3)
+                .join('; ')}.`
+            : `Plan still has open steps: ${pendingPlanWork(todoSteps)
+                .map((s) => s.text)
+                .slice(0, 3)
+                .join('; ')}.`
+          : mutatingEditFailed
+            ? uiLang === 'ru'
+              ? `Правка не применилась${lastMutatingFailDetail ? ` (${lastMutatingFailDetail})` : ''}.`
+              : `Edit did not apply${lastMutatingFailDetail ? ` (${lastMutatingFailDetail})` : ''}.`
+            : uiLang === 'ru'
+              ? 'Нет успешной правки файла в этом ходе.'
+              : 'No successful file edit in this turn.'
+      finalText =
+        uiLang === 'ru'
+          ? `${why} Задача не выполнена — не рапортуем успех.`
+          : `${why} Task not completed — not reporting success.`
+      // Replace the last non-tool assistant bubble that claimed success.
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const m = messages[i]
+        if (!m || m.role !== 'assistant' || m.toolName) continue
+        if (isAgentTodoMessageId(m.id) || m.id === AGENT_CHECKLIST_MSG_ID || m.id === AGENT_PLAN_MSG_ID) {
+          continue
+        }
+        if (/сделано|готово|исправлен|fixed|done\.|task completed/i.test(m.content ?? '')) {
+          messages[i] = { ...m, content: finalText, streaming: false }
+          break
+        }
+      }
+    } else if (claimsVisualOk && !htmlPreviewOpened) {
+      finalText = finalText
+        .replace(/визуально проверен[оа]?\s*(в\s+AFKLLM\s+Browser)?[.;,]?/gi, '')
+        .replace(/visually verified[.;,]?/gi, '')
+        .replace(/\s{2,}/g, ' ')
+        .trim()
+      if (uiLang === 'ru') {
+        finalText =
+          (finalText ? `${finalText} ` : '') +
+          '(Превью в браузере не открывалось — утверждение о визуальной проверке убрано.)'
+      } else {
+        finalText =
+          (finalText ? `${finalText} ` : '') +
+          '(Browser preview was not opened — visual-verification claim removed.)'
+      }
+    }
+
     if (finalText || rawFinal) {
       const lastApi = apiMessages[apiMessages.length - 1]
       if (lastApi?.role === 'assistant' && !lastApi.tool_calls?.length) {
-        lastApi.content = `${apiContentText(lastApi.content)}\n\n${rawFinal}`
+        lastApi.content = `${apiContentText(lastApi.content)}\n\n${
+          falseSuccess ? finalText : rawFinal
+        }`
       } else if (rawFinal) {
-        apiMessages.push({ role: 'assistant', content: rawFinal })
+        apiMessages.push({
+          role: 'assistant',
+          content: falseSuccess ? finalText : rawFinal
+        })
       }
       apiMessages = normalizeApiMessages(apiMessages)
       // Keep UI message without <plan> tags (card shows steps).
@@ -4224,7 +4592,7 @@ export async function runAgentTurn(params: {
         if (
           m?.role === 'assistant' &&
           !m.toolName &&
-          m.id !== AGENT_TODO_MSG_ID &&
+          !isAgentTodoMessageId(m.id) &&
           m.id !== AGENT_CHECKLIST_MSG_ID &&
           m.id !== AGENT_PLAN_MSG_ID &&
           /<\s*plan\s*>/i.test(m.content ?? '')
@@ -4245,24 +4613,51 @@ export async function runAgentTurn(params: {
     ) {
       concludeAsked = true
       const concludeHint =
-        uiLang === 'ru'
-          ? 'Инструменты уже выполнены. Напиши краткое заключение для пользователя: что сделано, ключевые пути файлов, как проверить. Без новых tool calls, если задача завершена; иначе один следующий tool, затем заключение.'
-          : 'Tools already ran. Write a short closing summary for the user: what changed, key file paths, how to verify. No new tool calls if the task is done; otherwise one next tool, then the summary.'
+        mutatingEditFailed
+          ? uiLang === 'ru'
+            ? `Правка не удалась${lastMutatingFailDetail ? ` (${lastMutatingFailDetail})` : ''}. Напиши честное короткое заключение: что не применилось и почему. Без ложного «Сделано». Без новых tool calls, если больше нечего пробовать; иначе один corrective apply_diff.`
+            : `The edit failed${lastMutatingFailDetail ? ` (${lastMutatingFailDetail})` : ''}. Write an honest short summary: what did not apply and why. Do not claim "done". No new tools if nothing left to try; otherwise one corrective apply_diff.`
+          : uiLang === 'ru'
+            ? 'Инструменты уже выполнены. Напиши краткое заключение для пользователя: что сделано, ключевые пути файлов, как проверить. Без новых tool calls, если задача завершена; иначе один следующий tool, затем заключение.'
+            : 'Tools already ran. Write a short closing summary for the user: what changed, key file paths, how to verify. No new tool calls if the task is done; otherwise one next tool, then the summary.'
       pushUserMessage(apiMessages, concludeHint)
       apiMessages = normalizeApiMessages(apiMessages)
-      messages.push({
-        id: uid(),
-        role: 'assistant',
-        content: uiLang === 'ru' ? '↻ Пишу заключение…' : '↻ Writing closing summary…'
-      })
+      pushStatusBubble(
+        messages,
+        uiLang === 'ru' ? '↻ Пишу заключение…' : '↻ Writing closing summary…'
+      )
       params.onUpdate([...messages])
       continue
+    }
+
+    // Surgical turn ended with failed edits and a success-sounding (or empty) close — inject honest failure.
+    if (
+      mutatingEditFailed &&
+      completedTools > 0 &&
+      pendingPlanWork(todoSteps).length === 0 &&
+      (falseSuccess || claimsEditSuccess || (!finalText.trim() && concludeAsked))
+    ) {
+      const honest =
+        uiLang === 'ru'
+          ? `Правка не применилась${lastMutatingFailDetail ? ` (${lastMutatingFailDetail})` : ''}. Задача не выполнена.`
+          : `Edit did not apply${lastMutatingFailDetail ? ` (${lastMutatingFailDetail})` : ''}. Task not completed.`
+      const last = messages[messages.length - 1]
+      const alreadyHonest =
+        last &&
+        last.role === 'assistant' &&
+        !last.toolName &&
+        /не применил|did not apply|не выполнен/i.test(last.content ?? '')
+      if (!alreadyHonest) {
+        messages.push({ id: uid(), role: 'assistant', content: honest })
+        params.onUpdate([...messages])
+      }
+      return finishWithTiming(messages)
     }
 
     const {
       hardMissing,
       acceptanceDone,
-      looksPrematureDone
+      looksPrematureDone: gatePremature
     } = evaluateAcceptanceGate({
       finalText,
       userWantsNodeTest,
@@ -4273,8 +4668,15 @@ export async function runAgentTurn(params: {
       ranCliSmoke,
       incompleteCount: checklist.incomplete.length,
       failedCount: checklist.failed.length,
-      completedTools
+      completedTools,
+      mutatingEditOk,
+      mutatingEditFailed
     })
+    const looksPrematureDone =
+      gatePremature ||
+      falseSuccess ||
+      (planStillOpen && claimsEditSuccess && round < maxRounds - 1) ||
+      (mutatingEditFailed && claimsEditSuccess && round < maxRounds - 1)
 
     if (
       earlyDoneNudges < 3 &&
@@ -4287,6 +4689,13 @@ export async function runAgentTurn(params: {
         hardMissing.length > 0
           ? `\nMissing before you may finish:\n- ${hardMissing.join('\n- ')}\n`
           : ''
+      const openPlan =
+        planStillOpen
+          ? `\nOpen plan steps still pending:\n- ${pendingPlanWork(todoSteps)
+              .map((s) => s.text)
+              .slice(0, 5)
+              .join('\n- ')}\n`
+          : ''
       const fixFirst = hardMissing.some((m) =>
         /test FAILED|until green/i.test(m)
       )
@@ -4294,51 +4703,50 @@ export async function runAgentTurn(params: {
         apiMessages,
         'Do not stop yet.' +
           reqBlock +
+          openPlan +
           (fixFirst
             ? 'Do NOT repeat a success summary. Fix the failing command first.\n'
-            : 'Verify the project tree against the required structure. Create any MISSING files only (no rewrites).\n') +
+            : mutatingEditFailed
+              ? 'An edit failed — use apply_diff (not a full HTML rewrite) or honestly report failure.\n'
+              : 'Verify remaining plan steps. Patch existing files only (no full rewrites).\n') +
           tree
       )
       apiMessages = normalizeApiMessages(apiMessages)
-      messages.push({
-        id: uid(),
-        role: 'assistant',
-        content:
-          hardMissing.length > 0
-            ? '↻ Acceptance incomplete — finish required checks…'
-            : '↻ Checking for missing files before finishing…'
-      })
+      pushStatusBubble(
+        messages,
+        hardMissing.length > 0
+          ? '↻ Acceptance incomplete — finish required checks…'
+          : '↻ Checking for missing files before finishing…'
+      )
       params.onUpdate([...messages])
       continue
     }
 
-    if (todoSteps.length > 0 && lastHtmlWrite) {
-      todoSteps = reconcileTodosWithContent(todoSteps, lastHtmlWrite)
-      upsertTodoBubble(messages, todoSteps, { afterId: thinkBubbleId ?? undefined })
-    }
-
     const workLeft = pendingPlanWork(todoSteps)
+    const landingComplete =
+      Boolean(lastHtmlWrite) && contentLooksStructurallyComplete(lastHtmlWrite)
+
     if (
       workLeft.length > 0 &&
       completedTools > 0 &&
       planFinishNudges < 3 &&
-      round < maxRounds - 1
+      round < maxRounds - 1 &&
+      !landingComplete &&
+      !mutatingEditOk
     ) {
       planFinishNudges++
       const pendingList = workLeft.map((s) => `- ${s.text}`).join('\n')
       pushUserMessage(
         apiMessages,
-        'PLAN_ORDER: finish the remaining plan steps IN ORDER before opening a browser or writing a summary:\n' +
+        'Open plan steps remain:\n' +
           pendingList +
-          '\nDo not Start-Process yet. Keep using tools (write_file / apply_patch) until these steps are done.'
+          '\nKeep using tools if work is still needed, or write an honest summary. Opening preview is allowed.'
       )
       apiMessages = normalizeApiMessages(apiMessages)
-      messages.push({
-        id: uid(),
-        role: 'assistant',
-        content:
-          uiLang === 'ru' ? '↻ Доделываю план по порядку…' : '↻ Finishing the plan in order…'
-      })
+      pushStatusBubble(
+        messages,
+        uiLang === 'ru' ? '↻ Доделываю план по порядку…' : '↻ Finishing the plan in order…'
+      )
       params.onUpdate([...messages])
       continue
     }
@@ -4346,11 +4754,14 @@ export async function runAgentTurn(params: {
     const pendingBrowser = todoSteps.filter(
       (s) => s.status !== 'done' && isBrowserPlanStep(s.text)
     )
+    // The agent must open the preview through its own tool call — the editor
+    // no longer opens index.html behind the model's back.
     if (
       !htmlPreviewOpened &&
       pendingBrowser.length > 0 &&
       completedTools > 0 &&
-      planFinishNudges < 4 &&
+      mutatingEditOk &&
+      planFinishNudges < 2 &&
       round < maxRounds - 1 &&
       /готов|done|создан|finished|complete/i.test(finalText)
     ) {
@@ -4358,23 +4769,60 @@ export async function runAgentTurn(params: {
       const pendingList = pendingBrowser.map((s) => `- ${s.text}`).join('\n')
       pushUserMessage(
         apiMessages,
-        'PLAN_INCOMPLETE: open/preview is still pending:\n' +
+        'PLAN_INCOMPLETE: preview is still pending:\n' +
           pendingList +
-          '\nOpen the page now with Start-Process (Resolve-Path .\\index.html) for static HTML, or the Vite Local: URL if a dev server is running. Do NOT open the LLM API port. Then a one-line summary.'
+          '\nOpen the page yourself with execute_terminal_command (static HTML: Start-Process (Resolve-Path .\\index.html); dev server: the printed Local: URL). Never open the LLM API port. Then one line of summary.'
       )
       apiMessages = normalizeApiMessages(apiMessages)
-      messages.push({
-        id: uid(),
-        role: 'assistant',
-        content:
-          uiLang === 'ru' ? '↻ Открываю превью, затем заключение…' : '↻ Opening preview, then summary…'
-      })
+      pushStatusBubble(
+        messages,
+        uiLang === 'ru' ? '↻ Прошу открыть превью, затем заключение…' : '↻ Asking to open preview, then summary…'
+      )
       params.onUpdate([...messages])
       continue
     }
 
+    if (htmlPreviewOpened) {
+      paintTodo(todoSteps, { afterId: thinkBubbleId ?? undefined })
+    }
+
+    if (
+      userAskedVerify(params.userText) &&
+      !verifyAlreadyRan(evidenceLog) &&
+      mutatingEditOk &&
+      round < maxRounds - 1 &&
+      planFinishNudges < 2
+    ) {
+      planFinishNudges++
+      pushUserMessage(
+        apiMessages,
+        formatVerifyNudge(inferredVerifyMode(params.userText), uiLang)
+      )
+      apiMessages = normalizeApiMessages(apiMessages)
+      pushStatusBubble(
+        messages,
+        uiLang === 'ru' ? '↻ Проверяю сборку/тесты стека…' : '↻ Verifying stack build/tests…'
+      )
+      params.onUpdate([...messages])
+      continue
+    }
+
+    const honest = honestClosingNote({
+      mutatingEditOk,
+      mutatingEditFailed,
+      lastFail: lastMutatingFailDetail,
+      evidence: evidenceLog,
+      previewOpened: htmlPreviewOpened,
+      claimsVisualOk,
+      lang: uiLang
+    })
+    if (honest) {
+      finalText = honest
+      messages.push({ id: uid(), role: 'assistant', content: honest })
+    }
+
     if (todoSteps.length > 0 && todosAllDone(todoSteps)) {
-      upsertTodoBubble(messages, todoSteps, { afterId: thinkBubbleId ?? undefined })
+      paintTodo(todoSteps, { afterId: thinkBubbleId ?? undefined })
     }
 
     params.onUpdate([...messages])

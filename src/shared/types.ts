@@ -76,6 +76,8 @@ export type AgentToolName =
   | 'delete_file'
   | 'create_directory'
   | 'generate_image'
+  | 'verify_project'
+  | 'get_diagnostics'
 
 export interface AgentToolCall {
   id: string
@@ -164,9 +166,10 @@ export const AGENT_TOOL_SCHEMAS = [
       name: 'write_file',
       description:
         'Create or update a file. ALWAYS set relative_path FIRST (e.g. "index.html", "styles.css") then content. ' +
-        'NEW file: write the full body (small HTML/CSS/scripts <6KB in one call). ' +
-        'EXISTING small file (<6KB / HTML, CSS, short scripts): set overwrite=true with the full corrected file. ' +
-        'EXISTING large file: do not overwrite — use apply_patch / apply_diff, or append=true to continue a truncated write. ' +
+        'NEW / missing file: write the full body. ' +
+        'EXISTING file: prefer apply_diff / apply_patch. ' +
+        'EXISTING small files: overwrite=true only when appropriate. ' +
+        'EXISTING large file: apply_patch / apply_diff, or append=true to continue a truncated write. ' +
         'Paths relative to project root only.',
       parameters: {
         type: 'object',
@@ -183,7 +186,12 @@ export const AGENT_TOOL_SCHEMAS = [
           overwrite: {
             type: 'boolean',
             description:
-              'Replace the entire existing file. Required for small HTML/CSS/script edits. For large files prefer apply_patch unless two patches already failed. Default false.'
+              'Replace the entire existing file. Prefer apply_diff/apply_patch. Default false.'
+          },
+          allow_full_rewrite: {
+            type: 'boolean',
+            description:
+              'Permit overwriting a complete existing file after two failed patches or an explicit user rewrite request. Default false.'
           }
         },
         required: ['relative_path', 'content']
@@ -195,7 +203,9 @@ export const AGENT_TOOL_SCHEMAS = [
     function: {
       name: 'apply_patch',
       description:
-        'Edit LARGE files (or many files at once) with a Codex-style patch: *** Begin Patch / *** Add File: path / *** Update File: path with @@ hunks (-/+/space lines) / *** Delete File: path / *** End Patch. For small HTML/CSS/scripts prefer write_file overwrite=true. Use apply_diff for one unique search→replace.',
+        'Edit files with a Codex-style patch: *** Begin Patch / *** Update File: path with @@ hunks / *** End Patch. ' +
+        'Prefer this or apply_diff over a full write_file rewrite of an existing file. ' +
+        'If hunks fail, the apply model retries automatically; do not loop read_file.',
       parameters: {
         type: 'object',
         properties: {
@@ -213,18 +223,30 @@ export const AGENT_TOOL_SCHEMAS = [
     function: {
       name: 'apply_diff',
       description:
-        'Simple fallback edit on a LARGE file: replace one exact unique search_block with replace_block. For small HTML/CSS prefer write_file overwrite=true. Prefer apply_patch for multi-hunk or multi-file edits. On failure: read_file, copy a shorter unique substring, retry — or overwrite if the file is small.',
+        'Targeted edit: replace one unique search_block with replace_block, or pass instruction for the apply model. ' +
+        'Pass replace_all=true to replace every occurrence (global rename). ' +
+        'Preferred for existing complete HTML (theme/FAQ/CSS tweaks). On fuzzy miss the coresident apply model runs once — do NOT re-read or full-rewrite.',
       parameters: {
         type: 'object',
         properties: {
           relative_path: { type: 'string' },
           search_block: {
             type: 'string',
-            description: 'Exact unique substring from the current file (copy from read_file)'
+            description: 'Exact unique substring from the current file (optional if instruction is set)'
           },
-          replace_block: { type: 'string' }
+          replace_block: { type: 'string' },
+          replace_all: {
+            type: 'boolean',
+            description:
+              'Replace every occurrence of search_block (use for global renames). Default false requires a unique match.'
+          },
+          instruction: {
+            type: 'string',
+            description:
+              'Natural-language edit intent for the apply model (e.g. "darken Bootstrap accordion buttons"). Use when search_block is hard to copy exactly.'
+          }
         },
-        required: ['relative_path', 'search_block', 'replace_block']
+        required: ['relative_path']
       }
     }
   },
@@ -335,7 +357,7 @@ export const AGENT_TOOL_SCHEMAS = [
     function: {
       name: 'execute_terminal_command',
       description:
-        'Run ONE shell command in the IDE terminal (PowerShell on Windows). Do NOT use bash && — use the cwd arg for directories, or `;` to chain. On TERMINAL_ERROR, fix from ERROR_FOCUS. If you see PROCESS_ENDED, the user closed the app — do not rewrite or relaunch.',
+        'Run ONE shell command in the IDE terminal (PowerShell on Windows). Do NOT use bash && — use the cwd arg for directories, or `;` to chain. On TERMINAL_ERROR / nonzero exit_code, fix from ERROR_FOCUS. PROCESS_ENDED means the user closed a GUI or hit Ctrl+C — do not rewrite or relaunch.',
       parameters: {
         type: 'object',
         properties: {
@@ -398,6 +420,45 @@ export const AGENT_TOOL_SCHEMAS = [
           steps: { type: 'integer', description: 'Denoising steps (default from settings)' }
         },
         required: ['prompt']
+      }
+    }
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'verify_project',
+      description:
+        'Run the detected stack’s build, test, lint, or run command (Maven/Gradle/CMake/dotnet/Go/Cargo/npm/pytest/Make). ' +
+        'Prefer this over guessing a shell command. Non-zero exit is a failure — do not claim success.',
+      parameters: {
+        type: 'object',
+        properties: {
+          mode: {
+            type: 'string',
+            enum: ['build', 'test', 'lint', 'run'],
+            description: 'Which verification to run (default build)'
+          },
+          command: {
+            type: 'string',
+            description: 'Optional explicit command; otherwise the stack default is used'
+          },
+          cwd: {
+            type: 'string',
+            description: 'Working directory relative to project root'
+          }
+        }
+      }
+    }
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'get_diagnostics',
+      description:
+        'Return the latest IDE diagnostics (tsc/eslint and similar). Read-only. Use after edits to see compiler/linter issues.',
+      parameters: {
+        type: 'object',
+        properties: {}
       }
     }
   }

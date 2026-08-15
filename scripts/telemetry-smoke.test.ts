@@ -40,6 +40,18 @@ describe('formatTelemetryLogLine', () => {
     assert.match(line, /hello world/)
     assert.match(line, /\[test\]/)
   })
+
+  it('includes extra fields on the same line', () => {
+    const line = formatTelemetryLogLine({
+      kind: 'info',
+      message: 'round result',
+      at: '2026-01-01T00:00:00.000Z',
+      source: 'agent:tool',
+      extra: { round: 0, toolCalls: 1 }
+    })
+    assert.match(line, /round result/)
+    assert.match(line, /"toolCalls":1/)
+  })
 })
 
 describe('parseTelemetryLogText', () => {

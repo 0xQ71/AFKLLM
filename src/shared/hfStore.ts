@@ -15,6 +15,7 @@ export type HfRecommendFit = 'ideal' | 'comfortable' | 'tight' | 'heavy'
 /** Which setting a store download should fill. */
 export type StoreDownloadTarget =
   | 'chat'
+  | 'apply'
   | 'vision'
   | 'mmproj'
   | 'imageGen'
@@ -26,6 +27,7 @@ export type StoreDownloadTarget =
 
 const STORE_TARGETS: StoreDownloadTarget[] = [
   'chat',
+  'apply',
   'vision',
   'mmproj',
   'imageGen',
@@ -64,7 +66,7 @@ export interface HfRecommendedModel {
   sizeGb: number
   /** Soft min VRAM (GiB) for mostly-GPU offload; below → CPU-heavy fallback */
   minVramGb: number
-  tags: Array<'coding' | 'agent' | 'general' | 'popular' | 'vision' | 'imageGen'>
+  tags: Array<'coding' | 'agent' | 'general' | 'popular' | 'vision' | 'imageGen' | 'apply'>
 }
 
 /** Staff/hardware picks, roughly small → large. */
@@ -204,6 +206,37 @@ export const HF_RECOMMENDED_MODELS: HfRecommendedModel[] = [
     sizeGb: 31.0,
     minVramGb: 24,
     tags: ['general', 'popular']
+  }
+]
+
+/**
+ * Fast-apply / code-edit GGUF picks (Morph-style apply slot).
+ * Prefer small MTP instruct models — swapped in only for targeted patches.
+ */
+export const HF_APPLY_RECOMMENDED_MODELS: HfRecommendedModel[] = [
+  {
+    repoId: 'unsloth/Qwen3.5-4B-MTP-GGUF',
+    title: 'Qwen3.5 4B MTP (Apply)',
+    description:
+      'Best local apply model — MTP Q4_K_M (~2.6 GB). Fast speculative decode for targeted edits.',
+    descriptionRu:
+      'Лучшая локальная apply-модель — MTP Q4_K_M (~2.6 ГБ). Быстрый speculative decode для точечных правок.',
+    preferredFile: 'Qwen3.5-4B-Q4_K_M.gguf',
+    sizeGb: 2.6,
+    minVramGb: 4,
+    tags: ['apply', 'coding', 'popular']
+  },
+  {
+    repoId: 'unsloth/Qwen3.5-4B-MTP-GGUF',
+    title: 'Qwen3.5 4B MTP Q5 (Apply)',
+    description:
+      'Higher-quality apply — MTP Q5_K_M (~3.0 GB). Use when VRAM allows.',
+    descriptionRu:
+      'Более качественный apply — MTP Q5_K_M (~3.0 ГБ). Когда хватает VRAM.',
+    preferredFile: 'Qwen3.5-4B-Q5_K_M.gguf',
+    sizeGb: 3.0,
+    minVramGb: 5,
+    tags: ['apply', 'coding']
   }
 ]
 

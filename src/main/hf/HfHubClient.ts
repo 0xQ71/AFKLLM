@@ -1,4 +1,5 @@
 import {
+  HF_APPLY_RECOMMENDED_MODELS,
   HF_IMAGE_GEN_CLIP_G_MODELS,
   HF_IMAGE_GEN_CLIP_L_MODELS,
   HF_IMAGE_GEN_LLM_MODELS,
@@ -94,6 +95,7 @@ function markRecommended(
 }
 
 function catalogForTarget(target: StoreDownloadTarget): HfRecommendedModel[] {
+  if (target === 'apply') return HF_APPLY_RECOMMENDED_MODELS
   if (target === 'vision' || target === 'mmproj') return HF_VISION_RECOMMENDED_MODELS
   if (target === 'imageGen') return HF_IMAGE_GEN_RECOMMENDED_MODELS
   if (target === 'imageGenVae') return HF_IMAGE_GEN_VAE_MODELS
@@ -339,7 +341,9 @@ export async function listStoreHome(
           recommended: true,
           pipeline_tag: isImageGenStoreTarget(target)
             ? 'text-to-image'
-            : 'image-text-to-text',
+            : target === 'vision' || target === 'mmproj'
+              ? 'image-text-to-text'
+              : 'text-generation',
           tags: [...r.tags],
           description: readme || r.description,
           avatarUrl,

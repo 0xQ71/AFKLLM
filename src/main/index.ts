@@ -52,6 +52,7 @@ import { GitService } from './git/GitService'
 import { buildRepoMap, queryCodebase } from './context/ContextEngine'
 import { ContextIndex } from './context/ContextIndex'
 import { loadProjectRules } from './context/ProjectRules'
+import { probeProjectStack } from './context/StackProbe'
 import { setWebSearchCacheDir } from './agent/WebSearch'
 import { isUiLanguage } from '../shared/i18n'
 import { TsLanguageService } from './lsp/TsLanguageService'
@@ -87,6 +88,8 @@ let mainWindow: BrowserWindow | null = null
 /** When true, close events are allowed to destroy the window (real quit). */
 let isQuitting = false
 let llama: LlamaProcessManager | null = null
+/** Coresident apply llama-server (port+1); only while chat slot is active. */
+let applyLlama: LlamaProcessManager | null = null
 let slotOrch: ModelSlotOrchestrator | null = null
 let tools: AgentToolRegistry | null = null
 let settingsStore: SettingsStore | null = null
@@ -288,6 +291,24 @@ function runtimeStatus(): LlmRuntimeStatus {
     slot?.slot === 'vision'
       ? settings?.visionModelPath ?? null
       : settings?.modelPath ?? null
+  const applyPath = settings?.applyModelPath?.trim() || ''
+  const applyErr = slotOrch?.getApplyError() ?? applyLlama?.error
+  let applyState: LlmRuntimeStatus['applyState'] = 'stopped'
+  if (!applyPath) {
+    applyState = 'stopped'
+  } else if (applyLlama?.currentState === 'ready') {
+    applyState = 'ready'
+  } else if (applyLlama?.currentState === 'starting') {
+    applyState = 'starting'
+  } else if (applyErr || applyLlama?.currentState === 'error') {
+    applyState = 'error'
+  } else if (slot?.slot === 'chat' && slot.phase === 'switching') {
+    applyState = 'starting'
+  }
+
+  const applyPort = (Number(settings?.port) || 8080) + 1
+  const applyHost = settings?.host || '127.0.0.1'
+
   return {
     state: llama?.currentState ?? 'stopped',
     baseUrl: llama?.baseUrl ?? settings?.baseUrl ?? null,
@@ -295,19 +316,25 @@ function runtimeStatus(): LlmRuntimeStatus {
     ctxSize: settings?.ctxSize ?? null,
     pending: queue.pendingCount,
     error: bootError ?? llama?.error ?? slot?.error,
-    detail: slot?.phase === 'switching' ? slot.detail : llama?.detail || slot?.detail
+    detail: slot?.phase === 'switching' ? slot.detail : llama?.detail || slot?.detail,
+    applyState,
+    applyModelPath: applyPath || null,
+    applyBaseUrl: applyLlama?.baseUrl ?? (applyPath ? `http://${applyHost}:${applyPort}` : null),
+    applyError: applyErr
   }
 }
 
 function applyQueueSettings(settings: AppSettings): void {
   getLLMQueue(settings.baseUrl, 'local')
   const port = Number(settings.port) || 8080
-  terminals.setDenyPreviewPorts([port, 8080].filter((p, i, a) => a.indexOf(p) === i))
+  terminals.setDenyPreviewPorts(
+    [port, port + 1, 8080].filter((p, i, a) => a.indexOf(p) === i)
+  )
 }
 
 function settingsToLlamaOpts(
   settings: AppSettings,
-  slot: 'chat' | 'vision' = 'chat',
+  slot: 'chat' | 'vision' | 'apply' = 'chat',
   mmprojPath?: string | null
 ): LlamaProcessOptions {
   const custom = settings.llamaServerPath?.trim()
@@ -315,15 +342,25 @@ function settingsToLlamaOpts(
     ? custom
     : llamaRuntime.resolveStatus(undefined, settings.llamaRuntimeVariant).binaryPath ||
       undefined
-  const modelPath = slot === 'vision' ? settings.visionModelPath : settings.modelPath
+  const port = Number(settings.port) || 8080
+  let modelPath = settings.modelPath
+  let portOut = port
+  let ctxSize = settings.ctxSize
+  if (slot === 'vision') {
+    modelPath = settings.visionModelPath
+  } else if (slot === 'apply') {
+    modelPath = settings.applyModelPath
+    portOut = port + 1
+    ctxSize = Math.min(Math.max(settings.ctxSize || 8192, 8192), 16384)
+  }
   return {
     binaryPath: resolved,
     modelPath,
     ...(slot === 'vision' && mmprojPath ? { mmprojPath } : {}),
     host: settings.host,
-    port: settings.port,
+    port: portOut,
     nGpuLayers: settings.nGpuLayers,
-    ctxSize: settings.ctxSize,
+    ctxSize,
     cacheTypeK: settings.cacheTypeK,
     cacheTypeV: settings.cacheTypeV,
     parallel: Math.max(1, settings.parallel),
@@ -336,7 +373,8 @@ function settingsToLlamaOpts(
     kvUnified: settings.kvUnified,
     ctxCheckpoints: settings.ctxCheckpoints,
     loadMode: settings.loadMode,
-    contextShift: settings.contextOverflow === 'context_shift'
+    contextShift: settings.contextOverflow === 'context_shift',
+    ...(slot === 'apply' ? { disableReasoning: true } : {})
   }
 }
 
@@ -351,6 +389,10 @@ function initSlotOrchestrator(): void {
     setLlama: (mgr) => {
       llama = mgr
     },
+    getApplyLlama: () => applyLlama,
+    setApplyLlama: (mgr) => {
+      applyLlama = mgr
+    },
     createLlama: (opts) => new LlamaProcessManager(opts),
     optsFor: async (slot) => {
       const settings = settingsStore!.get()
@@ -360,6 +402,9 @@ function initSlotOrchestrator(): void {
           settings.visionMmprojPath
         )
         return settingsToLlamaOpts(settings, 'vision', mm)
+      }
+      if (slot === 'apply') {
+        return settingsToLlamaOpts(settings, 'apply')
       }
       return settingsToLlamaOpts(settings, 'chat')
     },
@@ -497,6 +542,7 @@ function registerIpc(): void {
       llama?.updateOptions(settingsToLlamaOpts(next, 'vision', mm))
     } else {
       llama?.updateOptions(settingsToLlamaOpts(next, 'chat'))
+      applyLlama?.updateOptions(settingsToLlamaOpts(next, 'apply'))
     }
     applyQueueSettings(next)
     if (mcpManager) {
@@ -735,6 +781,19 @@ function registerIpc(): void {
     }
   })
 
+  ipcMain.handle('context:stack', async () => {
+    try {
+      return await probeProjectStack(projectRoot)
+    } catch (e) {
+      return {
+        stacks: [],
+        markers: [],
+        text: '',
+        error: e instanceof Error ? e.message : String(e)
+      }
+    }
+  })
+
   ipcMain.handle('workspace:list', async (_e, dirPath = '.') => {
     if (!tools) return { ok: false, content: '', error: 'Tools not ready' }
     return tools.invoke({
@@ -905,6 +964,8 @@ function registerIpc(): void {
       } else {
         getLLMQueue().cancelAll('model_unloaded')
         await llama?.stop()
+        await applyLlama?.stop()
+        applyLlama = null
       }
     } catch (err) {
       bootError = err instanceof Error ? err.message : String(err)
@@ -1522,6 +1583,14 @@ app.whenReady().then(async () => {
   await settingsStore.load()
   initSlotOrchestrator()
   setCollectLogsToFile(() => settingsStore?.get().collectLogsToFile !== false)
+  void reportEvent({
+    kind: 'info',
+    message: 'Log recording active',
+    source: 'main:startup',
+    extra: {
+      collectLogsToFile: settingsStore.get().collectLogsToFile !== false
+    }
+  })
   terminals.setAutoConfirm(() => settingsStore?.get().agentAutoApprove === true)
   applyQueueSettings(settingsStore.get())
 
@@ -1565,6 +1634,9 @@ app.whenReady().then(async () => {
   tools = new AgentToolRegistry({
     projectRoot: placeholder,
     contextIndex,
+    getApplyBaseUrl: () =>
+      applyLlama?.currentState === 'ready' ? applyLlama.baseUrl : null,
+    getDiagnostics: () => diagnostics.getLast(),
     runVisibleCommand: (command, cwd) => terminals.runVisibleCommand(command, cwd),
     readTerminalScrollback: (maxChars) => terminals.getPrimaryScrollback(maxChars),
     confirmTerminal: async (command, cwd) => {
@@ -1984,6 +2056,7 @@ app.on('before-quit', () => {
   folderWatcher?.close()
   void mcpManager?.dispose()
   void llama?.stop()
+  void applyLlama?.stop()
   getLLMQueue().cancelAll('app_quit')
 })
 

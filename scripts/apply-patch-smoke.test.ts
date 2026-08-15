@@ -33,6 +33,63 @@ describe('parseApplyPatch', () => {
     assert.equal(r.ops[0]!.hunks![0]!.lines.length, 3)
   })
 
+  it('tolerates "*** Begin Patch ***" / "*** End Patch ***" trailing stars', () => {
+    const r = parseApplyPatch(`*** Begin Patch ***
+*** Update File: index.html
+@@
+-  <div class="faq">old</div>
++  <div class="faq bg-dark text-white">new</div>
+*** End Patch ***`)
+    assert.equal(r.ok, true, r.error)
+    assert.equal(r.ops.length, 1)
+    assert.equal(r.ops[0]!.type, 'update')
+    assert.equal(r.ops[0]!.path, 'index.html')
+  })
+
+  it('converts unified --- a/ +++ b/ diffs into Update File ops', () => {
+    const r = parseApplyPatch(`--- a/index.html
++++ b/index.html
+@@ -1,3 +1,3 @@
+ <html>
+-  <p class="muted">gray</p>
++  <p class="muted">white</p>
+ </html>
+`)
+    assert.equal(r.ok, true, r.error)
+    assert.equal(r.ops[0]!.type, 'update')
+    assert.equal(r.ops[0]!.path, 'index.html')
+    assert.ok((r.ops[0]!.hunks?.length ?? 0) >= 1)
+    const original = `<html>
+  <p class="muted">gray</p>
+</html>
+`
+    const applied = applyHunksToText(original, r.ops[0]!.hunks!)
+    assert.equal(applied.ok, true, applied.error)
+    assert.match(applied.content!, /white/)
+  })
+
+  it('converts mixed Begin Patch + --- a/ headers', () => {
+    const r = parseApplyPatch(`*** Begin Patch ***
+--- a/index.html
++++ b/index.html
+@@
+-  <div class="faq">old</div>
++  <div class="faq bg-dark">new</div>
+*** End Patch ***`)
+    assert.equal(r.ok, true, r.error)
+    assert.equal(r.ops[0]!.path, 'index.html')
+  })
+
+  it('tolerates "Update File:" without *** prefix', () => {
+    const r = parseApplyPatch(`Update File: index.html
+@@
+-  <div class="faq">old</div>
++  <div class="faq bg-dark text-white">new</div>`)
+    assert.equal(r.ok, true, r.error)
+    assert.equal(r.ops[0]!.type, 'update')
+    assert.equal(r.ops[0]!.path, 'index.html')
+  })
+
   it('parses Delete File', () => {
     const r = parseApplyPatch(`*** Begin Patch
 *** Delete File: gone.ts

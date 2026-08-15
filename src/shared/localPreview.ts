@@ -104,6 +104,23 @@ export function pathToFileUrl(absPath: string): string {
   return `file:///${normalized}`
 }
 
+/** True when a path is AFKLLM's own UI (dist/browser.html) — never a user landing. */
+export function isAfkllmInternalHtmlPath(p: string): boolean {
+  const n = String(p ?? '').replace(/\\/g, '/').toLowerCase()
+  if (!n) return false
+  return (
+    /(?:^|\/)dist\/browser\.html$/.test(n) ||
+    /(?:^|\/)out\/renderer\/index\.html$/.test(n) ||
+    /afkllm\/(?:dist|out)\//.test(n)
+  )
+}
+
+/** HTML that already closes — shared by main (write_file) and renderer. */
+export function htmlDocumentComplete(content: string): boolean {
+  const t = String(content ?? '').trim()
+  return t.length > 0 && /<\/html\s*>/i.test(t)
+}
+
 /** Extract http(s)://localhost… from a Start-Process / browser open command. */
 export function extractHttpUrlFromOpenCommand(command: string): string | null {
   const m = String(command ?? '').match(
@@ -131,6 +148,9 @@ export function extractOpenHtmlRelativePath(command: string, cwdRel = '.'): stri
   )
   if (quoted?.[1]) {
     const p = quoted[1].replace(/\\/g, '/')
+    if (isAfkllmInternalHtmlPath(p) || /(?:^|\/)browser\.html$/i.test(p)) {
+      return joinRel('index.html')
+    }
     if (/^[a-zA-Z]:\//.test(p) || p.startsWith('/')) return p
     return joinRel(p)
   }
@@ -138,7 +158,11 @@ export function extractOpenHtmlRelativePath(command: string, cwdRel = '.'): stri
   const bare = c.match(
     /(?:Start-Process|Invoke-Item|xdg-open|open)\s+(?:-FilePath\s+)?(?:Resolve-Path\s+)?\.?\\?\/?([\w./\\-]+\.html?)/i
   )
-  if (bare?.[1]) return joinRel(bare[1])
+  if (bare?.[1]) {
+    const p = bare[1].replace(/\\/g, '/')
+    if (isAfkllmInternalHtmlPath(p) || /^browser\.html$/i.test(p)) return joinRel('index.html')
+    return joinRel(p)
+  }
 
   const wd = c.match(/-WorkingDirectory\s+["']([^"']+)["']/i)
   if (wd?.[1] && /\.html?\b/i.test(c)) {

@@ -228,6 +228,7 @@ function sanitize(input: Record<string, unknown> | AppSettings): AppSettings {
   next.agentAutoApprove = next.agentAutoApprove === true
   next.agentThinkThrough = true
   next.agentImageGenEnabled = next.agentImageGenEnabled === true
+  next.agentLoopV2 = next.agentLoopV2 !== false
   next.setupComplete = next.setupComplete === true
   next.localApiEnabled = next.localApiEnabled === true
 
@@ -277,6 +278,7 @@ function sanitize(input: Record<string, unknown> | AppSettings): AppSettings {
 
   next.visionModelPath = typeof next.visionModelPath === 'string' ? next.visionModelPath : ''
   next.visionMmprojPath = typeof next.visionMmprojPath === 'string' ? next.visionMmprojPath : ''
+  next.applyModelPath = typeof next.applyModelPath === 'string' ? next.applyModelPath : ''
   next.imageGenModelPath =
     typeof next.imageGenModelPath === 'string' ? next.imageGenModelPath : ''
   next.imageGenVaePath =

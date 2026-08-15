@@ -1,5 +1,7 @@
 /** Shared types for context engine (repo map + @codebase + BM25 index). */
 
+import type { ProjectStack } from './projectStack'
+
 export interface RepoMapSnapshot {
   text: string
   fileCount: number
@@ -31,5 +33,12 @@ export interface ContextIndexStatus {
 export interface ProjectRulesSnapshot {
   text: string
   files: string[]
+  error?: string
+}
+
+export interface ProjectStackSnapshot {
+  text: string
+  markers: string[]
+  stacks: ProjectStack[]
   error?: string
 }

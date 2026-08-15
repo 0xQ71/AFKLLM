@@ -9,15 +9,18 @@ import type { ModelSlot, ModelSlotStatus } from '../../shared/modelSlots'
 import { defaultSlotStatus } from '../../shared/modelSlots'
 
 export type LlamaOptsFactory = (
-  slot: 'chat' | 'vision'
+  slot: 'chat' | 'vision' | 'apply'
 ) => LlamaProcessOptions | Promise<LlamaProcessOptions>
 
 /**
  * Serializes exclusive GPU use across chat / vision llama-server and
  * one-shot image-gen (sd-cli).
  *
- * Cold disk swap only:
- * - Leaving a slot always kills llama-server (weights leave process memory).
+ * Chat slot may keep a coresident apply llama-server (port+1) in the same VRAM.
+ * Vision / idle / imageGen always kill both processes (cold disk swap for VL).
+ *
+ * Cold disk swap for exclusive slots:
+ * - Leaving chat/vision always kills llama-server (weights leave process memory).
  * - Next slot always starts a fresh process that mmap/loads from disk.
  * - Never park a second model in system RAM (no --n-gpu-layers 0 warm keep).
  * - Slot loads force loadMode=mmap (never mmap+mlock) so pages are not pinned.
@@ -28,13 +31,18 @@ export class ModelSlotOrchestrator extends EventEmitter {
   private switchGen = 0
   private getLlama: () => LlamaProcessManager | null
   private setLlama: (mgr: LlamaProcessManager | null) => void
+  private getApplyLlama: () => LlamaProcessManager | null
+  private setApplyLlama: (mgr: LlamaProcessManager | null) => void
   private createLlama: (opts: LlamaProcessOptions) => LlamaProcessManager
   private optsFor: LlamaOptsFactory
   private ensureRuntime: () => Promise<void>
+  private lastApplyError?: string
 
   constructor(deps: {
     getLlama: () => LlamaProcessManager | null
     setLlama: (mgr: LlamaProcessManager | null) => void
+    getApplyLlama: () => LlamaProcessManager | null
+    setApplyLlama: (mgr: LlamaProcessManager | null) => void
     createLlama: (opts: LlamaProcessOptions) => LlamaProcessManager
     optsFor: LlamaOptsFactory
     ensureRuntime: () => Promise<void>
@@ -42,6 +50,8 @@ export class ModelSlotOrchestrator extends EventEmitter {
     super()
     this.getLlama = deps.getLlama
     this.setLlama = deps.setLlama
+    this.getApplyLlama = deps.getApplyLlama
+    this.setApplyLlama = deps.setApplyLlama
     this.createLlama = deps.createLlama
     this.optsFor = deps.optsFor
     this.ensureRuntime = deps.ensureRuntime
@@ -49,6 +59,10 @@ export class ModelSlotOrchestrator extends EventEmitter {
 
   getStatus(): ModelSlotStatus {
     return { ...this.status }
+  }
+
+  getApplyError(): string | undefined {
+    return this.lastApplyError ?? this.getApplyLlama()?.error
   }
 
   private setStatus(patch: Partial<ModelSlotStatus>): void {
@@ -78,6 +92,7 @@ export class ModelSlotOrchestrator extends EventEmitter {
     // until waitUntilReady finishes (up to ~10 min) before idle runs.
     if (target === 'idle' || target === 'imageGen') {
       void this.getLlama()?.stop()
+      void this.getApplyLlama()?.stop()
     }
     const gen = ++this.switchGen
     const run = this.switchChain.then(() =>
@@ -103,14 +118,20 @@ export class ModelSlotOrchestrator extends EventEmitter {
         await this.disposeLlama()
         return this.getStatus()
       }
-      const llama = this.getLlama()
-      const opts = await this.optsFor(target)
-      const sameModel =
-        llama?.currentState === 'ready' &&
-        llama.modelPath === opts.modelPath &&
-        (target !== 'vision' ||
-          (llama.mmprojPath || '') === (opts.mmprojPath || ''))
-      if (sameModel) return this.getStatus()
+      if (target === 'chat' || target === 'vision') {
+        const llama = this.getLlama()
+        const opts = await this.optsFor(target)
+        const sameChat =
+          llama?.currentState === 'ready' &&
+          llama.modelPath === opts.modelPath &&
+          (target !== 'vision' ||
+            (llama.mmprojPath || '') === (opts.mmprojPath || ''))
+        if (target === 'vision') {
+          if (sameChat) return this.getStatus()
+        } else if (sameChat && (await this.applyMatchesWanted(gen))) {
+          return this.getStatus()
+        }
+      }
     }
 
     this.setStatus({
@@ -124,7 +145,7 @@ export class ModelSlotOrchestrator extends EventEmitter {
         getLLMQueue().cancelAll('slot_switch')
       }
 
-      // Always drop the live llama-server first — never keep weights in RAM/VRAM.
+      // Always drop live llama-servers first — never keep weights in RAM/VRAM.
       await this.disposeLlama()
       if (gen !== this.switchGen) return this.getStatus()
 
@@ -161,6 +182,14 @@ export class ModelSlotOrchestrator extends EventEmitter {
         }
       }
 
+      this.setStatus({
+        phase: 'switching',
+        detail:
+          target === 'vision'
+            ? 'Loading vision model from disk…'
+            : 'Loading chat model from disk…'
+      })
+
       const llama = this.createLlama(opts)
       this.setLlama(llama)
       await llama.start({ force: true })
@@ -169,13 +198,23 @@ export class ModelSlotOrchestrator extends EventEmitter {
         return this.getStatus()
       }
 
+      let detail =
+        target === 'vision'
+          ? 'Vision model ready (loaded from disk)'
+          : 'Chat model ready (loaded from disk)'
+
+      if (target === 'chat') {
+        detail = await this.startApplyCoresident(gen, detail)
+        if (gen !== this.switchGen) {
+          await this.disposeLlama()
+          return this.getStatus()
+        }
+      }
+
       this.setStatus({
         slot: target,
         phase: 'ready',
-        detail:
-          target === 'vision'
-            ? 'Vision model ready (loaded from disk)'
-            : 'Chat model ready (loaded from disk)',
+        detail,
         error: undefined
       })
       return this.getStatus()
@@ -192,20 +231,103 @@ export class ModelSlotOrchestrator extends EventEmitter {
     }
   }
 
-  /** Kill llama-server and drop the manager so nothing stays mapped in RAM/VRAM. */
-  private async disposeLlama(): Promise<void> {
-    const llama = this.getLlama()
-    const port = llama?.port ?? 8080
-    if (llama) {
+  /** True when apply path empty and no process, or apply ready on the wanted path. */
+  private async applyMatchesWanted(gen: number): Promise<boolean> {
+    if (gen !== this.switchGen) return false
+    let applyOpts: LlamaProcessOptions
+    try {
+      applyOpts = await this.optsFor('apply')
+    } catch {
+      return !this.getApplyLlama()
+    }
+    const want = applyOpts.modelPath?.trim() || ''
+    const apply = this.getApplyLlama()
+    if (!want) {
+      return !apply || apply.currentState === 'stopped'
+    }
+    return (
+      !!apply &&
+      apply.currentState === 'ready' &&
+      apply.modelPath === want &&
+      !this.lastApplyError
+    )
+  }
+
+  /**
+   * Soft-start apply on port+1 after chat is ready. Failures leave chat up.
+   */
+  private async startApplyCoresident(
+    gen: number,
+    chatDetail: string
+  ): Promise<string> {
+    this.lastApplyError = undefined
+    let applyOpts: LlamaProcessOptions
+    try {
+      applyOpts = await this.optsFor('apply')
+    } catch (err) {
+      this.lastApplyError = err instanceof Error ? err.message : String(err)
+      return `${chatDetail} · Apply failed: ${this.lastApplyError}`
+    }
+
+    const path = applyOpts.modelPath?.trim() || ''
+    if (!path) {
+      return chatDetail
+    }
+    if (!existsSync(path)) {
+      this.lastApplyError = `Apply model not found: ${path}`
+      return `${chatDetail} · Apply failed: ${this.lastApplyError}`
+    }
+
+    this.setStatus({
+      phase: 'switching',
+      detail: 'Loading apply model into VRAM…'
+    })
+
+    applyOpts.loadMode = 'mmap'
+    const apply = this.createLlama(applyOpts)
+    this.setApplyLlama(apply)
+    try {
+      await apply.start({ force: true })
+      if (gen !== this.switchGen) return chatDetail
+      this.lastApplyError = undefined
+      return 'Chat + Apply ready (coresident in VRAM)'
+    } catch (err) {
+      this.lastApplyError = err instanceof Error ? err.message : String(err)
       try {
-        await llama.stop()
+        await apply.stop()
       } catch {
         /* ignore */
       }
-      this.setLlama(null)
+      this.setApplyLlama(null)
+      LlamaProcessManager.killListenersOnPort(applyOpts.port ?? 8081)
+      return `${chatDetail} · Apply failed: ${this.lastApplyError}`
     }
-    // Belt-and-suspenders: orphans survive when the manager was already null.
-    LlamaProcessManager.killListenersOnPort(port)
+  }
+
+  /** Kill chat + apply llama-servers so nothing stays mapped in RAM/VRAM. */
+  private async disposeLlama(): Promise<void> {
+    const llama = this.getLlama()
+    const apply = this.getApplyLlama()
+    const ports = new Set<number>()
+    if (llama) ports.add(llama.port)
+    if (apply) ports.add(apply.port)
+    if (ports.size === 0) ports.add(8080)
+
+    for (const mgr of [llama, apply]) {
+      if (!mgr) continue
+      try {
+        await mgr.stop()
+      } catch {
+        /* ignore */
+      }
+    }
+    this.setLlama(null)
+    this.setApplyLlama(null)
+    this.lastApplyError = undefined
+
+    for (const port of ports) {
+      LlamaProcessManager.killListenersOnPort(port)
+    }
     // Let the OS reclaim CUDA context / mmap pages before the next load.
     await new Promise((r) => setTimeout(r, 750))
   }

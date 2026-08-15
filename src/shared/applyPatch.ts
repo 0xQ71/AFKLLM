@@ -42,12 +42,130 @@ const UPDATE = '*** Update File:'
 const DELETE = '*** Delete File:'
 const MOVE = '*** Move to File:' // rename hint only — move not supported
 
-/** Strip optional fence; normalize newlines. */
+/** Models often emit "*** Begin Patch ***" / "*** End Patch ***" (trailing stars). */
+const BEGIN_RE = /^\*{3}\s*Begin Patch\b[\s*]*$/i
+const END_RE = /^\*{3}\s*End Patch\b[\s*]*$/i
+function isPatchEnd(trimmed: string): boolean {
+  return trimmed === END || END_RE.test(trimmed)
+}
+
+/** Strip optional fence; normalize newlines. Also convert unified diffs to apply_patch. */
 export function normalizePatchInput(raw: string): string {
   let s = raw.replace(/\r\n/g, '\n').trim()
   const fence = s.match(/^```(?:patch|diff)?\n([\s\S]*?)\n```$/)
   if (fence) s = fence[1]!.trim()
+  if (looksLikeUnifiedDiff(s)) {
+    s = convertUnifiedDiffToApplyPatch(s)
+  }
   return s
+}
+
+/** Detect git/unified diff that models often send instead of *** Begin Patch. */
+export function looksLikeUnifiedDiff(text: string): boolean {
+  const t = text.trim()
+  // Pure Codex form without unified ---/+++ headers → leave alone.
+  if (
+    /^\*{3}\s*(Add|Update|Delete) File:/im.test(t) &&
+    !/^---\s+(?:a\/)?\S+/m.test(t) &&
+    !/^diff --git\s+/m.test(t)
+  ) {
+    return false
+  }
+  if (
+    /^\*{3}\s*Begin Patch/im.test(t) &&
+    !/^---\s+(?:a\/)?\S+/m.test(t) &&
+    !/^\+\+\+\s+(?:b\/)?\S+/m.test(t) &&
+    !/^diff --git\s+/m.test(t)
+  ) {
+    return false
+  }
+  return (
+    /^---\s+(?:a\/)?\S+/m.test(t) ||
+    /^\+\+\+\s+(?:b\/)?\S+/m.test(t) ||
+    /^diff --git\s+/m.test(t)
+  )
+}
+
+/**
+ * Convert a simple unified/git diff into Codex apply_patch Update File form.
+ * Best-effort — multi-file diffs become multiple Update File ops.
+ */
+export function convertUnifiedDiffToApplyPatch(raw: string): string {
+  // Drop Codex wrappers if the model mixed them with unified headers.
+  const cleaned = raw
+    .replace(/\r\n/g, '\n')
+    .replace(/^\*{3}\s*Begin Patch\b[\s*]*\n?/gim, '')
+    .replace(/^\*{3}\s*End Patch\b[\s*]*\n?/gim, '')
+  const lines = cleaned.split('\n')
+  const out: string[] = ['*** Begin Patch']
+  let i = 0
+  let currentPath = ''
+  let inHunk = false
+
+  const flushPath = (): void => {
+    /* no-op — Update File header already emitted */
+  }
+
+  while (i < lines.length) {
+    const L = lines[i]!
+    const t = L.trim()
+    if (/^diff --git\s+/.test(t)) {
+      inHunk = false
+      i++
+      continue
+    }
+    // Already-Codex Update File inside a mixed patch — keep path, skip unified ---.
+    const updateHdr = t.match(/^\*{3}\s*Update File:\s*(\S+)/i) || t.match(/^Update File:\s*(\S+)/i)
+    if (updateHdr) {
+      currentPath = normalizeRelPath(updateHdr[1]!)
+      out.push(`*** Update File: ${currentPath}`)
+      inHunk = false
+      i++
+      continue
+    }
+    const minus = t.match(/^---\s+(?:a\/)?(.+)$/)
+    if (minus) {
+      const p = minus[1]!.replace(/^b\//, '').trim()
+      if (p !== '/dev/null') {
+        currentPath = normalizeRelPath(p)
+        out.push(`*** Update File: ${currentPath}`)
+      }
+      inHunk = false
+      i++
+      continue
+    }
+    if (/^\+\+\+\s+/.test(t)) {
+      i++
+      continue
+    }
+    if (t.startsWith('@@')) {
+      out.push('@@')
+      inHunk = true
+      i++
+      continue
+    }
+    if (inHunk || currentPath) {
+      if (L.startsWith(' ') || L.startsWith('-') || L.startsWith('+')) {
+        out.push(L)
+        inHunk = true
+        i++
+        continue
+      }
+      if (t === '' && inHunk) {
+        out.push(' ')
+        i++
+        continue
+      }
+      if (/^index\s+|^\-\-\-\s+|^\+\+\+\s+|^diff --git/.test(t)) {
+        inHunk = false
+        continue
+      }
+    }
+    i++
+  }
+  flushPath()
+  out.push('*** End Patch')
+  return out.join('\n')
 }
 
 export function parseApplyPatch(raw: string): ParseApplyPatchResult {
@@ -58,22 +176,24 @@ export function parseApplyPatch(raw: string): ParseApplyPatchResult {
 
   const lines = text.split('\n')
   let i = 0
-  // Missing Begin/End OK if file ops present
-  if (lines[i]?.trim() === BEGIN) i++
+  // Missing Begin/End OK if file ops present; tolerate trailing "***".
+  if (lines[i] && (lines[i]!.trim() === BEGIN || BEGIN_RE.test(lines[i]!.trim()))) i++
 
   const ops: PatchOp[] = []
 
   while (i < lines.length) {
     const line = lines[i]!.trimEnd()
     const trimmed = line.trim()
-    if (!trimmed || trimmed === END) {
+    if (!trimmed || isPatchEnd(trimmed)) {
       i++
-      if (trimmed === END) break
+      if (isPatchEnd(trimmed)) break
       continue
     }
 
-    if (trimmed.startsWith(ADD)) {
-      const path = trimmed.slice(ADD.length).trim()
+    if (trimmed.startsWith(ADD) || /^Add File:/i.test(trimmed)) {
+      const path = trimmed.startsWith(ADD)
+        ? trimmed.slice(ADD.length).trim()
+        : trimmed.replace(/^Add File:/i, '').trim()
       if (!path) return { ok: false, ops: [], error: 'Add File missing path' }
       i++
       const addLines: string[] = []
@@ -81,11 +201,15 @@ export function parseApplyPatch(raw: string): ParseApplyPatchResult {
         const L = lines[i]!
         const t = L.trim()
         if (
-          t === END ||
+          isPatchEnd(t) ||
           t.startsWith('*** Add File:') ||
           t.startsWith('*** Update File:') ||
           t.startsWith('*** Delete File:') ||
-          t.startsWith('*** Move to File:')
+          t.startsWith('*** Move to File:') ||
+          /^Add File:/i.test(t) ||
+          /^Update File:/i.test(t) ||
+          /^Delete File:/i.test(t) ||
+          /^Move to File:/i.test(t)
         ) {
           break
         }
@@ -105,18 +229,29 @@ export function parseApplyPatch(raw: string): ParseApplyPatchResult {
       continue
     }
 
-    if (trimmed.startsWith(DELETE)) {
-      const path = trimmed.slice(DELETE.length).trim()
+    if (trimmed.startsWith(DELETE) || /^Delete File:/i.test(trimmed)) {
+      const path = trimmed.startsWith(DELETE)
+        ? trimmed.slice(DELETE.length).trim()
+        : trimmed.replace(/^Delete File:/i, '').trim()
       if (!path) return { ok: false, ops: [], error: 'Delete File missing path' }
       ops.push({ type: 'delete', path: normalizeRelPath(path) })
       i++
       continue
     }
 
-    if (trimmed.startsWith(UPDATE) || trimmed.startsWith(MOVE)) {
+    if (
+      trimmed.startsWith(UPDATE) ||
+      trimmed.startsWith(MOVE) ||
+      /^Update File:/i.test(trimmed) ||
+      /^Move to File:/i.test(trimmed)
+    ) {
       const path = trimmed.startsWith(UPDATE)
         ? trimmed.slice(UPDATE.length).trim()
-        : trimmed.slice(MOVE.length).trim()
+        : trimmed.startsWith(MOVE)
+          ? trimmed.slice(MOVE.length).trim()
+          : /^Update File:/i.test(trimmed)
+            ? trimmed.replace(/^Update File:/i, '').trim()
+            : trimmed.replace(/^Move to File:/i, '').trim()
       if (!path) return { ok: false, ops: [], error: 'Update File missing path' }
       i++
       if (i < lines.length && lines[i]!.trim().startsWith(MOVE)) {
@@ -129,11 +264,15 @@ export function parseApplyPatch(raw: string): ParseApplyPatchResult {
         const L = lines[i]!
         const t = L.trim()
         if (
-          t === END ||
+          isPatchEnd(t) ||
           t.startsWith('*** Add File:') ||
           t.startsWith('*** Update File:') ||
           t.startsWith('*** Delete File:') ||
-          t.startsWith('*** Move to File:')
+          t.startsWith('*** Move to File:') ||
+          /^Add File:/i.test(t) ||
+          /^Update File:/i.test(t) ||
+          /^Delete File:/i.test(t) ||
+          /^Move to File:/i.test(t)
         ) {
           break
         }
@@ -278,19 +417,65 @@ export function findFuzzyLineRange(
   if (needles.length === 0) return { ok: false }
 
   const hay = content.split('\n').map(normalizeLineForFuzzy)
-  const matches: Array<{ start: number; end: number }> = []
-  for (let i = 0; i <= hay.length - needles.length; i++) {
-    let ok = true
-    for (let j = 0; j < needles.length; j++) {
-      if (hay[i + j] !== needles[j]) {
-        ok = false
-        break
+
+  const tryMatch = (need: string[]): { start: number; end: number }[] => {
+    const matches: Array<{ start: number; end: number }> = []
+    if (need.length === 0) return matches
+    for (let i = 0; i <= hay.length - need.length; i++) {
+      let ok = true
+      for (let j = 0; j < need.length; j++) {
+        if (hay[i + j] !== need[j]) {
+          ok = false
+          break
+        }
       }
+      if (ok) matches.push({ start: i, end: i + need.length })
     }
-    if (ok) matches.push({ start: i, end: i + needles.length })
+    return matches
   }
-  if (matches.length !== 1) return { ok: false }
-  return { ok: true, start: matches[0]!.start, end: matches[0]!.end }
+
+  let matches = tryMatch(needles)
+  if (matches.length === 1) {
+    return { ok: true, start: matches[0]!.start, end: matches[0]!.end }
+  }
+
+  // Shrink from both ends (drop weak context) until a unique window remains.
+  let lo = 0
+  let hi = needles.length
+  while (hi - lo > 2) {
+    const trimmed = needles.slice(lo + 1, hi - 1)
+    if (trimmed.length < 1) break
+    matches = tryMatch(trimmed)
+    if (matches.length === 1) {
+      return { ok: true, start: matches[0]!.start, end: matches[0]!.end }
+    }
+    if (matches.length === 0) {
+      // Try dropping only leading or only trailing context next.
+      const dropLead = tryMatch(needles.slice(lo + 1, hi))
+      if (dropLead.length === 1) {
+        return { ok: true, start: dropLead[0]!.start, end: dropLead[0]!.end }
+      }
+      const dropTrail = tryMatch(needles.slice(lo, hi - 1))
+      if (dropTrail.length === 1) {
+        return { ok: true, start: dropTrail[0]!.start, end: dropTrail[0]!.end }
+      }
+      break
+    }
+    lo++
+    hi--
+  }
+
+  // Prefer changed lines only (-/+) when context is noisy: caller passes mixed;
+  // here retry with non-empty needles that look distinctive (length ≥ 8).
+  const distinctive = needles.filter((n) => n.length >= 8)
+  if (distinctive.length >= 1 && distinctive.length < needles.length) {
+    matches = tryMatch(distinctive)
+    if (matches.length === 1) {
+      return { ok: true, start: matches[0]!.start, end: matches[0]!.end }
+    }
+  }
+
+  return { ok: false }
 }
 
 /**
@@ -336,18 +521,32 @@ function mapFuzzyAfterLines(
 export function applySearchReplaceFuzzy(
   original: string,
   searchBlock: string,
-  replaceBlock: string
-): { ok: true; content: string; normalized?: boolean } | { ok: false; error: string } {
+  replaceBlock: string,
+  replaceAll = false
+):
+  | { ok: true; content: string; normalized?: boolean; replacements: number }
+  | { ok: false; error: string } {
   const tryOnce = (
     hay: string,
     needle: string,
     rep: string
-  ): { ok: true; content: string } | { ok: false; error: string } => {
+  ):
+    | { ok: true; content: string; replacements: number }
+    | { ok: false; error: string } => {
     if (!needle) return { ok: false, error: 'not found' }
     const n = hay.split(needle).length - 1
     if (n === 0) return { ok: false, error: 'not found' }
-    if (n > 1) return { ok: false, error: `matched ${n} times — must be unique` }
-    return { ok: true, content: hay.replace(needle, rep) }
+    if (n > 1 && !replaceAll) {
+      return {
+        ok: false,
+        error: `matched ${n} times — must be unique. Pass replace_all=true to replace all ${n} occurrences.`
+      }
+    }
+    return {
+      ok: true,
+      content: replaceAll && n > 1 ? hay.split(needle).join(rep) : hay.replace(needle, rep),
+      replacements: n
+    }
   }
 
   const exact = tryOnce(original, searchBlock, replaceBlock)
@@ -358,13 +557,15 @@ export function applySearchReplaceFuzzy(
   const normReplace = replaceBlock.replace(/\r\n/g, '\n')
   const soft = tryOnce(normOrig, normSearch, normReplace)
   if (soft.ok) {
-    return { ok: true, content: soft.content, normalized: true }
+    return { ok: true, content: soft.content, normalized: true, replacements: soft.replacements }
   }
 
   if (exact.error?.includes('times') || soft.error?.includes('times')) {
     return {
       ok: false,
-      error: `search_block matched multiple times — must be unique`
+      error: exact.error?.includes('times')
+        ? exact.error
+        : (soft.error ?? 'search_block matched multiple times — must be unique')
     }
   }
 
@@ -389,7 +590,8 @@ export function applySearchReplaceFuzzy(
   return {
     ok: true,
     content: eol === '\r\n' ? next.replace(/\n/g, '\r\n') : next,
-    normalized: true
+    normalized: true,
+    replacements: 1
   }
 }
 
@@ -414,7 +616,8 @@ export const EXPLORE_SUBAGENT_TOOL_NAMES = [
   'read_file',
   'list_directory',
   'search_codebase',
-  'web_search'
+  'web_search',
+  'get_diagnostics'
 ] as const
 
 export function filterExploreToolSchemas<T extends { function: { name: string } }>(

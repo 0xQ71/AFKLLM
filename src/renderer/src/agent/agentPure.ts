@@ -3,6 +3,8 @@
  */
 
 import { looksLikeOpenHtmlCommand } from '../../../shared/localPreview'
+import { contentLooksStructurallyComplete as contentLooksStructurallyCompleteV2 } from './loop/completeness'
+import { advanceTodosOnEvidence } from './loop/plan'
 
 export { looksLikeOpenHtmlCommand }
 
@@ -46,6 +48,12 @@ export function apiContentText(content: ApiMessage['content']): string {
 export const AGENT_CHECKLIST_MSG_ID = 'agent-checklist'
 /** Cursor-style todo plan authored by the model via <plan>…</plan>. */
 export const AGENT_TODO_MSG_ID = 'agent-todo'
+
+/** Live plan card id, or an archived prior-turn plan (`agent-todo-<ts>`). */
+export function isAgentTodoMessageId(id: string | undefined | null): boolean {
+  if (!id) return false
+  return id === AGENT_TODO_MSG_ID || id.startsWith(`${AGENT_TODO_MSG_ID}-`)
+}
 
 export type AgentTodoStatus = 'pending' | 'in_progress' | 'done'
 
@@ -274,6 +282,7 @@ export function sanitizeThinkProse(text: string | null | undefined): string {
   inner = stripPlanLeakFromThink(inner)
   inner = stripCodeLeakFromThink(inner)
   if (!inner || thinkBodyLooksLikeCodeDump(`<think>${inner}</think>`)) return ''
+  if (/^(Планирую:|Planning:)/i.test(inner.trim())) return inner
   if (thinkLooksLikeChecklist(inner)) return ''
   // Drop fenced code / obvious markup leftovers.
   inner = inner
@@ -368,14 +377,12 @@ export function wrapThinkForUi(prose: string): string {
   return `<think>\n${clean}\n</think>`
 }
 
-/** HTML/markup that already closes — do not treat as truncated mid-write. */
-export function contentLooksStructurallyComplete(content: string): boolean {
-  const t = content.trim()
-  if (!t) return false
-  if (/<\/html\s*>/i.test(t)) return true
-  if (/<\/body\s*>/i.test(t) && /<\/html\s*>/i.test(t)) return true
-  // Non-HTML: balanced enough closing brace / no open string — leave to other checks
-  return false
+/** Language-aware completeness (HTML `</html>`, braces, JSON, Python). */
+export function contentLooksStructurallyComplete(
+  content: string,
+  relativePath = ''
+): boolean {
+  return contentLooksStructurallyCompleteV2(content, relativePath)
 }
 
 /**
@@ -437,16 +444,250 @@ export function parseReadFileMeta(content: string): {
   }
 }
 
-const LANDING_SECTION_STEPS = [
-  'Каркас HTML + CSS',
-  'Navbar',
-  'Hero',
-  'Features',
-  'How it works',
-  'Social proof',
-  'FAQ',
-  'Footer'
+type LandingSectionKey =
+  | 'scaffold'
+  | 'navbar'
+  | 'hero'
+  | 'features'
+  | 'how'
+  | 'social'
+  | 'faq'
+  | 'footer'
+  | 'browser'
+  | 'other'
+
+const LANDING_SECTION_ORDER: Exclude<LandingSectionKey, 'browser' | 'other'>[] = [
+  'scaffold',
+  'navbar',
+  'hero',
+  'features',
+  'how',
+  'social',
+  'faq',
+  'footer'
 ]
+
+/** Map a plan row to a landing section key for de-duplication. */
+export function landingSectionKey(text: string): LandingSectionKey {
+  const t = text.trim()
+  if (!t) return 'other'
+  if (isBrowserPlanStep(t)) return 'browser'
+  if (/каркас|html\s*\+\s*css|^bootstrap\b/i.test(t) && t.length < 48) return 'scaffold'
+  if (/^секц\w*\s*:\s*/i.test(t) || t.length < 28 || /^(navbar|hero|features?|faq|footer|how|social)/i.test(t)) {
+    if (/каркас|html\s*\+|bootstrap/i.test(t)) return 'scaffold'
+    if (/navbar|навиг|шапк/i.test(t)) return 'navbar'
+    if (/\bhero\b|главн\w*\s+экран|jumbotron/i.test(t)) return 'hero'
+    if (/feature|возможн|преимущ/i.test(t)) return 'features'
+    if (/how\s*it\s*works|как\s*работа/i.test(t)) return 'how'
+    if (/social|trust|отзыв|доказат/i.test(t)) return 'social'
+    if (/\bfaq\b|вопрос/i.test(t)) return 'faq'
+    if (/footer|подвал/i.test(t)) return 'footer'
+  }
+  // Long descriptive rows — still one section each
+  if (/\bnavbar\b|навигац|логотип\s+northline|cta-?кнопк/i.test(t) && !/\bhero\b/i.test(t.slice(0, 40))) {
+    return 'navbar'
+  }
+  if (/\bhero\b|hero-секц|крупн\w*\s+заголов/i.test(t)) return 'hero'
+  if (/feature|возможн|преимущ|карточки/i.test(t)) return 'features'
+  if (/how\s*it\s*works|как\s*работа/i.test(t)) return 'how'
+  if (/social\s*proof|trust|отзыв|доказат/i.test(t)) return 'social'
+  if (/\bfaq\b|вопрос/i.test(t)) return 'faq'
+  if (/footer|подвал|копирайт/i.test(t)) return 'footer'
+  if (/navbar|навиг|шапк|логотип/i.test(t)) return 'navbar'
+  if (/каркас|html\s*\+|bootstrap|полный\s+лендинг|single[- ]?file/i.test(t)) return 'scaffold'
+  return 'other'
+}
+
+/**
+ * Drop duplicate landing rows (bare "Navbar" + long "Реализовать Navbar…").
+ * Prefer the more specific (longer) description; keep canonical section order.
+ */
+export function dedupeLandingPlanSteps(steps: AgentTodoStep[]): AgentTodoStep[] {
+  if (steps.length <= 1) return steps
+  const best = new Map<LandingSectionKey, AgentTodoStep>()
+  const others: AgentTodoStep[] = []
+  for (const s of steps) {
+    const key = landingSectionKey(s.text)
+    if (key === 'other') {
+      others.push(s)
+      continue
+    }
+    const prev = best.get(key)
+    if (!prev) {
+      best.set(key, s)
+      continue
+    }
+    // Prefer longer / more specific over bare labels like "Navbar".
+    const prevBare = isBareLandingSectionStep(prev.text) || prev.text.trim().length < 24
+    const nextBare = isBareLandingSectionStep(s.text) || s.text.trim().length < 24
+    if (prevBare && !nextBare) best.set(key, s)
+    else if (!prevBare && nextBare) {
+      /* keep prev */
+    } else if (s.text.trim().length > prev.text.trim().length) best.set(key, s)
+  }
+
+  const ordered: AgentTodoStep[] = []
+  for (const k of LANDING_SECTION_ORDER) {
+    const s = best.get(k)
+    if (s) ordered.push(s)
+  }
+  ordered.push(...others)
+  const browser = best.get('browser')
+  if (browser) ordered.push(browser)
+
+  return ordered.slice(0, 10).map((s, i) => ({
+    ...s,
+    id: `s${i + 1}`,
+    status: (i === 0 ? 'in_progress' : 'pending') as AgentTodoStep['status']
+  }))
+}
+
+/** Plan rows that escalate to rewriting the whole file — never keep these. */
+export function isFullRewriteFallbackPlanStep(text: string): boolean {
+  const t = text.trim()
+  if (!t) return false
+  return (
+    /если\s+(патч|patch)\s+не\s+сработ/i.test(t) ||
+    /патч\s+не\s+сработал\s*[—\-–:].*перепис/i.test(t) ||
+    /переписать\s+(файл\s+)?целик/i.test(t) ||
+    /перепис(ать|ывать)\s+(весь\s+)?файл\s+(с\s+нуля|целиком|полностью)/i.test(t) ||
+    /rewrite\s+(the\s+)?(whole|entire)\s+file/i.test(t) ||
+    /full\s+rewrite\s+(if|when|fallback)/i.test(t) ||
+    /overwrite\s+(the\s+)?(whole|entire)\s+file/i.test(t) ||
+    /иначе\s+закрыть/i.test(t) && /перепис|rewrite|overwrite/i.test(t)
+  )
+}
+
+/** Plan rows that name tools / shell / "close" — not product work from the user prompt. */
+export function isToolOrientedPlanStep(text: string): boolean {
+  const t = text.trim()
+  if (!t) return true
+  if (isFullRewriteFallbackPlanStep(t)) return true
+  if (
+    /\b(execute_terminal_command|write_file|read_file|apply_patch|apply_diff|generate_image|create_directory|list_directory|search_codebase)\b/i.test(
+      t
+    )
+  ) {
+    return true
+  }
+  if (/\b(Start-Process|Get-Content|Invoke-Item|Select-String|Measure-Object)\b/i.test(t)) {
+    return true
+  }
+  if (/проверк\w*\s+синтаксис|синтаксис\s+html|html\s+syntax|syntax\s+check/i.test(t)) {
+    return true
+  }
+  if (/^(закрыть|close|стоп|stop|конец)\.?$/i.test(t)) return true
+  return false
+}
+
+/** True when the user is asking to build a full landing / new page from scratch. */
+export function looksLikeLandingBuildTask(userText: string): boolean {
+  const t = userText ?? ''
+  if (!t.trim()) return false
+  if (
+    /исправ|поправ|убери|добавь|цвет|theme|тем[аы]|faq|перепиши\s+блок|только\s+(css|html|faq)|white|серый|gray|grey/i.test(
+      t
+    ) &&
+    !/лендинг|landing|одностранич|bootstrap\s*5|с\s*нуля|новый\s+сайт/i.test(t)
+  ) {
+    // Targeted fix language without “build a landing” → not a build task.
+    if (t.length < 900) return false
+  }
+  return (
+    /лендинг|landing\s*page|одностранич|single[- ]?page|bootstrap\s*5|создай\s+(сайт|страниц|лендинг)|напиши\s+(лендинг|index\.html)|hero|navbar.*footer|все\s+секц/i.test(
+      t
+    ) ||
+    (/index\.html/i.test(t) && /navbar|hero|features|faq|footer/i.test(t) && t.length > 400)
+  )
+}
+
+/** Bare “Секция: Navbar” rows — junk on a surgical FAQ/CSS fix. */
+export function isBareLandingSectionStep(text: string): boolean {
+  const t = text
+    .trim()
+    .replace(/^секци[яюи]?\s*:\s*/i, '')
+    .replace(/^section\s*:\s*/i, '')
+    .replace(/^["'`]+|["'`]+$/g, '')
+    .replace(/\.$/, '')
+  return /^(navbar|навигац\w*|hero|features?|возможн\w*|how\s*it\s*works|как\s*работа\w*|social\s*proof|trust|faq|footer|подвал|каркас(\s+html.*)?|html\s*\+\s*css)$/i.test(
+    t
+  )
+}
+
+/** CSS class / Bootstrap token — never a product plan row. */
+export function isCssClassPlanStep(text: string): boolean {
+  const raw = text.trim()
+  // Model dumps selectors as: Секция: 'btn-primary' / Секция: "card"
+  if (/^секци[яюи]?\s*:\s*['"`][\w.-]+['"`]\s*$/i.test(raw)) return true
+  const t = raw
+    .replace(/^секци[яюи]?\s*:\s*/i, '')
+    .replace(/^section\s*:\s*/i, '')
+    .replace(/^["'`]+|["'`]+$/g, '')
+    .replace(/^\./, '')
+    .trim()
+  if (!t || t.length > 48) return false
+  if (/\s/.test(t)) return false
+  return (
+    /^(btn|badge|card|nav-|navbar-toggler|accordion|form-|col-|row|container|dropdown|list-group|spinner|alert|modal|offcanvas|pagination|progress|toast)[\w-]*/i.test(
+      t
+    ) ||
+    /^(primary|secondary|success|danger|warning|info|light|dark)$/i.test(t) ||
+    /^[a-z][\w-]*--[\w-]+$/i.test(t)
+  )
+}
+
+export function isLandingSectionToken(text: string): boolean {
+  const t = text
+    .trim()
+    .replace(/^секци[яюи]?\s*:\s*/i, '')
+    .replace(/^section\s*:\s*/i, '')
+    .replace(/^["'`]+|["'`]+$/g, '')
+    .trim()
+  return /^(navbar|навигац\w*|hero|features?|возможн\w*|how(\s*it\s*works)?|как\s*работа\w*|social(\s*proof)?|trust|faq|footer|подвал|каркас)$/i.test(
+    t
+  )
+}
+
+/** True when ≥ half the steps are tool/shell fluff (bad PLAN_ONLY from the model). */
+export function looksLikeToolOrientedPlan(steps: AgentTodoStep[]): boolean {
+  if (!steps.length) return true
+  const bad = steps.filter(
+    (s) => isToolOrientedPlanStep(s.text) || isJunkPlanStep(s.text)
+  ).length
+  const hasSection = steps.some((s) =>
+    /navbar|hero|feature|faq|footer|каркас|how\s*it|social|trust|навиг|секц/i.test(s.text)
+  )
+  // Short edit plans without section labels are OK — do NOT treat as tool fluff.
+  if (!hasSection && steps.length <= 5) {
+    return bad >= Math.ceil(steps.length / 2)
+  }
+  return bad >= Math.ceil(steps.length / 2)
+}
+
+export type CoercePlanOptions = {
+  userText?: string
+  /** When true, never inject the full landing checklist. */
+  surgical?: boolean
+}
+
+/**
+ * Keep plan grounded in the model's own steps.
+ * Empty / tool-name / status-noise rows are dropped; nothing is invented.
+ */
+export function coerceProductPlan(
+  steps: AgentTodoStep[] | null | undefined,
+  _opts?: CoercePlanOptions
+): AgentTodoStep[] {
+  const cleaned = (steps ?? []).filter(
+    (s) => !isJunkPlanStep(s.text) && !isToolOrientedPlanStep(s.text)
+  )
+  if (!cleaned.length) return []
+  return cleaned.slice(0, 10).map((s, i) => ({
+    ...s,
+    id: `s${i + 1}`,
+    status: (i === 0 ? 'in_progress' : 'pending') as AgentTodoStep['status']
+  }))
+}
 
 /** Parse <plan>…</plan> or a markdown [Plan] / checklist body into Cursor-style todo steps. */
 export function parsePlanBlock(text: string | null | undefined): AgentTodoStep[] | null {
@@ -489,21 +730,7 @@ export function parsePlanBlock(text: string | null | undefined): AgentTodoStep[]
   }
   if (steps.length === 0) return null
   steps[0]!.status = 'in_progress'
-  return steps.slice(0, 10)
-}
-
-/** Fallback plan when the model skips <plan> — still show the UI card. */
-export function defaultLandingPlanSteps(): AgentTodoStep[] {
-  const steps: AgentTodoStep[] = [
-    ...LANDING_SECTION_STEPS,
-    'Открыть index.html в браузере'
-  ].map((text, i) => ({
-    id: `s${i + 1}`,
-    text,
-    status: 'pending' as const
-  }))
-  steps[0]!.status = 'in_progress'
-  return steps
+  return dedupeLandingPlanSteps(steps.slice(0, 14))
 }
 
 /** Split “все секции (a, b, c)” / “полный лендинг” mega-steps into atomic todos. */
@@ -514,7 +741,7 @@ export function splitCompoundPlanStep(text: string): string[] {
       t
     )
   if (mega && /navbar|hero|feature|faq|footer|bootstrap|секц|лендинг|landing/i.test(t)) {
-    return [...LANDING_SECTION_STEPS]
+    return [t]
   }
   if (t.length < 60) return [t]
   const grouped = t.match(/\(([^)]{15,})\)/)
@@ -523,7 +750,11 @@ export function splitCompoundPlanStep(text: string): string[] {
       .split(/\s*[+,;/]\s*|\s+и\s+/i)
       .map((x) => x.trim())
       .filter((x) => x.length >= 2)
-    if (parts.length >= 3) {
+    if (
+      parts.length >= 3 &&
+      parts.filter((p) => isLandingSectionToken(p)).length >= 3 &&
+      !parts.some((p) => isCssClassPlanStep(p) && !isLandingSectionToken(p))
+    ) {
       return parts.map((p) => (/^секц/i.test(p) ? p : `Секция: ${p}`))
     }
   }
@@ -533,7 +764,14 @@ export function splitCompoundPlanStep(text: string): string[] {
       .split(/\s*,\s*/)
       .map((x) => x.replace(/\s+и\s+/gi, ' ').trim())
       .filter((x) => x.length >= 3 && x.length < 80)
-    if (parts.length >= 3) return parts
+    // "navbar, card, btn-primary…" → CSS junk; only split real landing section lists.
+    if (
+      parts.length >= 3 &&
+      parts.filter((p) => isLandingSectionToken(p)).length >= Math.ceil(parts.length * 0.6) &&
+      parts.every((p) => isLandingSectionToken(p) || !isCssClassPlanStep(p))
+    ) {
+      return parts
+    }
   }
   return [t]
 }
@@ -613,28 +851,132 @@ export function isMetaOrSummaryPlanStep(text: string): boolean {
   const t = text.trim()
   if (!t) return true
   if (isBrowserPlanStep(t)) return false
+  if (isToolOrientedPlanStep(t)) return true
   return (
     /сводк|summary|заключен|отчёт|отчет|report\s+completion/i.test(t) ||
     /подтвердить|валидац|отсутствие\s+ошибок|корректность\s+отображ/i.test(t) ||
-    /проверк\w*\s+(отсутств|ошибок|корректн|отображ|вёрст|верст|html)/i.test(t) ||
+    /проверк\w*\s+(отсутств|ошибок|корректн|отображ|вёрст|верст|html|синтаксис)/i.test(t) ||
     /give\s+(a\s+)?brief|краткую\s+сводк|пользователю\s+на\s+(русск|english)/i.test(t) ||
-    /^(verify|validate|check|done|finish|summarize|report)\b/i.test(t) ||
+    /кратко\s+сообщ|сообщ\w*\s+пользовател|inform\s+the\s+user|tell\s+the\s+user|о\s+результатах/i.test(
+      t
+    ) ||
+    /^(verify|validate|check|done|finish|summarize|report|закрыть|close)\b/i.test(t) ||
     /напиши\s+(кратк|итог|заключен)|write\s+(a\s+)?(short\s+)?(summary|closing)/i.test(t)
   )
+}
+
+/** «с NorthLine на AFKLLM» / «замени Foo на Bar» — literal global rename in a file. */
+export function parseGlobalRenameIntent(
+  text: string
+): { from: string; to: string } | null {
+  const t = text.trim()
+  if (!t || t.length > 220) return null
+  if (!/измени|замени|переимен|помен|rename|replace|везде/i.test(t)) return null
+  const m =
+    t.match(
+      /(?:с|from)\s+([A-Za-z][\w.-]{1,48})\s+(?:на|to)\s+([A-Za-z][\w.-]{1,48})/i
+    ) ||
+    t.match(
+      /(?:замени|заменить|поменяй|измени|rename|replace)\s+([A-Za-z][\w.-]{1,48})\s+(?:на|to|with)\s+([A-Za-z][\w.-]{1,48})/i
+    )
+  if (!m?.[1] || !m?.[2]) return null
+  if (m[1].toLowerCase() === m[2].toLowerCase()) return null
+  return { from: m[1], to: m[2] }
+}
+
+/** «…затем открой его» after an edit. */
+export function wantsOpenAfterEdit(text: string): boolean {
+  return /(?:затем|потом|после\s+этого|and\s+then|then).{0,24}(открой|open)|открой\s+(его|её|ее|файл|лендинг|index)|then\s+open|and\s+open\s+it/i.test(
+    text
+  )
+}
+
+export function replaceAllCi(content: string, from: string, to: string): string {
+  if (!from) return content
+  const escaped = from.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return content.replace(new RegExp(escaped, 'gi'), to)
+}
+
+export function countOccurrencesCi(content: string, needle: string): number {
+  if (!needle) return 0
+  const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return content.match(new RegExp(escaped, 'gi'))?.length ?? 0
+}
+
+/** Think/plan claiming the job is already done before any tools ran. */
+export function isFalseSuccessProse(prose: string): boolean {
+  const t = prose.trim()
+  if (!t) return false
+  return (
+    /^(готово|сделано|done)[!.,:\s]/i.test(t) ||
+    /все\s+упоминания\s+\w+\s+заменен/i.test(t) ||
+    /страница\s+открыта\s+в\s+браузер/i.test(t) ||
+    /что\s+изменилось\s*:|как\s+проверить\s*:|what\s+changed\s*:/i.test(t) ||
+    /заменен[ыао]\s+на\s+\w+.*(открыт|браузер|проверк)/i.test(t)
+  )
+}
+
+/** Status / fake-success bubbles must not enter the model prompt. */
+export function isAgentChatNoise(content: string | null | undefined): boolean {
+  const t = (content ?? '').trim()
+  if (!t) return true
+  if (/^[↻⏹]/.test(t)) return true
+  if (/^(Открыто|Opened)\.?\s*$/i.test(t)) return true
+  if (isFalseSuccessProse(t)) return true
+  if (/выдала план|не вызвала (ни одного )?инструмент|never called (a single )?tool/i.test(t)) {
+    return true
+  }
+  if (t.length < 400 && /уже полный|точечная правка|FILE_COMPLETE/i.test(t)) return true
+  return false
 }
 
 /** Ellipsis / code / HTML crumbs that must never become plan rows. */
 export function isJunkPlanStep(text: string): boolean {
   const t = text.trim()
   if (!t || isEllipsisOnly(t)) return true
-  if (isFluffPlanStep(t)) return true
-  if (isMetaOrSummaryPlanStep(t)) return true
+  if (isFullRewriteFallbackPlanStep(t)) return true
+  if (isToolOrientedPlanStep(t)) return true
+  if (isCssClassPlanStep(t)) return true
+  // Markdown / think leak into plan: "*План хирургического вмешательства:**"
+  // Do not use \b after Cyrillic — JS treats letters as non-word without the unicode flag.
+  if (/^\*+\s*план|^план\s+хирург|^#{1,6}\s*план|вмешательства\s*:\*+/i.test(t)) return true
+  if (/^секци[яюи]?\s*:\s*['"`]?[\w.-]+['"`]?\s*$/i.test(t) && isCssClassPlanStep(t)) return true
   if (/^```/.test(t) || /```/.test(t)) return true
   if (/^</.test(t)) return true
   if (/<!DOCTYPE|<html[\s>]|<style[\s>]|<script[\s>]|<head[\s>]|<body[\s>]/i.test(t)) return true
   if (/^[{[]/.test(t) && t.length < 48) return true
   if (/^(write_file|call:|tool_call|function\s*call)/i.test(t)) return true
   if (/^(создаю|пишу|writing|creating)\s+index\.html/i.test(t) && t.length < 80) return true
+  // Agent status / falseSuccess / recovery lines must never become plan rows.
+  if (/^[↻⏹]/.test(t)) return true
+  if (isFalseSuccessProse(t)) return true
+  if (/^\*+\s*что\s+изменилось|^\*+\s*как\s+проверить|^что\s+изменилось\s*:|^как\s+проверить\s*:/i.test(t)) {
+    return true
+  }
+  // Report crumbs like «Заголовок в секции …: NorthLine -> AFKLLM», not action steps.
+  if (/заголовок\s+в\s+секции|подзаголовки\s+и\s+тексты|все\s+упоминания\s+заменен/i.test(t)) {
+    return true
+  }
+  if (
+    /незакрытые\s+шаги|не\s+рапортуем\s+успех|задача\s+не\s+выполнена|plan\s+still\s+has\s+open/i.test(
+      t
+    )
+  ) {
+    return true
+  }
+  if (
+    /checking\s+for\s+missing|acceptance\s+incomplete|доделываю\s+план|finishing\s+the\s+plan|missing\s+files\s+before/i.test(
+      t
+    )
+  ) {
+    return true
+  }
+  if (/модель\s+не\s+вызвала|opened\s+the\s+complete\s+index|открыл\s+готов(ый|ое)\s+index/i.test(t)) {
+    return true
+  }
+  if (/^готово[!.;]?\s*(лендинг|landing|northline|index|все)/i.test(t)) return true
+  if (/что\s+реализовано\s*:/i.test(t)) return true
+  if (/исправил\s+ширин|fixed\s+faq\s+width|faq\s+answers?\s+not\s+full/i.test(t)) return true
   return false
 }
 
@@ -644,19 +986,137 @@ export type AdvanceTodoContext = {
   path?: string
 }
 
-const PLAN_CONTENT_RULES: { step: RegExp; hay: RegExp }[] = [
-  { step: /каркас|html\s*\+|bootstrap|\bcss\b/i, hay: /<!DOCTYPE\s+html|<html[\s>]/i },
-  { step: /navbar|навиг|шапк/i, hay: /<nav\b|id=["']navbar|class=["'][^"']*navbar/i },
-  { step: /hero|главн\w*\s+экран|jumbotron/i, hay: /id=["']hero\b|class=["'][^"']*hero|#hero\b/i },
-  { step: /feature|возможн|преимущ/i, hay: /id=["']features?\b|feature-card|features/i },
-  { step: /how|как\s*работа/i, hay: /how-it-works|howitworks|id=["']how/i },
-  { step: /trust|social|отзыв|social\s*proof|доказат/i, hay: /id=["']trust|testimonial|social-proof|\btrust\b/i },
-  { step: /faq|вопрос/i, hay: /id=["']faq\b|accordion|\bfaq\b/i },
-  { step: /footer|подвал/i, hay: /<footer\b|id=["']footer/i }
+/** Drop CSS/JS so class names / comments do not fake section completion. */
+export function htmlSansAssets(content: string): string {
+  return content
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
+}
+
+function sectionInnerLongEnough(inner: string, minChars: number): boolean {
+  const text = inner.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim()
+  return text.length >= minChars
+}
+
+/** True when a named landmark exists as a closed HTML block with real body text. */
+export function htmlSectionComplete(
+  content: string,
+  opts: { tag?: RegExp; idOrClass: RegExp; minChars?: number }
+): boolean {
+  const html = htmlSansAssets(content)
+  if (!html.trim()) return false
+  const min = opts.minChars ?? 40
+  const idRe = opts.idOrClass.source
+  // <nav class="navbar">…</nav> or <section id="hero">…</section>
+  const block = new RegExp(
+    `<(${opts.tag?.source ?? 'section|div|header|footer|nav|aside'})\\b([^>]*)>` +
+      `([\\s\\S]*?)<\\/\\1\\s*>`,
+    'gi'
+  )
+  let m: RegExpExecArray | null
+  const attrHit = new RegExp(idRe, 'i')
+  while ((m = block.exec(html)) !== null) {
+    const attrs = m[2] ?? ''
+    const inner = m[3] ?? ''
+    if (attrHit.test(attrs) && sectionInnerLongEnough(inner, min)) return true
+  }
+  // id= on any element with enough following siblings until a matching close is hard;
+  // also accept <footer>…</footer> without id when tag is footer.
+  if (opts.tag && /footer/i.test(opts.tag.source)) {
+    const fm = html.match(/<footer\b[^>]*>([\s\S]*?)<\/footer\s*>/i)
+    if (fm && sectionInnerLongEnough(fm[1] ?? '', min)) return true
+  }
+  if (opts.tag && /nav/i.test(opts.tag.source)) {
+    const nm = html.match(/<nav\b[^>]*>([\s\S]*?)<\/nav\s*>/i)
+    if (nm && sectionInnerLongEnough(nm[1] ?? '', Math.min(min, 24))) return true
+  }
+  return false
+}
+
+type PlanContentRule = { step: RegExp; done: (html: string) => boolean }
+
+const PLAN_CONTENT_RULES: PlanContentRule[] = [
+  {
+    step: /каркас|html\s*\+|bootstrap|\bcss\b/i,
+    done: (h) =>
+      /<!DOCTYPE\s+html|<html[\s>]/i.test(h) &&
+      /<body[\s>]/i.test(htmlSansAssets(h)) &&
+      (/<style\b|<link\b[^>]+stylesheet/i.test(h) || /class=["']/i.test(htmlSansAssets(h)))
+  },
+  {
+    step: /navbar|навиг|шапк/i,
+    done: (h) =>
+      htmlSectionComplete(h, { tag: /nav/i, idOrClass: /navbar|nav-bar|site-nav/i, minChars: 10 }) ||
+      htmlSectionComplete(h, { tag: /header/i, idOrClass: /navbar|nav/i, minChars: 16 }) ||
+      (() => {
+        const nm = htmlSansAssets(h).match(/<nav\b[^>]*>([\s\S]*?)<\/nav\s*>/i)
+        return Boolean(nm && sectionInnerLongEnough(nm[1] ?? '', 10))
+      })()
+  },
+  {
+    step: /hero|главн\w*\s+экран|jumbotron/i,
+    done: (h) => htmlSectionComplete(h, { idOrClass: /\bhero\b|jumbotron/i, minChars: 32 })
+  },
+  {
+    step: /feature|возможн|преимущ/i,
+    done: (h) =>
+      htmlSectionComplete(h, { idOrClass: /\bfeatures?\b/i, minChars: 36 }) ||
+      (/feature-card/i.test(htmlSansAssets(h)) &&
+        (htmlSansAssets(h).match(/feature-card/gi) ?? []).length >= 2)
+  },
+  {
+    step: /how|как\s*работа/i,
+    done: (h) =>
+      htmlSectionComplete(h, { idOrClass: /how-it-works|howitworks|\bhow\b/i, minChars: 28 })
+  },
+  {
+    step: /trust|social|отзыв|social\s*proof|доказат/i,
+    done: (h) =>
+      htmlSectionComplete(h, {
+        idOrClass: /\btrust\b|testimonial|social-proof|reviews?/i,
+        minChars: 28
+      })
+  },
+  {
+    step: /faq|вопрос/i,
+    done: (h) =>
+      htmlSectionComplete(h, { idOrClass: /\bfaq\b|accordion/i, minChars: 24 })
+  },
+  {
+    step: /footer|подвал/i,
+    done: (h) =>
+      htmlSectionComplete(h, { tag: /footer/i, idOrClass: /footer|site-footer/i, minChars: 12 })
+  },
+  {
+    step: /\bcta\b|призыв|кнопк\w*\s*(справа|справа\.|cta)|cta\s*справа/i,
+    done: (h) => {
+      const body = htmlSansAssets(h)
+      return (
+        /class=["'][^"']*\b(btn|cta|button)\b/i.test(body) ||
+        /<(a|button)\b[^>]*(btn|cta)/i.test(body)
+      ) && body.length > 200
+    }
+  }
 ]
 
+/** Soft layout leftovers after a full landing write — do not force rewrite loops. */
+export function isSoftLayoutPlanStep(text: string): boolean {
+  const t = text.trim()
+  if (!t || isBrowserPlanStep(t)) return false
+  return (
+    /\bcta\b|справа|layout|сетк|grid|выравнив|отступ|spacing|кнопк/i.test(t) ||
+    // "Найти FAQ в файле" is research fluff — must not block Start-Process forever.
+    // Do NOT use \b after Cyrillic: JS treats Cyrillic as non-word, so /^найти\b/ never matches.
+    /^найти[\s\u00a0]/i.test(t) ||
+    /найти\s+.+\s+(файл|блок|faq|секц)/i.test(t) ||
+    /find\s+.+\s+in\s+(the\s+)?existing|locate\s+(the\s+)?faq|search\s+for\s+faq/i.test(t) ||
+    // Surgical leftover rows that stay yellow forever and trip PLAN_ORDER.
+    /точечн|без\s+перепис|стили?\s*\/\s*размет|разметк\w*\s*\(|apply_diff|патч/i.test(t)
+  )
+}
+
 export function isBrowserPlanStep(text: string): boolean {
-  return /браузер|browser|открыть\s+index|open\s+in\s+browser|visual|проверк\w*\s+в[её]рст/i.test(
+  return /браузер|browser|открыт\w*\s+index|open\s+in\s+browser|visual|визуальн|desktop\s*\+|mobile|проверк\w*\s+в[её]рст|проверк\w*\s+на\s+(desktop|mobile)|Start-Process.*index\.html/i.test(
     text
   )
 }
@@ -678,84 +1138,38 @@ export function pendingPlanWork(steps: AgentTodoStep[]): AgentTodoStep[] {
     (s) =>
       s.status !== 'done' &&
       !isBrowserPlanStep(s.text) &&
-      !isMetaOrSummaryPlanStep(s.text)
+      !isMetaOrSummaryPlanStep(s.text) &&
+      !isFluffPlanStep(s.text) &&
+      !isSoftLayoutPlanStep(s.text)
   )
 }
 
 /** Mark plan steps done when HTML/content clearly contains that section. */
 export function markTodosMatchingContent(
-  steps: AgentTodoStep[],
-  content: string
+  _steps: AgentTodoStep[],
+  _content: string
 ): number {
-  if (!content || steps.length === 0) return 0
-  let n = 0
-  for (const s of steps) {
-    if (s.status === 'done') continue
-    if (isBrowserPlanStep(s.text) && !/navbar|hero|faq|footer|feature/i.test(s.text)) {
-      continue
-    }
-    let hit = false
-    for (const r of PLAN_CONTENT_RULES) {
-      if (r.step.test(s.text) && r.hay.test(content)) {
-        hit = true
-        break
-      }
-    }
-    if (!hit) {
-      const sec = s.text.match(/секц\w*\s*:\s*(.+)/i)
-      const key = (sec?.[1] ?? '').trim().toLowerCase().replace(/\s+/g, '-')
-      if (key.length >= 3) {
-        const esc = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-        if (new RegExp(esc, 'i').test(content)) hit = true
-      }
-    }
-    if (hit) {
-      s.status = 'done'
-      n++
-    }
-  }
-  return n
+  // Content-shape matching (navbar/hero/faq) is not evidence of this turn's work.
+  return 0
 }
 
 /**
- * After a structurally complete HTML write: close every non-browser work step
- * that this file already satisfies (sections + mega "write whole landing" todos).
- * Incomplete HTML must NOT close the whole plan (that unlocked Start-Process too early).
+ * After HTML write: mark only sections actually present in content.
+ * Do NOT mass-check every plan row at once — progress is content-driven / live.
  */
 export function markTodosAfterCompleteHtmlWrite(
-  steps: AgentTodoStep[],
-  content: string
+  _steps: AgentTodoStep[],
+  _content: string
 ): number {
-  if (!content || steps.length === 0) return 0
-  // Partial writes may contain <html> + a few section ids — only soft-match sections.
-  if (!contentLooksStructurallyComplete(content)) {
-    return markTodosMatchingContent(steps, content)
-  }
-  let n = markTodosMatchingContent(steps, content)
-  for (const s of steps) {
-    if (s.status === 'done') continue
-    if (isBrowserPlanStep(s.text)) continue
-    if (isMetaOrSummaryPlanStep(s.text)) {
-      s.status = 'done'
-      n++
-      continue
-    }
-    if (isLandingWritePlanStep(s.text)) {
-      s.status = 'done'
-      n++
-      continue
-    }
-    // Any remaining section-ish / каркас step once the page exists.
-    if (
-      /каркас|html\s*\+|bootstrap|секц|navbar|hero|feature|how|trust|social|faq|footer|тёмн|dark\s*theme|svg|иллюстрац/i.test(
-        s.text
-      )
-    ) {
-      s.status = 'done'
-      n++
-    }
-  }
-  return n
+  return 0
+}
+
+/** Live plan progress — evidence-gated in the tool loop; content shape is not proof. */
+export function progressTodosFromContent(
+  steps: AgentTodoStep[],
+  _content: string
+): { steps: AgentTodoStep[]; changed: boolean } {
+  return { steps, changed: false }
 }
 
 export function rebalanceTodoStatuses(steps: AgentTodoStep[]): AgentTodoStep[] {
@@ -776,9 +1190,7 @@ export function reconcileTodosWithContent(
   steps: AgentTodoStep[],
   content: string
 ): AgentTodoStep[] {
-  const next = steps.map((s) => ({ ...s }))
-  markTodosAfterCompleteHtmlWrite(next, content)
-  return rebalanceTodoStatuses(next)
+  return progressTodosFromContent(steps, content).steps
 }
 
 /** Advance plan after a successful mutating / shell tool (content-aware for HTML writes). */
@@ -788,51 +1200,13 @@ export function advanceTodosOnTool(
   ok: boolean,
   ctx?: AdvanceTodoContext
 ): AgentTodoStep[] {
-  if (!ok || steps.length === 0) return steps
-  if (
-    !/^(write_file|apply_patch|apply_diff|create_directory|delete_file|execute_terminal_command|generate_image|rename_file)$/.test(
-      name
-    )
-  ) {
-    return steps
-  }
-  const next = steps.map((s) => ({ ...s }))
-
-  if (
-    (name === 'write_file' || name === 'apply_patch' || name === 'apply_diff') &&
-    (ctx?.content?.length ?? 0) > 80
-  ) {
-    const body = ctx!.content!
-    const marked = contentLooksStructurallyComplete(body)
-      ? markTodosAfterCompleteHtmlWrite(next, body)
-      : markTodosMatchingContent(next, body)
-    if (marked > 0) return rebalanceTodoStatuses(next)
-  }
-
-  if (name === 'execute_terminal_command') {
-    const cmd = ctx?.command || ctx?.content || ''
-    if (looksLikeOpenHtmlCommand(cmd)) {
-      let marked = 0
-      for (const s of next) {
-        if (s.status === 'done') continue
-        if (isBrowserPlanStep(s.text)) {
-          s.status = 'done'
-          marked++
-        }
-      }
-      if (marked > 0) return rebalanceTodoStatuses(next)
-    }
-  }
-
-  let cur = next.find((s) => s.status === 'in_progress')
-  if (!cur) {
-    cur = next.find((s) => s.status === 'pending')
-    if (cur) cur.status = 'in_progress'
-  }
-  if (!cur) return next
-  cur.status = 'done'
-  const nxt = next.find((s) => s.status === 'pending')
-  if (nxt) nxt.status = 'in_progress'
+  const { steps: next } = advanceTodosOnEvidence(steps, [], {
+    name,
+    ok,
+    path: ctx?.path,
+    command: ctx?.command,
+    content: ctx?.content
+  })
   return next
 }
 
@@ -851,7 +1225,7 @@ export function formatChecklist(cl: AgentChecklist): string {
       : []),
     ...(cl.failed.length ? [`✗ failed: ${cl.failed.join(', ')}`] : []),
     ...(cl.shells.length ? [`shell: ${cl.shells.slice(-5).join(' | ')}`] : []),
-    'Use overwrite=true for small HTML/CSS; apply_patch for large existing files. Do not invent duplicate filenames.',
+    'Prefer apply_diff/apply_patch for edits. Do not invent duplicate filenames. Never claim done without a successful tool for that step.',
     '[/Agent checklist]'
   ]
   return '\n\n' + lines.join('\n')
@@ -1229,6 +1603,10 @@ export function evaluateAcceptanceGate(input: {
   incompleteCount: number
   failedCount: number
   completedTools: number
+  /** Edit tools succeeded this turn (write/patch/diff). */
+  mutatingEditOk?: boolean
+  /** Edit tools failed this turn. */
+  mutatingEditFailed?: boolean
 }): {
   claimsDone: boolean
   hardMissing: string[]
@@ -1236,7 +1614,7 @@ export function evaluateAcceptanceGate(input: {
   looksPrematureDone: boolean
 } {
   const claimsDone =
-    /task completed|all (tests )?pass|tests?\s+pass|done\.|готово/i.test(
+    /task completed|all (tests )?pass|tests?\s+pass|done\.|готово|сделано|исправлен/i.test(
       input.finalText
     )
   const hardMissing: string[] = []
@@ -1257,18 +1635,30 @@ export function evaluateAcceptanceGate(input: {
       'Smoke-test the CLI with execute_terminal_command (argv JSON and/or stdin pipe) and confirm it prints one JSON result line.'
     )
   }
+  if (input.mutatingEditFailed && !input.mutatingEditOk && claimsDone) {
+    hardMissing.push(
+      'A file edit failed this turn. Do not claim done — fix with apply_diff/apply_patch, or honestly report the failure. Never rewrite a finished HTML file from scratch.'
+    )
+  }
+  if (input.mutatingEditFailed && input.mutatingEditOk && claimsDone) {
+    hardMissing.push(
+      'An edit also failed this turn. Do not claim the whole task is done — verify remaining work or report what failed.'
+    )
+  }
   const acceptanceDone =
     /task completed/i.test(input.finalText) &&
     (!input.userWantsNodeTest || input.lastNodeTestOk === true) &&
     input.incompleteCount === 0 &&
-    hardMissing.length === 0
+    hardMissing.length === 0 &&
+    !input.mutatingEditFailed
   const looksPrematureDone =
     !acceptanceDone &&
     claimsDone &&
     (input.incompleteCount > 0 ||
       input.failedCount > 0 ||
       input.completedTools < 2 ||
-      hardMissing.length > 0)
+      hardMissing.length > 0 ||
+      input.mutatingEditFailed === true)
   return { claimsDone, hardMissing, acceptanceDone, looksPrematureDone }
 }
 
@@ -1352,33 +1742,13 @@ export function coerceToolRelativePath(
 }
 
 /**
- * When the model streams write_file content without a path, guess a sensible
- * filename from the body (landing-page trio and common source types).
+ * When the model streams write_file content without a path, guess only when the
+ * body is clearly a full HTML document. Never invent styles.css / app.js / etc.
  */
 export function inferWritePathFromContent(content: string): string | null {
   const t = (content ?? '').trimStart()
   if (!t || t.length < 8) return null
   if (/^<!DOCTYPE\s+html\b/i.test(t) || /^<html[\s>]/i.test(t)) return 'index.html'
-  // CSS: rules / at-rules, little/no HTML tags
-  const htmlTagHits = (t.match(/<\/?[a-zA-Z][\w:-]*/g) ?? []).length
-  if (
-    htmlTagHits < 2 &&
-    (/@(media|font-face|keyframes|import)\b/i.test(t) ||
-      /[.#]?[a-zA-Z][\w-]*\s*\{[^}]*:[^}]+\}/.test(t) ||
-      /:(root|hover|focus|active)\b/.test(t))
-  ) {
-    return 'styles.css'
-  }
-  if (
-    /\b(document\.|window\.|addEventListener|querySelector|getElementById|IntersectionObserver)\b/.test(
-      t
-    ) ||
-    /^(?:['"]use strict['"];?\s*)?(?:const|let|var|function|class)\b/m.test(t)
-  ) {
-    return 'app.js'
-  }
-  if (/^\{[\s\S]*"[\w.-]+"\s*:/.test(t)) return 'data.json'
-  if (/^#{1,3}\s+\w+/m.test(t) && !/<html/i.test(t)) return 'README.md'
   return null
 }
 

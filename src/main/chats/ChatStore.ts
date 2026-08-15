@@ -4,7 +4,6 @@ import { app } from 'electron'
 import {
   createEmptySession,
   DEFAULT_WELCOME_MESSAGE,
-  deriveChatTitleFromMessages,
   isDefaultChatTitle,
   sanitizePersistedMessages,
   type ChatSession,
@@ -206,13 +205,10 @@ export class ChatStore {
     if (idx === -1) return this.get()
     const prev = this.cache.sessions[idx]!
     const cleaned = sanitizePersistedMessages(messages)
-    // Auto-name once from the first prompt; never overwrite a set title.
+    // Title is set once (model or first explicit name) and then frozen.
     let nextTitle = prev.title
-    if (title?.trim()) {
+    if (title?.trim() && isDefaultChatTitle(prev.title)) {
       nextTitle = title.trim()
-    } else if (isDefaultChatTitle(prev.title)) {
-      nextTitle =
-        deriveChatTitleFromMessages(cleaned) || prev.title || 'New agent'
     }
     this.cache.sessions[idx] = {
       ...prev,

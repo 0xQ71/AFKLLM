@@ -68,18 +68,46 @@ export function initCrashReporter(): void {
   })
 }
 
+/** If the live log was renamed/rotated away (or left empty), copy the newest backup back. */
+async function recoverLogFileIfMissing(): Promise<void> {
+  const path = getErrorLogPath()
+  try {
+    const st = await fs.stat(path)
+    if (st.size > 0) return
+  } catch {
+    /* missing */
+  }
+  try {
+    const dir = getLogsDir()
+    await fs.mkdir(dir, { recursive: true })
+    const names = await fs.readdir(dir)
+    const rotated = names
+      .filter((n) => /^afkllm-errors\.\d{8}-\d{6}\.log$/i.test(n))
+      .sort()
+      .reverse()
+    if (rotated[0]) {
+      await fs.copyFile(join(dir, rotated[0]!), path)
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
 export async function appendErrorLog(text: string): Promise<string> {
   const dir = getLogsDir()
   const path = getErrorLogPath()
   await fs.mkdir(dir, { recursive: true })
-  let existing = ''
+  await recoverLogFileIfMissing()
+  await fs.appendFile(path, text, 'utf8')
   try {
-    existing = await fs.readFile(path, 'utf8')
+    const st = await fs.stat(path)
+    if (st.size > MAX_LOG_BYTES) {
+      const existing = await fs.readFile(path, 'utf8')
+      await fs.writeFile(path, rotateLogContent(existing, MAX_LOG_BYTES), 'utf8')
+    }
   } catch {
-    /* new file */
+    /* rotate is best-effort; the new line is already on disk */
   }
-  const next = rotateLogContent(existing + text, MAX_LOG_BYTES)
-  await fs.writeFile(path, next, 'utf8')
   return path
 }
 
@@ -139,6 +167,7 @@ export async function readErrorLog(maxChars = 80_000): Promise<{
   const path = getErrorLogPath()
   try {
     await fs.mkdir(getLogsDir(), { recursive: true })
+    await recoverLogFileIfMissing()
     let text = ''
     try {
       text = await fs.readFile(path, 'utf8')

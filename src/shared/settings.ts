@@ -173,11 +173,16 @@ export interface AppSettings {
   /** Brief reasoning step before tools / final answer */
   agentThinkThrough: boolean
 
-  /**
-   * When true, expose generate_image to the agent.
+  /** When true, expose generate_image to the agent.
    * Default false — coding mode must not invent image gens.
    */
   agentImageGenEnabled: boolean
+
+  /**
+   * Cursor-like honest agent loop (language-agnostic prompts, evidence-gated plan).
+   * Default true. Set false only to force the legacy turn path.
+   */
+  agentLoopV2: boolean
 
   /** First-run wizard done with a valid .gguf */
   setupComplete: boolean
@@ -200,6 +205,12 @@ export interface AppSettings {
   visionModelPath: string
   /** Projector for visionModelPath; empty = auto sibling *mmproj*.gguf */
   visionMmprojPath: string
+  /**
+   * Fast-apply / Morph-style edit GGUF — loaded coresident with chat on Load
+   * (second llama-server on port+1, same VRAM; no cold-swap).
+   * Empty = no apply process (agent falls back to chat later).
+   */
+  applyModelPath: string
   /** Diffusion weights for generate_image (safetensors / gguf) */
   imageGenModelPath: string
   /** FLUX / FLUX.2 VAE (ae.safetensors) */
@@ -319,6 +330,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
 
   agentImageGenEnabled: false,
 
+  agentLoopV2: true,
+
   setupComplete: false,
 
   localApiEnabled: false,
@@ -333,6 +346,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
 
   visionModelPath: '',
   visionMmprojPath: '',
+  applyModelPath: '',
   imageGenModelPath: '',
   imageGenVaePath: '',
   imageGenClipLPath: '',
@@ -373,6 +387,11 @@ export interface LlmRuntimeStatus {
   pending: number
   error?: string
   detail?: string
+  /** Coresident apply llama-server (port+1); absent when applyModelPath empty */
+  applyState?: 'stopped' | 'starting' | 'ready' | 'error'
+  applyModelPath?: string | null
+  applyBaseUrl?: string | null
+  applyError?: string
 }
 
 export function samplingFromSettings(s: AppSettings): Record<string, unknown> {

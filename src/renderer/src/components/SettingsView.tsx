@@ -119,6 +119,11 @@ export function SettingsView({
       void window.api.settings.save({ modelPath: value })
       return
     }
+    if (key === 'applyModelPath' && typeof value === 'string') {
+      setSettings({ ...settings, applyModelPath: value })
+      void window.api.settings.save({ applyModelPath: value })
+      return
+    }
     setSettings({ ...settings, [key]: value })
   }
 
@@ -336,6 +341,9 @@ export function SettingsView({
             if (storeTarget === 'vision') {
               return { ...prev, visionModelPath: localPath }
             }
+            if (storeTarget === 'apply') {
+              return { ...prev, applyModelPath: localPath }
+            }
             if (storeTarget === 'mmproj') {
               return { ...prev, visionMmprojPath: localPath }
             }
@@ -359,6 +367,15 @@ export function SettingsView({
             }
             return switchModelPath(prev, localPath)
           })
+          if (storeTarget === 'apply') {
+            void window.api.settings.save({ applyModelPath: localPath })
+          } else if (storeTarget === 'vision') {
+            void window.api.settings.save({ visionModelPath: localPath })
+          } else if (storeTarget === 'mmproj') {
+            void window.api.settings.save({ visionMmprojPath: localPath })
+          } else if (storeTarget === 'chat') {
+            void window.api.settings.save({ modelPath: localPath })
+          }
           setStoreOpen(false)
           setMessage(t('store.imported', { path: localPath }))
           void window.api.llm.listModels().then(setModels).catch(() => {
@@ -887,6 +904,43 @@ function ModelPage({
             </button>
           </div>
         </Field>
+        <Field label={t('settings.model.applyGguf')}>
+          <div className="flex gap-2">
+            <select
+              value={settings.applyModelPath}
+              onChange={(e) => patch('applyModelPath', e.target.value)}
+              className={settingsInputClass + ' font-mono text-xs'}
+            >
+              <option value="">{t('settings.multimodal.none')}</option>
+              {models.map((m) => (
+                <option key={m.path} value={m.path}>
+                  {m.id} ({(m.sizeBytes / 1e9).toFixed(1)} GB)
+                </option>
+              ))}
+              {settings.applyModelPath &&
+                !models.some((m) => m.path === settings.applyModelPath) && (
+                  <option value={settings.applyModelPath}>
+                    {settings.applyModelPath.split(/[/\\]/).pop()}
+                  </option>
+                )}
+            </select>
+            <button
+              type="button"
+              onClick={() => onOpenStore('apply')}
+              className={settingsBtnClass + ' text-signal border-signal/40'}
+            >
+              {t('settings.model.storeShort')}
+            </button>
+            <button
+              type="button"
+              onClick={() => void window.api.hf.openModelsDir()}
+              className={settingsBtnClass}
+              title={t('settings.model.browseFolder')}
+            >
+              {t('settings.model.browse')}
+            </button>
+          </div>
+        </Field>
         <SettingRow
           title={t('settings.model.status')}
           description={
@@ -936,6 +990,33 @@ function ModelPage({
               {t('settings.model.load')}
             </button>
           )}
+        </SettingRow>
+        <SettingRow
+          title={t('settings.model.applyStatus')}
+          description={
+            llmStatus?.applyError && llmStatus.applyState === 'error'
+              ? llmStatus.applyError
+              : !settings.applyModelPath?.trim()
+                ? t('settings.model.applyStatusHint')
+                : undefined
+          }
+        >
+          <span
+            className={
+              'text-xs ' +
+              (llmStatus?.applyState === 'ready'
+                ? 'text-signal'
+                : llmStatus?.applyState === 'error'
+                  ? 'text-rose-400'
+                  : llmStatus?.applyState === 'starting'
+                    ? 'text-amber-400'
+                    : 'text-ink-mute')
+            }
+          >
+            {!settings.applyModelPath?.trim()
+              ? '—'
+              : (llmStatus?.applyState ?? 'stopped')}
+          </span>
         </SettingRow>
         <SettingRow title={t('settings.model.port')}>
           <input
