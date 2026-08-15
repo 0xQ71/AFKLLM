@@ -352,6 +352,15 @@ export function stripThinkTags(text: string): string {
     .trim()
 }
 
+/** Drop think blocks with their bodies (history context, not the UI fold). */
+export function stripThinkBlocks(text: string): string {
+  return (text ?? '')
+    .replace(/<\s*(?:think|thinking)\s*>[\s\S]*?<\s*\/\s*(?:think|thinking)\s*>/gi, '')
+    .replace(/<\s*(?:think|thinking)\s*>[\s\S]*$/i, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+}
+
 /** Live UI think body while tokens stream (do not wait for sanitize — show prose as it arrives). */
 export function formatLiveThinkContent(rawAccum: string): string {
   let body = liveThinkProse(rawAccum)
@@ -385,24 +394,63 @@ export function contentLooksStructurallyComplete(
   return contentLooksStructurallyCompleteV2(content, relativePath)
 }
 
+const CHARS_PER_TOKEN_READ = 3.2
+
+/** Full-read budget from the model ctx — a whole file beats guessed line ranges. */
+export function readFileCharBudget(ctxSize?: number): number {
+  const ctx = Number.isFinite(ctxSize) && (ctxSize ?? 0) > 0 ? ctxSize! : 8192
+  return Math.max(6_000, Math.min(24_000, Math.floor(ctx * CHARS_PER_TOKEN_READ * 0.25)))
+}
+
+/** Top-level anchors so a follow-up range request is exact, never guessed. */
+export function buildFileStructureMap(raw: string, maxEntries = 60): string {
+  const lines = raw.split(/\r?\n/)
+  const anchors: string[] = []
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i] ?? ''
+    const t = line.trim()
+    if (!t || t.length > 200) continue
+    const isAnchor =
+      /^<(?:style|script|head|body|nav|header|main|footer|section|article|aside|template)\b/i.test(t) ||
+      /^<\/(?:style|script|head|body)\s*>/i.test(t) ||
+      /^<[a-z][\w-]*[^>]*\b(?:id|class)\s*=/i.test(t) ||
+      /^(?:export\s+)?(?:async\s+)?(?:function|class|const|let|var|type|interface|enum)\s+[A-Za-z_$]/.test(t) ||
+      /^(?:def|class)\s+[A-Za-z_]/.test(t) ||
+      /^(?:public|private|protected|internal)\s+[\w<>[\]]+\s+\w+\s*\(/.test(t) ||
+      /^@[A-Za-z-]+\s*[{(]?/.test(t) ||
+      /^[.#]?[A-Za-z][\w -]*(?:,\s*[.#]?[A-Za-z][\w -]*)*\s*\{$/.test(t) ||
+      /^#{1,6}\s+\S/.test(t) ||
+      /^(?:[-\w"']+)\s*:\s*$/.test(t)
+    if (!isAnchor) continue
+    anchors.push(`${i + 1}| ${t.slice(0, 120)}`)
+    if (anchors.length >= maxEntries) break
+  }
+  return anchors.join('\n')
+}
+
 /**
- * Pack read_file for the model: head + tail + metadata.
- * Never present a head-only slice as if it were EOF (false "file truncated at ~250 lines").
+ * Pack read_file for the model. Whole file whenever it fits the ctx budget —
+ * head+tail packing made the middle invisible and pushed the model into
+ * guessing line ranges (read L1-10, L86-153 …) until the round cap.
  */
 export function packReadFileForAgent(
   raw: string,
-  opts?: { headLines?: number; tailLines?: number; maxChars?: number }
+  opts?: {
+    headLines?: number
+    tailLines?: number
+    maxChars?: number
+    ctxSize?: number
+    relativePath?: string
+  }
 ): string {
-  const headN = opts?.headLines ?? 80
-  const tailN = opts?.tailLines ?? 40
-  const maxChars = opts?.maxChars ?? 10_000
+  const maxChars = opts?.maxChars ?? readFileCharBudget(opts?.ctxSize)
   const lines = raw.split(/\r?\n/)
   const totalLines = lines.length
   const bytes = raw.length
-  const complete = contentLooksStructurallyComplete(raw)
+  const complete = contentLooksStructurallyComplete(raw, opts?.relativePath ?? '')
   const status = complete ? 'FILE_COMPLETE' : 'FILE_MAYBE_INCOMPLETE'
 
-  if (bytes <= maxChars && totalLines <= headN + tailN) {
+  if (bytes <= maxChars) {
     return (
       `[read_file meta] total_lines=${totalLines} bytes=${bytes} truncated=false ${status}\n` +
       `--- full file ---\n` +
@@ -410,23 +458,81 @@ export function packReadFileForAgent(
     )
   }
 
-  const head = lines.slice(0, headN).join('\n')
-  const tailStart = Math.max(headN, totalLines - tailN)
-  const tail = lines.slice(tailStart).join('\n')
-  const omitted = Math.max(0, tailStart - headN)
-  let body =
+  // Too big for one shot: give a line-numbered map so the next range is exact.
+  // Prefer map + fitted head/tail over a mid-body hard cut (which used to drop
+  // the structure map and the closing lines the model needed).
+  const headCap = opts?.headLines ?? 120
+  const tailCap = opts?.tailLines ?? 60
+  let headN = headCap
+  let tailN = Math.min(tailCap, Math.max(0, totalLines - 1))
+  const map = buildFileStructureMap(raw)
+  const mapBlock = map ? `--- structure map (line| anchor) ---\n${map}\n` : ''
+  const preface =
     `[read_file meta] total_lines=${totalLines} bytes=${bytes} truncated=true ${status}\n` +
-    `NOTE: Middle omitted (${omitted} lines). Tail is shown — closing tags may be here. Do NOT rewrite the file just because the head ends mid-section.\n` +
-    `--- lines 1-${Math.min(headN, totalLines)} ---\n` +
-    head
-  if (tailStart < totalLines) {
-    body +=
-      `\n--- lines ${tailStart + 1}-${totalLines} (tail) ---\n` + tail
+    `NOTE: File is too large for one read (${bytes} > ${maxChars} chars). Middle omitted.\n` +
+    `Use the STRUCTURE MAP below to request an EXACT range with read_file start_line/end_line — never guess line numbers. Do NOT rewrite the file.\n` +
+    mapBlock
+
+  const buildBody = (h: number, t: number): string => {
+    const head = lines.slice(0, h).join('\n')
+    const tailStart = Math.max(h, totalLines - t)
+    const omitted = Math.max(0, tailStart - h)
+    let body =
+      preface.replace('Middle omitted.', `Middle omitted (${omitted} lines).`) +
+      `--- lines 1-${Math.min(h, totalLines)} ---\n${head}`
+    if (tailStart < totalLines) {
+      body += `\n--- lines ${tailStart + 1}-${totalLines} (tail) ---\n${lines.slice(tailStart).join('\n')}`
+    }
+    return body
+  }
+
+  let body = buildBody(headN, tailN)
+  while (body.length > maxChars + 800 && (headN > 24 || tailN > 12)) {
+    if (headN >= tailN * 2) headN = Math.max(24, Math.floor(headN * 0.7))
+    else tailN = Math.max(12, Math.floor(tailN * 0.7))
+    body = buildBody(headN, tailN)
   }
   if (body.length > maxChars + 2000) {
-    return body.slice(0, maxChars) + '\n…[pack truncated for context]'
+    // Last resort: keep meta + structure map (the actionable part).
+    const essential = preface.trimEnd() + '\n…[head/tail omitted — use structure map ranges]'
+    return essential.length <= maxChars + 2000
+      ? essential
+      : essential.slice(0, maxChars) + '\n…[pack truncated for context]'
   }
   return body
+}
+
+/** Cache key so a later range never receives an earlier range's body. */
+export function readFileRangeCacheKey(
+  pathKey: string,
+  startLine?: unknown,
+  endLine?: unknown
+): string {
+  return `${pathKey}|${Number(startLine) || 0}-${Number(endLine) || 0}`
+}
+
+/**
+ * When the re-read budget is spent: serve only an exact range hit.
+ * Never invent an empty ok:true body — that lied to the model and caused loops.
+ */
+export function resolveExhaustedReadBudget(
+  cached: string | undefined,
+  filePath: string
+): { ok: true; content: string } | { ok: false; content: string; error: string } {
+  if (cached !== undefined) {
+    return {
+      ok: true,
+      content: `${cached}\n[cached read_file: identical range already read this turn — use it, do not re-read]`
+    }
+  }
+  return {
+    ok: false,
+    content: '',
+    error:
+      `READ_BUDGET: "${filePath}" was already read this turn and the re-read budget is spent. ` +
+      'Use the content you already have. To locate something specific call search_codebase, ' +
+      'then edit with apply_diff. Do NOT keep requesting line ranges.'
+  }
 }
 
 /** Parse total_lines from packed read_file meta for UI activity labels. */
@@ -564,7 +670,7 @@ export function isToolOrientedPlanStep(text: string): boolean {
   if (!t) return true
   if (isFullRewriteFallbackPlanStep(t)) return true
   if (
-    /\b(execute_terminal_command|write_file|read_file|apply_patch|apply_diff|generate_image|create_directory|list_directory|search_codebase)\b/i.test(
+    /\b(execute_terminal_command|write_file|read_file|apply_patch|apply_diff|generate_image|create_directory|list_directory|search_codebase|web_search)\b/i.test(
       t
     )
   ) {
@@ -686,6 +792,43 @@ export function coerceProductPlan(
     ...s,
     id: `s${i + 1}`,
     status: (i === 0 ? 'in_progress' : 'pending') as AgentTodoStep['status']
+  }))
+}
+
+/**
+ * Drop plan rows that restate earlier chat work or expand far beyond THIS request
+ * (e.g. navbar ask → weather / i18n / “fully rewrite landing”).
+ */
+export function filterPlanToCurrentRequest(
+  steps: AgentTodoStep[],
+  userText: string
+): AgentTodoStep[] {
+  const t = userText.trim()
+  if (!steps.length || !t) return steps
+  const navbarOnly =
+    /навбар|navbar|header/i.test(t) &&
+    !/лендинг\s+с\s*нуля|landing\s+from\s+scratch|все\s+секц|bootstrap\s*5/i.test(t)
+  const out = steps.filter((s) => {
+    const x = s.text
+    if (/погод|weather|одежд|печк|что\s+лучше\s+одеть/i.test(x)) return false
+    if (/i18n|RU\s*\/\s*EN|переключ\S*\s+язык|language\s+switch/i.test(x) && !/язык/i.test(t)) {
+      return false
+    }
+    if (
+      navbarOnly &&
+      /полностью\s+обнов|весь\s+лендинг|перепис\S*\s+(styles|css|лендинг)|hero\.js|open-?meteo|виджет\s+погод/i.test(
+        x
+      )
+    ) {
+      return false
+    }
+    return true
+  })
+  const capped = (out.length ? out : steps).slice(0, navbarOnly ? 4 : 10)
+  return capped.map((s, i) => ({
+    ...s,
+    id: `s${i + 1}`,
+    status: (i === 0 ? 'in_progress' : s.status === 'done' ? 'done' : 'pending') as AgentTodoStep['status']
   }))
 }
 
@@ -857,11 +1000,31 @@ export function isMetaOrSummaryPlanStep(text: string): boolean {
     /подтвердить|валидац|отсутствие\s+ошибок|корректность\s+отображ/i.test(t) ||
     /проверк\w*\s+(отсутств|ошибок|корректн|отображ|вёрст|верст|html|синтаксис)/i.test(t) ||
     /give\s+(a\s+)?brief|краткую\s+сводк|пользователю\s+на\s+(русск|english)/i.test(t) ||
-    /кратко\s+сообщ|сообщ\w*\s+пользовател|inform\s+the\s+user|tell\s+the\s+user|о\s+результатах/i.test(
+    /кратко\s+сообщ|сообщ\S*\s+пользовател|inform\s+the\s+user|tell\s+the\s+user|о\s+результатах/i.test(
+      t
+    ) ||
+    /извлечь\s+информац|extract\s+(the\s+)?(info|information|data|temp|weather)|распарс/i.test(t) ||
+    /получить\s+актуальн|fetch\s+(current|live)\s+(weather|data)/i.test(t) ||
+    /уточнить\s*,?\s*если|clarify\s+if|дополнительн\S*\s+детал/i.test(t) ||
+    /уже\s+(дан|даны|предоставлен|сообщен|выполнен)|already\s+(been\s+)?(given|provided|answered|done)/i.test(
       t
     ) ||
     /^(verify|validate|check|done|finish|summarize|report|закрыть|close)\b/i.test(t) ||
     /напиши\s+(кратк|итог|заключен)|write\s+(a\s+)?(short\s+)?(summary|closing)/i.test(t)
+  )
+}
+
+/** Model repeating “plan already done in previous answer” — stop the nudge loop. */
+export function isRedundantPlanCompleteProse(text: string): boolean {
+  const t = (text ?? '').trim()
+  if (!t) return false
+  return (
+    /все\s+(три\s+)?шаг\S*\s+плана\s+уже\s+выполн/i.test(t) ||
+    /уже\s+выполнен\S*\s+в\s+предыдущ/i.test(t) ||
+    /отправлено\s+в\s+предыдущ\S*\s+ответ/i.test(t) ||
+    /уже\s+предоставлен|already\s+provided|рекомендации\s+по\s+одежде\s+уже/i.test(t) ||
+    /already\s+(been\s+)?(completed|done|finished)\s+in\s+the\s+previous/i.test(t) ||
+    /all\s+(three\s+)?plan\s+steps?\s+(are\s+)?already\s+(done|complete)/i.test(t)
   )
 }
 
@@ -912,7 +1075,201 @@ export function isFalseSuccessProse(prose: string): boolean {
     /все\s+упоминания\s+\w+\s+заменен/i.test(t) ||
     /страница\s+открыта\s+в\s+браузер/i.test(t) ||
     /что\s+изменилось\s*:|как\s+проверить\s*:|what\s+changed\s*:/i.test(t) ||
-    /заменен[ыао]\s+на\s+\w+.*(открыт|браузер|проверк)/i.test(t)
+    /заменен[ыао]\s+на\s+\w+.*(открыт|браузер|проверк)/i.test(t) ||
+    // Hallucinated progress without tools: "Создаю styles.css… Файлы созданы…"
+    /файлы?\s+создан|созданн\S*\s+файл/i.test(t) ||
+    /files?\s+(?:were\s+)?created|created\s+files?/i.test(t) ||
+    /(?:создаю|пишу|writing|creating)\s+(?:компонент|component|styles\.css|js\/|index\.html|assets\/|navbar|навбар)/i.test(
+      t
+    ) ||
+    /обновляю\s+index\.html|updating\s+index\.html|без\s+полной\s+перепис/i.test(t) ||
+    /(?:^|\n)\s*(?:созданные\s+файлы|обновления|структура|язык)\s*:/i.test(t)
+  )
+}
+
+/**
+ * User wants a real file/landing edit — prose-only "done" is never enough.
+ */
+export function looksLikeFileEditRequest(userText: string): boolean {
+  const t = userText.trim()
+  if (!t) return false
+  if (looksLikeSurgicalFollowUp(t) || looksLikeLandingBuildTask(t)) return true
+  return (
+    /навбар|navbar|header|футер|footer|hero|секци|faq|index\.html|\.css|\.js\b/i.test(t) ||
+    /добав|вставь|сделай|создай|поправ|исправ|убери|вынес|перенес|увели|больш/i.test(t)
+  ) &&
+    !looksLikeChatQa(t)
+}
+
+/**
+ * Model stuck repeating the same paragraph in one completion (no tools).
+ * Used to abort the stream early instead of burning max_tokens.
+ */
+export function detectProseStutter(text: string): boolean {
+  if (text.length < 240) return false
+  const maxUnit = Math.min(280, Math.floor(text.length / 3))
+  for (let size = 48; size <= maxUnit; size++) {
+    const a = text.slice(-size)
+    if (a.trim().length < 36) continue
+    const b = text.slice(-size * 2, -size)
+    const c = text.slice(-size * 3, -size * 2)
+    if (a === b && b === c) return true
+  }
+  const lines = text
+    .split(/\n/)
+    .map((l) => l.trim())
+    .filter((l) => l.length >= 36)
+  if (lines.length >= 3) {
+    const last = lines[lines.length - 1]!
+    let n = 0
+    for (let i = lines.length - 1; i >= 0 && lines[i] === last; i--) n++
+    if (n >= 3) return true
+  }
+  // Model glitch: same --- / blank-line blocks pasted many times.
+  const norm = (s: string): string => s.replace(/\s+/g, ' ').trim()
+  const dashChunks = text
+    .split(/\n\s*---\s*\n/)
+    .map(norm)
+    .filter((c) => c.length >= 40)
+  if (dashChunks.length >= 3) {
+    const last = dashChunks[dashChunks.length - 1]!
+    let n = 0
+    for (let i = dashChunks.length - 1; i >= 0 && dashChunks[i] === last; i--) n++
+    if (n >= 3) return true
+  }
+  const paras = text
+    .split(/\n{2,}/)
+    .map(norm)
+    .filter((p) => p.length >= 50)
+  const counts = new Map<string, number>()
+  for (const p of paras) {
+    const next = (counts.get(p) ?? 0) + 1
+    counts.set(p, next)
+    if (next >= 3) return true
+  }
+  if ((text.match(/Итого:\s*Рекомендации/gi) ?? []).length >= 3) return true
+  if ((text.match(/Примечание:\s*данные основаны/gi) ?? []).length >= 3) return true
+  if ((text.match(/If you need anything else|Если требуется что-то ещё/gi) ?? []).length >= 3) {
+    return true
+  }
+  return false
+}
+
+/** Keep the first copy when the model pasted the same closing block repeatedly. */
+export function dedupeStutteringProse(text: string): string {
+  const raw = text ?? ''
+  if (!raw.trim()) return raw
+  const norm = (s: string): string => s.replace(/\s+/g, ' ').trim()
+  const parts = raw.split(/(\n\s*---\s*\n)/)
+  if (parts.length >= 5) {
+    const seen = new Set<string>()
+    let out = ''
+    for (const p of parts) {
+      if (/^\n\s*---\s*\n$/.test(p)) {
+        out += p
+        continue
+      }
+      const key = norm(p)
+      if (key.length >= 40 && seen.has(key)) break
+      if (key.length >= 40) seen.add(key)
+      out += p
+    }
+    const trimmed = out.trim()
+    if (trimmed.length >= 40) return trimmed
+  }
+  const paras = raw.split(/(\n{2,})/)
+  const seen = new Set<string>()
+  let out = ''
+  for (const p of paras) {
+    if (/^\n{2,}$/.test(p)) {
+      out += p
+      continue
+    }
+    const key = norm(p)
+    if (key.length >= 50 && seen.has(key)) break
+    if (key.length >= 50) seen.add(key)
+    out += p
+  }
+  return out.trim() || raw.trim()
+}
+
+/**
+ * Chat Q&A / advice — answer in prose is fine; do not force tools or plan-finish loops.
+ * Coding / file-edit requests must return false.
+ * Pass recent history so short follow-ups (“а если я как печка”) stay in the same chat thread.
+ */
+export function looksLikeChatQa(
+  userText: string,
+  history?: Array<{ role?: string; content?: string | null; toolName?: string }>
+): boolean {
+  const t = userText.trim()
+  if (!t || t.length > 420) return false
+  if (
+    /write_file|apply_diff|apply_patch|index\.html|\.tsx?|\.jsx?|\.css|\.py\b|лендинг|landing|репозитор|codebase|компонент|рефактор|refactor|npm\s|git\s|pytest|javac|dockerfile/i.test(
+      t
+    )
+  ) {
+    return false
+  }
+  if (
+    /исправ|поправ|создай\s+(сайт|файл|страниц|лендинг|проект|приложение|виджет)|перепиши|добавь\s+в\s+код|удали\s+из\s+файл|сделай\s+(сайт|страниц|лендинг|приложение)/i.test(
+      t
+    )
+  ) {
+    return false
+  }
+  if (
+    /\?$|погод|weather|одеть|надеть|wear|что\s+лучше|как\s+(лучше|одеться)|посоветуй|recommend|сколько\s+градус|какая\s+погода|какой\s+прогноз|печк|жаркт|мерзн|замёрз|замерз|hot\s+person|i'?m\s+hot|i'?m\s+cold/i.test(
+      t
+    )
+  ) {
+    return true
+  }
+  if (
+    t.length <= 100 &&
+    !/[\\/][\w.-]+\.\w{1,8}\b/.test(t) &&
+    /^(привет|спасибо|thanks|ок|ok|да|нет|хорошо|понял|подскаж|совет)/i.test(t)
+  ) {
+    return true
+  }
+  // Short personal follow-up in an ongoing weather / clothing advice thread.
+  if (
+    history &&
+    t.length <= 160 &&
+    !/[\\/][\w.-]+\.\w{1,8}\b/.test(t) &&
+    /^(а\s+если|а\s+я|если\s+я|ну\s+а|what\s+if|and\s+if|а\s+как)/i.test(t)
+  ) {
+    const recent = history.slice(-12)
+    const threadLooksLikeAdvice = recent.some((m) => {
+      const c = (m.content ?? '').trim()
+      if (!c || c.length < 8) return false
+      if (m.role === 'user') {
+        return /погод|weather|одеть|надеть|wear|градус|прогноз|что\s+лучше/i.test(c)
+      }
+      if (m.role === 'assistant' && !m.toolName) {
+        return /°\s*c|температур|одежд|куртк|свитер|ветровк|шарф|погод|яндex|open-?meteo/i.test(
+          c
+        )
+      }
+      return false
+    })
+    if (threadLooksLikeAdvice) return true
+  }
+  return false
+}
+
+/** Follow-ups that must patch existing files, not invent a new landing. */
+export function looksLikeSurgicalFollowUp(userText: string): boolean {
+  const t = userText.trim()
+  if (!t) return false
+  return (
+    /без\s+полной\s+перепис|without\s+(a\s+)?full\s+rewrite|не\s+переписывай\s+цел/i.test(t) ||
+    /вынеси|выделить|отдельн(ый|ую|ое)\s+(компонент|файл|css|js|модул)/i.test(t) ||
+    /extract\s+(the\s+)?hero|split\s+(into|out)|move\s+hero\s+into/i.test(t) ||
+    /поправь\s+cta|fix\s+the\s+cta|только\s+cta/i.test(t) ||
+    /добав\S*\s+(больш\S*\s+)?(навбар|navbar|header|футер|footer|секци)/i.test(t) ||
+    /как\s+насч[её]т\s+добав/i.test(t) ||
+    /увели\S*\s+(навбар|navbar|header)|больш\S*\s+навбар/i.test(t)
   )
 }
 

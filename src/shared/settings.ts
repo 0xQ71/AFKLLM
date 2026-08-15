@@ -211,6 +211,11 @@ export interface AppSettings {
    * Empty = no apply process (agent falls back to chat later).
    */
   applyModelPath: string
+  /**
+   * Context for the apply slot. 0 = follow chat ctx (clamped 8192…32768).
+   * A bigger window lets fast-apply see whole medium files instead of a clip.
+   */
+  applyCtxSize: number
   /** Diffusion weights for generate_image (safetensors / gguf) */
   imageGenModelPath: string
   /** FLUX / FLUX.2 VAE (ae.safetensors) */
@@ -347,6 +352,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   visionModelPath: '',
   visionMmprojPath: '',
   applyModelPath: '',
+  applyCtxSize: 0,
   imageGenModelPath: '',
   imageGenVaePath: '',
   imageGenClipLPath: '',

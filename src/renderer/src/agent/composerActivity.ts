@@ -1,4 +1,4 @@
-﻿import { parseReadFileMeta } from './agentPure'
+import { parseReadFileMeta } from './agentPure'
 import { DEFAULT_UI_LANGUAGE } from '../../../shared/i18n'
 import { translate } from '../i18n/messages'
 

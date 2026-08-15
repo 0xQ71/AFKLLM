@@ -1,4 +1,4 @@
-﻿import { promises as fs } from 'node:fs'
+import { promises as fs } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { app } from 'electron'
 import {

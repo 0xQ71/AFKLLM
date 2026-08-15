@@ -6,6 +6,7 @@ export type EvidenceKind =
   | 'verify_ok'
   | 'verify_fail'
   | 'preview_ok'
+  | 'search_ok'
 
 export interface StepEvidence {
   kind: EvidenceKind
@@ -37,6 +38,9 @@ export function evidenceFromTool(opts: {
   }
   if (name === 'apply_patch' || name === 'apply_diff') {
     return { kind: 'patch_ok', tool: name, ok, path }
+  }
+  if (name === 'web_search') {
+    return { kind: 'search_ok', tool: name, ok }
   }
   if (name === 'verify_project') {
     return {
@@ -83,7 +87,11 @@ export function evidenceSupportsStep(stepText: string, log: StepEvidence[]): boo
   const okShell = log.filter(
     (e) => e.ok && (e.kind === 'shell_ok' || e.kind === 'verify_ok' || e.kind === 'preview_ok')
   )
+  const okSearch = log.filter((e) => e.ok && e.kind === 'search_ok')
 
+  if (/web_search|поиск|search\s+the\s+web|искать\s+в\s+интернет|погод|weather/i.test(t)) {
+    return okSearch.length > 0
+  }
   if (/тест|test|pytest|junit|cargo test|go test|dotnet test/i.test(t)) {
     return okShell.some((e) =>
       /test|pytest|gradle test|mvn .*test|cargo test|go test|dotnet test/i.test(

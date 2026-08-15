@@ -37,6 +37,8 @@ import {
   packReadFileForAgent,
   contentLooksStructurallyComplete,
   parseReadFileMeta,
+  readFileRangeCacheKey,
+  resolveExhaustedReadBudget,
   reconcileTodosWithContent,
   progressTodosFromContent,
   displayThinkProse,
@@ -48,8 +50,16 @@ import {
   coerceProductPlan,
   looksLikeToolOrientedPlan,
   isToolOrientedPlanStep,
+  isMetaOrSummaryPlanStep,
+  isRedundantPlanCompleteProse,
   isFalseSuccessProse,
   isAgentChatNoise,
+  detectProseStutter,
+  dedupeStutteringProse,
+  looksLikeChatQa,
+  looksLikeFileEditRequest,
+  looksLikeSurgicalFollowUp,
+  filterPlanToCurrentRequest,
   parseGlobalRenameIntent,
   wantsOpenAfterEdit,
   replaceAllCi,
@@ -67,18 +77,21 @@ import {
   estimateLocalContextSum
 } from '../src/renderer/src/agent/contextUsage'
 import { AgentToolRegistry } from '../src/main/agent/AgentToolRegistry'
-import { looksLikeShellFileMutation } from '../src/shared/shellErrors'
+import { looksLikeShellFileMutation, powershellOperatorMisuse } from '../src/shared/shellErrors'
 import {
   CHAT_MAX_CONTENT_CHARS,
   deriveChatTitle,
   extractBrandFromPrompt,
   isAwkwardChatTitle,
+  isVisibleChatMessageId,
   pickChatTitle,
   sanitizeModelChatTitle,
   sanitizePersistedMessages,
   THREAD_SUMMARY_MSG_ID,
   type PersistedChatMessage
 } from '../src/shared/chats'
+import { applySearchReplaceBlocks } from '../src/shared/fastApply'
+import { hasDisplayableStats } from '../src/renderer/src/components/MessageStatsInfo'
 import { loadProjectRules } from '../src/main/context/ProjectRules'
 import {
   AGENT_PLAN_MSG_ID,
@@ -796,6 +809,79 @@ describe('agent todo plan', () => {
       ),
       true
     )
+    assert.equal(
+      isFalseSuccessProse('Создаю styles.css с секцией .hero. Файлы созданы: Проверка: index.html'),
+      true
+    )
+    assert.equal(
+      looksLikeSurgicalFollowUp(
+        'вынеси hero в отдельный компонент CSS/JS и поправь CTA без полной переписи'
+      ),
+      true
+    )
+    assert.equal(looksLikeSurgicalFollowUp('сделай лендинг с нуля'), false)
+    const stutterUnit =
+      'Создаю styles.css с секцией .hero, CTA кнопки, адаптив. Затем js/main.js. Файлы созданы: '
+    assert.equal(detectProseStutter(stutterUnit.repeat(4)), true)
+    assert.equal(detectProseStutter('short unique text once'), false)
+    const dashBlock =
+      'Примечание: данные основаны на информации из Яндекс Погоды.\n\n' +
+      'Итого: Рекомендации по одежде и погодные условия предоставлены. Если требуется что-то ещё — обращайтесь!'
+    const dashed = `\n\n---\n\n${dashBlock}`.repeat(4)
+    assert.equal(detectProseStutter(dashed), true)
+    const deduped = dedupeStutteringProse(`Ответ короткий.${dashed}`)
+    assert.ok(deduped.includes('Ответ короткий'))
+    assert.ok(!deduped.includes(dashBlock.repeat(2)))
+    assert.equal(looksLikeChatQa('что лучше одеть'), true)
+    assert.equal(looksLikeChatQa('какая погода сейчас в Москвее'), true)
+    assert.equal(looksLikeChatQa('исправь index.html hero'), false)
+    assert.equal(looksLikeChatQa('а если я как печка'), true)
+    assert.equal(looksLikeSurgicalFollowUp('как насчёт добавления большого навбара'), true)
+    assert.equal(looksLikeFileEditRequest('как насчёт добавления большого навбара'), true)
+    assert.equal(
+      isFalseSuccessProse(
+        'Создаю компонент навбара в отдельном файле и обновляю index.html без полной переписи. Созданные файлы: Обновления:'
+      ),
+      true
+    )
+    const scoped = filterPlanToCurrentRequest(
+      [
+        {
+          id: '1',
+          text: 'Добавить большой навбар в index.html',
+          status: 'pending' as const
+        },
+        {
+          id: '2',
+          text: 'Добавить RU/EN переключатель языка',
+          status: 'pending' as const
+        },
+        {
+          id: '3',
+          text: 'Полностью обновить лендинг и виджет погоды',
+          status: 'pending' as const
+        }
+      ],
+      'как насчёт добавления большого навбара'
+    )
+    assert.equal(scoped.length, 1)
+    assert.match(scoped[0]!.text, /навбар/i)
+    assert.equal(
+      looksLikeChatQa('а если ещё теплее', [
+        { role: 'user', content: 'какая погода сейчас Москве' },
+        {
+          role: 'assistant',
+          content: 'Сейчас +10°C, облачно. Лучше свитер и ветровка.'
+        }
+      ]),
+      true
+    )
+    assert.equal(
+      looksLikeChatQa('а если ещё', [
+        { role: 'user', content: 'сделай лендинг bootstrap' }
+      ]),
+      false
+    )
     assert.equal(isJunkPlanStep('*Что изменилось:**'), true)
     assert.equal(isJunkPlanStep('Как проверить:'), true)
     assert.equal(
@@ -1069,6 +1155,40 @@ describe('agent todo plan', () => {
     assert.equal(pendingPlanWork(steps).length, 0)
   })
 
+  it('web_search / extract / tell-user weather plan does not leave file work pending', () => {
+    const steps = [
+      {
+        id: '1',
+        text: 'Выполнить web_search с запросом "погода Переславль-Залесский сегодня"',
+        status: 'pending' as const
+      },
+      {
+        id: '2',
+        text: 'Извлечь информацию о температуре, осадках и условиях из результатов поиска',
+        status: 'pending' as const
+      },
+      {
+        id: '3',
+        text: 'Сообщить пользователю текущую погоду в Переславле-Залесском',
+        status: 'pending' as const
+      }
+    ]
+    assert.equal(isToolOrientedPlanStep(steps[0]!.text), true)
+    assert.equal(isMetaOrSummaryPlanStep(steps[1]!.text), true)
+    assert.equal(isMetaOrSummaryPlanStep(steps[2]!.text), true)
+    assert.equal(pendingPlanWork(steps).length, 0)
+  })
+
+  it('detects redundant “plan already done in previous answer” prose', () => {
+    assert.equal(
+      isRedundantPlanCompleteProse(
+        'Все три шага плана уже выполнены в предыдущем ответе:\n1. web_search'
+      ),
+      true
+    )
+    assert.equal(isRedundantPlanCompleteProse('Сейчас в Переславле +10°C'), false)
+  })
+
   it('Найти FAQ в существующем файле is soft (Cyrillic, no \\b)', () => {
     const findFaq = 'Найти FAQ в существующем файле'
     assert.ok(isSoftLayoutPlanStep(findFaq))
@@ -1174,19 +1294,39 @@ describe('chat titles', () => {
 })
 
 describe('packReadFileForAgent', () => {
-  it('includes head, tail, total_lines and FILE_COMPLETE for long HTML', () => {
-    const lines = Array.from({ length: 400 }, (_, i) => {
+  it('returns a 200-line file whole when it fits the budget', () => {
+    const lines = Array.from({ length: 200 }, (_, i) => {
       if (i === 0) return '<!DOCTYPE html><html><body>'
-      if (i === 398) return '</body>'
-      if (i === 399) return '</html>'
+      if (i === 50) return '<style>.hero { color: red; }</style>'
+      if (i === 198) return '</body>'
+      if (i === 199) return '</html>'
       return `<!-- section line ${i + 1} -->`
     })
     const raw = lines.join('\n')
-    const packed = packReadFileForAgent(raw, { headLines: 80, tailLines: 40, maxChars: 6000 })
+    const packed = packReadFileForAgent(raw, { maxChars: 24_000 })
+    assert.match(packed, /truncated=false/)
+    assert.match(packed, /--- full file ---/)
+    assert.match(packed, /\.hero \{ color: red; \}/)
+    assert.match(packed, /<\/html>/)
+  })
+
+  it('includes a structure map with line numbers when the file is too large', () => {
+    const lines = Array.from({ length: 400 }, (_, i) => {
+      if (i === 0) return '<!DOCTYPE html><html><body>'
+      if (i === 100) return '<style id="theme">.mid { color: blue; }</style>'
+      if (i === 200) return '<section id="hero">Hero body</section>'
+      if (i === 398) return '</body>'
+      if (i === 399) return '</html>'
+      return `<!-- section line ${i + 1} xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx -->`
+    })
+    const raw = lines.join('\n')
+    const packed = packReadFileForAgent(raw, { maxChars: 6000 })
     assert.match(packed, /total_lines=400/)
     assert.match(packed, /truncated=true/)
     assert.match(packed, /FILE_COMPLETE/)
-    assert.match(packed, /lines 1-80/)
+    assert.match(packed, /structure map/)
+    assert.match(packed, /101\|/)
+    assert.match(packed, /201\|/)
     assert.match(packed, /<\/html>/)
     assert.match(packed, /Do NOT rewrite/)
     const meta = parseReadFileMeta(packed)
@@ -1375,7 +1515,7 @@ describe('AgentToolRegistry edit review', () => {
     }
   })
 
-  it('complete medium landing HTML may overwrite; incomplete still blocked', async () => {
+  it('finished landing is edited, not regenerated — overwrite needs allow_full_rewrite', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'afkllm-landing-exists-'))
     try {
       const reg = new AgentToolRegistry({ projectRoot: root })
@@ -1395,7 +1535,7 @@ describe('AgentToolRegistry edit review', () => {
       assert.match(blocked.error ?? '', /FILE_COMPLETE/)
       assert.doesNotMatch(blocked.error ?? '', /overwrite=true/)
 
-      const overwritten = await reg.invoke({
+      const rewriteBlocked = await reg.invoke({
         id: '2',
         name: 'write_file',
         arguments: {
@@ -1404,8 +1544,47 @@ describe('AgentToolRegistry edit review', () => {
           overwrite: true
         }
       })
-      assert.equal(overwritten.ok, true, overwritten.error ?? overwritten.content)
+      assert.equal(rewriteBlocked.ok, false)
+      assert.match(rewriteBlocked.error ?? '', /FILE_COMPLETE/)
+      assert.match(rewriteBlocked.content, /apply_diff/)
+      assert.equal(await fs.readFile(path.join(root, rel), 'utf8'), big)
+
+      const explicit = await reg.invoke({
+        id: '3',
+        name: 'write_file',
+        arguments: {
+          relative_path: rel,
+          content: big.replace('Northline', 'Northline Dark'),
+          overwrite: true,
+          allow_full_rewrite: true
+        }
+      })
+      assert.equal(explicit.ok, true, explicit.error ?? explicit.content)
       assert.match(await fs.readFile(path.join(root, rel), 'utf8'), /Northline Dark/)
+    } finally {
+      await fs.rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('small complete HTML may still be overwritten in one shot', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'afkllm-small-html-'))
+    try {
+      const reg = new AgentToolRegistry({ projectRoot: root })
+      const rel = 'index.html'
+      const small =
+        '<!DOCTYPE html><html><head><title>Draft</title></head><body><p>hi</p></body></html>\n'
+      await fs.writeFile(path.join(root, rel), small, 'utf8')
+      const res = await reg.invoke({
+        id: '1',
+        name: 'write_file',
+        arguments: {
+          relative_path: rel,
+          content: small.replace('Draft', 'Draft 2'),
+          overwrite: true
+        }
+      })
+      assert.equal(res.ok, true, res.error ?? res.content)
+      assert.match(await fs.readFile(path.join(root, rel), 'utf8'), /Draft 2/)
     } finally {
       await fs.rm(root, { recursive: true, force: true })
     }
@@ -1822,6 +2001,99 @@ describe('SHELL_EDIT_FORBIDDEN', () => {
     } finally {
       await fs.rm(root, { recursive: true, force: true })
     }
+  })
+})
+
+describe('read_file range cache budget', () => {
+  it('keys ranges separately so another range cannot reuse prior content', () => {
+    const a = readFileRangeCacheKey('index.html', 1, 40)
+    const b = readFileRangeCacheKey('index.html', 80, 120)
+    const full = readFileRangeCacheKey('index.html')
+    assert.notEqual(a, b)
+    assert.notEqual(a, full)
+    assert.equal(readFileRangeCacheKey('index.html', 1, 40), a)
+  })
+
+  it('exhausted budget returns ok:false on miss, not an empty ok:true', () => {
+    const miss = resolveExhaustedReadBudget(undefined, 'index.html')
+    assert.equal(miss.ok, false)
+    assert.equal(miss.content, '')
+    assert.match(miss.error ?? '', /READ_BUDGET/)
+
+    const hit = resolveExhaustedReadBudget('--- lines 1-10 ---\n<style>', 'index.html')
+    assert.equal(hit.ok, true)
+    assert.match(hit.content, /<style>/)
+    assert.match(hit.content, /cached read_file/)
+  })
+})
+
+describe('search_codebase punctuation grep fallback', () => {
+  it('finds <style> via grep when BM25 would drop punctuation', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'afkllm-search-style-'))
+    try {
+      await fs.writeFile(
+        path.join(root, 'index.html'),
+        '<!DOCTYPE html>\n<html><head>\n<style>.hero { color: red; }</style>\n</head><body>Hi</body></html>\n',
+        'utf8'
+      )
+      const reg = new AgentToolRegistry({ projectRoot: root })
+      const res = await reg.invoke({
+        id: '1',
+        name: 'search_codebase',
+        arguments: { query: '<style>' }
+      })
+      assert.equal(res.ok, true)
+      assert.match(res.content, /style/i)
+      assert.doesNotMatch(res.content, /No matches found/)
+    } finally {
+      await fs.rm(root, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('applySearchReplaceBlocks fuzzy + CRLF', () => {
+  it('applies fuzzy blocks and keeps CRLF endings', () => {
+    // Tab vs spaces: exact SEARCH fails, fuzzy normalizeLineForFuzzy matches.
+    const original = 'line one\r\n\tline two\r\nline three\r\n'
+    const out = applySearchReplaceBlocks(original, [
+      {
+        search: '  line two',
+        replace: 'line TWO'
+      }
+    ])
+    assert.equal(out.applied, 1)
+    assert.equal(out.failed.length, 0)
+    assert.match(out.content, /\r\n/)
+    assert.match(out.content, /line TWO/)
+    // Fuzzy keeps the file's indent; CRLF must survive end-to-end.
+    assert.equal(out.content, 'line one\r\n\tline TWO\r\nline three\r\n')
+  })
+})
+
+describe('thread summary visibility', () => {
+  it('hides thread-summary from the chat list while keeping the id for memory', () => {
+    assert.equal(THREAD_SUMMARY_MSG_ID, 'thread-summary')
+    assert.equal(isVisibleChatMessageId(THREAD_SUMMARY_MSG_ID), false)
+    assert.equal(isVisibleChatMessageId('welcome'), true)
+    assert.equal(isVisibleChatMessageId('msg-1'), true)
+  })
+})
+
+describe('hasDisplayableStats', () => {
+  it('returns true when tps is present', () => {
+    assert.equal(hasDisplayableStats({ tps: 42 }), true)
+    assert.equal(hasDisplayableStats(null), false)
+    assert.equal(hasDisplayableStats({}), false)
+  })
+})
+
+describe('powershellOperatorMisuse', () => {
+  it('flags -And as a cmdlet parameter and suggests parentheses', () => {
+    const err = powershellOperatorMisuse('Test-Path "index.html" -And (Test-Path "styles.css")')
+    assert.ok(err)
+    assert.match(err!, /SHELL_SYNTAX/)
+    assert.match(err!, /-and/i)
+    assert.match(err!, /\(Test-Path/)
   })
 })
 

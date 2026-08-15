@@ -195,6 +195,14 @@ export class LLMQueueManager {
       const body = {
         ...request.body,
         stream: useStream,
+        // Some llama.cpp builds omit usage/timings from the final SSE chunk
+        // unless asked — that left per-message tok/s and token counts empty.
+        ...(useStream
+          ? {
+              stream_options: { include_usage: true },
+              timings_per_token: true
+            }
+          : {}),
         ...(this.defaultModel && !request.body.model
           ? { model: this.defaultModel }
           : {})

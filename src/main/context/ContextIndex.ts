@@ -193,15 +193,22 @@ export class ContextIndex {
     let budget = QUERY_MAX_CHARS
     let hitCount = 0
 
+    const lowerTerms = terms.map((t) => t.toLowerCase())
     for (const h of ranked) {
       const chunk = byId.get(h.id)
       if (!chunk) continue
       files.add(chunk.path)
-      const preview = chunk.text
-        .split('\n')
-        .slice(0, 12)
-        .map((l, i) => `${chunk.startLine + i}| ${l.slice(0, 160)}`)
-        .join('\n')
+      // Preview the MATCHING lines. Showing the first 12 lines of a 100-line
+      // chunk hid hits and pushed the agent into guessing read_file ranges.
+      const chunkLines = chunk.text.split('\n')
+      const numbered = chunkLines.map(
+        (l, i) => `${chunk.startLine + i}| ${l.slice(0, 160)}`
+      )
+      const matched = numbered.filter((l) => {
+        const body = l.toLowerCase()
+        return lowerTerms.some((t) => body.includes(t))
+      })
+      const preview = (matched.length ? matched : numbered).slice(0, 12).join('\n')
       const block = `${chunk.path}:${chunk.startLine}-${chunk.endLine} (score=${h.score.toFixed(2)})\n${preview}`
       if (block.length + 8 > budget) break
       blocks.push('---')

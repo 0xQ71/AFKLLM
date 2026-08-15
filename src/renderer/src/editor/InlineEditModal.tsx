@@ -25,6 +25,8 @@ export interface InlineEditModalProps {
   filePath: string
   queue: QueueManager
   editorTheme?: string
+  /** Coresident apply model is loaded — use it instead of the chat queue. */
+  applyReady?: boolean
   /** Called after user Accepts — parent should persist content */
   onAccept: (payload: { filePath: string; content: string }) => void
 }
@@ -42,6 +44,7 @@ export function InlineEditModal({
   filePath,
   queue,
   editorTheme = 'afkllm-dark',
+  applyReady = false,
   onAccept
 }: InlineEditModalProps): React.JSX.Element | null {
   const [instruction, setInstruction] = useState('')
@@ -98,6 +101,16 @@ export function InlineEditModal({
     requestAnimationFrame(() => inputRef.current?.focus())
   }, [open, editor])
 
+  // Live apply-model tokens so the overlay never looks frozen.
+  useEffect(() => {
+    if (!open) return
+    let streamed = ''
+    return window.api.agent.onApplyToken(({ token }) => {
+      streamed += token
+      setStreamPreview(streamed.slice(-1200))
+    })
+  }, [open])
+
   const runEdit = useCallback(async () => {
     const snap = selectionSnapshot.current
     if (!snap || !instruction.trim()) return
@@ -107,6 +120,34 @@ export function InlineEditModal({
     setStreamPreview('')
 
     try {
+      // Fast path: the coresident apply model. It is built for SEARCH/REPLACE
+      // and leaves the chat queue free, so Ctrl+K stays snappy.
+      const applyResult = applyReady
+        ? await window.api.agent.applyEdit({
+            instruction: instruction.trim(),
+            filePath,
+            content: snap.fullText,
+            region: {
+              startLine: snap.range.startLineNumber,
+              endLine: snap.range.endLineNumber
+            }
+          })
+        : null
+
+      if (applyResult?.ok && applyResult.content != null) {
+        setPreview({
+          original: snap.fullText,
+          modified: applyResult.content,
+          languageId: snap.languageId,
+          filePath,
+          blocks: [],
+          applied: applyResult.applied ?? 1,
+          failed: []
+        })
+        setPhase('diff')
+        return
+      }
+
       const messages = buildInlineEditMessages({
         instruction: instruction.trim(),
         selectedCode: snap.selectedCode,
@@ -133,7 +174,9 @@ export function InlineEditModal({
       const text = result.text || streamed
       const blocks = parseSearchReplaceBlocks(text)
       if (!blocks.length) {
-        throw new Error('Model returned no SEARCH/REPLACE blocks')
+        throw new Error(
+          applyResult?.error ?? 'Model returned no SEARCH/REPLACE blocks'
+        )
       }
 
       const applied = applySearchReplaceBlocks(snap.fullText, blocks)
@@ -158,7 +201,7 @@ export function InlineEditModal({
       setError(err instanceof Error ? err.message : String(err))
       setPhase('error')
     }
-  }, [instruction, filePath, queue])
+  }, [instruction, filePath, queue, applyReady])
 
   const accept = useCallback(() => {
     if (!preview || !editor) return

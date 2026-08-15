@@ -4,8 +4,14 @@ import { detectStacks, commandForMode, formatStackPromptSection } from '../src/s
 import {
   extractErrorFocus,
   isUserInterruptExit,
-  looksLikeGuiLaunchCommand
+  looksLikeGuiLaunchCommand,
+  recursiveListingRefusal
 } from '../src/shared/shellErrors'
+import {
+  userAskedVerify,
+  shouldNudgeVerify,
+  stackSupportsVerify
+} from '../src/renderer/src/agent/loop/verify'
 import { allowsFullOverwrite } from '../src/shared/writeThresholds'
 import { contentLooksStructurallyComplete } from '../src/renderer/src/agent/loop/completeness'
 import { evidenceSupportsStep, evidenceFromTool, recordEvidence } from '../src/renderer/src/agent/loop/evidence'
@@ -46,6 +52,79 @@ describe('stack detect', () => {
     const text = formatStackPromptSection([])
     assert.match(text, /unknown/i)
     assert.doesNotMatch(text, /Bootstrap/)
+  })
+
+  it('static HTML prompt forbids recursive verify scavenger hunts', () => {
+    const [html] = detectStacks(['index.html'])
+    assert.equal(html?.id, 'html')
+    assert.equal(commandForMode(html!, 'build'), null)
+    assert.equal(stackSupportsVerify([html!]), false)
+    const text = formatStackPromptSection([html!])
+    assert.match(text, /FORBIDDEN|Get-ChildItem -Recurse/i)
+    assert.match(text, /one preview|one-shot|ONCE/i)
+  })
+})
+
+describe('verify nudge intent', () => {
+  it('does not treat «после сборки открой» as a verify ask', () => {
+    assert.equal(
+      userAskedVerify('После сборки открой index.html в превью и кратко подтверди'),
+      false
+    )
+    assert.equal(userAskedVerify('Сделай профессиональный лендинг для AFKLLM'), false)
+    assert.equal(shouldNudgeVerify({ userText: 'После сборки открой', stacks: [] }), false)
+  })
+
+  it('fires only on explicit test/build asks when the stack has commands', () => {
+    assert.equal(userAskedVerify('проверь сборку проекта'), true)
+    assert.equal(userAskedVerify('запусти тесты'), true)
+    assert.equal(userAskedVerify('run npm test'), true)
+    const node = detectStacks(['package.json'])[0]!
+    assert.equal(stackSupportsVerify([node]), true)
+    assert.equal(
+      shouldNudgeVerify({ userText: 'проверь сборку', stacks: [node] }),
+      true
+    )
+    const html = detectStacks(['index.html'])[0]!
+    assert.equal(
+      shouldNudgeVerify({ userText: 'проверь сборку', stacks: [html] }),
+      false
+    )
+  })
+})
+
+describe('recursive listing refusal', () => {
+  it('blocks unbounded Get-ChildItem -Recurse', () => {
+    assert.match(
+      recursiveListingRefusal('Get-ChildItem -Recurse -File | Select-Object FullName') ?? '',
+      /SHELL_REFUSED/
+    )
+    assert.equal(recursiveListingRefusal('Get-ChildItem -Depth 2'), null)
+    assert.equal(recursiveListingRefusal('npm test'), null)
+  })
+})
+
+describe('verify_project static HTML one-shot', () => {
+  it('checks entry files without shell and without recurse', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'afkllm-html-verify-'))
+    try {
+      await fs.writeFile(path.join(root, 'index.html'), '<!doctype html><title>x</title>', 'utf8')
+      await fs.writeFile(path.join(root, 'styles.css'), 'body{}', 'utf8')
+      await fs.mkdir(path.join(root, 'js'))
+      await fs.writeFile(path.join(root, 'js', 'main.js'), 'console.log(1)', 'utf8')
+      const reg = new AgentToolRegistry({ projectRoot: root })
+      const res = await reg.invoke({
+        id: '1',
+        name: 'verify_project',
+        arguments: { mode: 'build' }
+      })
+      assert.equal(res.ok, true)
+      assert.match(res.content, /static HTML/)
+      assert.match(res.content, /OK {2}index\.html/)
+      assert.match(res.content, /Do NOT Get-ChildItem -Recurse/)
+    } finally {
+      await fs.rm(root, { recursive: true, force: true })
+    }
   })
 })
 
@@ -186,6 +265,34 @@ describe('evidence-gated plan', () => {
       })!
     )
     assert.equal(evidenceSupportsStep('Запустить pytest', log), true)
+  })
+
+  it('web_search ticks weather/search plan rows and does not need a write', () => {
+    const steps = [
+      {
+        id: '1',
+        text: 'Выполнить web_search с запросом "погода Переславль"',
+        status: 'in_progress' as const
+      },
+      {
+        id: '2',
+        text: 'Извлечь информацию о температуре и осадках',
+        status: 'pending' as const
+      },
+      {
+        id: '3',
+        text: 'Сообщить пользователю текущую погоду',
+        status: 'pending' as const
+      }
+    ]
+    const { steps: next, evidence } = advanceTodosOnEvidence(steps, [], {
+      name: 'web_search',
+      ok: true,
+      content: 'temp +10'
+    })
+    assert.ok(evidence.some((e) => e.kind === 'search_ok'))
+    assert.equal(next.find((s) => s.id === '1')?.status, 'done')
+    assert.equal(evidenceSupportsStep(steps[0]!.text, evidence), true)
   })
 })
 

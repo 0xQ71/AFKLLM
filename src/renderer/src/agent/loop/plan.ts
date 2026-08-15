@@ -15,7 +15,7 @@ function rebalance(steps: AgentTodoStep[]): AgentTodoStep[] {
 
 /**
  * Close a plan row only when this tool produced matching evidence.
- * Successful list/read/search never ticks a product step.
+ * Successful list/read never ticks a product step; web_search may tick search rows.
  */
 export function advanceTodosOnEvidence(
   steps: AgentTodoStep[],

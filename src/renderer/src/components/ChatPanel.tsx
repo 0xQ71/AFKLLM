@@ -39,7 +39,9 @@ import {
   DEFAULT_WELCOME_MESSAGE,
   deriveChatTitle,
   isDefaultChatTitle,
-  pickChatTitle
+  isVisibleChatMessageId,
+  pickChatTitle,
+  THREAD_SUMMARY_MSG_ID
 } from '../../../shared/chats'
 import { ComposerQueue, type QueuedFollowUp } from './ComposerQueue'
 import { EditReviewDiff } from './EditReviewDiff'
@@ -1325,7 +1327,7 @@ export function ChatPanel({
                   </div>
                 </div>
                 {!m.streaming && hasDisplayableStats(m.stats) ? (
-                  <MessageStatsInfo stats={m.stats!} />
+                  <MessageStatsInfo stats={m.stats!} t={t} />
                 ) : null}
               </div>
             ) : !m.toolName && (m.content?.trim() || (m.files && m.files.length > 0) || (m.images && m.images.length > 0)) ? (
@@ -1467,7 +1469,7 @@ export function ChatPanel({
                     )}
                   </div>
                   {!m.streaming && hasDisplayableStats(m.stats) ? (
-                    <MessageStatsInfo stats={m.stats!} />
+                    <MessageStatsInfo stats={m.stats!} t={t} />
                   ) : null}
                 </div>
               )
@@ -2069,7 +2071,6 @@ function ThinkThroughBody({
   durationLabel?: string
 }): React.JSX.Element {
   const { t } = useI18n()
-  void durationLabel
   const live = liveThinkProse(content)
   const hasThinkTags = /<\s*(?:think|thinking)\s*>/i.test(content)
   const lastGoodRef = useRef('')
@@ -2089,19 +2090,23 @@ function ThinkThroughBody({
     )
   }
 
-  const displaySrc = content
-  const parts = parseThinkBlocks(displaySrc).map((p) => {
+  const parts = parseThinkBlocks(content).map((p) => {
     if (p.kind === 'think') {
       const text =
         displayThinkProse(`<think>${p.text}</think>`) ||
         liveThinkProse(p.text) ||
         (p.text.trim() && !/^[.….\s·•<]+$/u.test(p.text.trim()) ? p.text : '')
-      return { ...p, text }
+      // Prefer longest stable prose if a brief empty frame arrives mid-stream.
+      const stable =
+        text.trim() ||
+        (streaming && lastGoodRef.current ? lastGoodRef.current : '')
+      return { ...p, text: stable }
     }
     return { ...p, text: stripPlanBlock(stripThinkTags(p.text)) }
   })
   const thinkParts = parts.filter((p) => p.kind === 'think' && p.text.trim())
   const textParts = parts.filter((p) => p.kind === 'text' && p.text.trim())
+  // One fold only — if multiple think blocks leaked in, keep the longest.
   const mergedThink =
     thinkParts.length > 0
       ? thinkParts.map((p) => p.text).sort((a, b) => b.length - a.length)[0]!
@@ -2143,6 +2148,9 @@ function ThinkThroughBody({
             />
           </svg>
           {thoughtLabel}
+          {!streaming && durationLabel ? (
+            <span className="text-ink-mute/60">{durationLabel}</span>
+          ) : null}
         </summary>
         <div className="mt-1.5 border-l border-ink-line/50 pl-3 text-[12px] leading-relaxed text-ink-mute [&_.text-ink-soft]:text-ink-mute [&_.text-ink-bright]:text-ink-soft">
           <MarkdownBody content={body} streaming={!!streaming} />
@@ -2573,6 +2581,9 @@ function fileExtLabel(name: string): string {
 }
 
 function isVisibleChatMessage(m: ChatMessage): boolean {
+  // Thread memory is prompt context, not a chat message. sanitizePersistedMessages
+  // pins it right after "welcome", so rendering it parked a debug dump at the top.
+  if (!isVisibleChatMessageId(m.id)) return false
   if (isAgentTodoMessageId(m.id)) return Boolean(m.content?.trim())
   if (m.id === AGENT_CHECKLIST_MSG_ID) return Boolean(m.content?.trim())
   if (m.id === 'welcome') return true

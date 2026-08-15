@@ -20,9 +20,15 @@ import {
   extractErrorFocus,
   isUserInterruptExit,
   looksLikeGuiLaunchCommand,
-  looksLikeShellFileMutation
+  looksLikeShellFileMutation,
+  powershellOperatorMisuse,
+  recursiveListingRefusal
 } from '../../shared/shellErrors'
-import { allowsFullOverwrite, truncationGuardMessage } from '../../shared/writeThresholds'
+import {
+  allowsFullOverwrite,
+  SMALL_FILE_OVERWRITE_CHARS,
+  truncationGuardMessage
+} from '../../shared/writeThresholds'
 import {
   commandForMode,
   DEFAULT_IGNORE_DIRS,
@@ -40,6 +46,7 @@ import {
   pathToFileUrl
 } from '../../shared/localPreview'
 import { fastApplyEdit } from '../llama/ApplyEditClient'
+import { locateApplyRegion, type ApplyRegion } from '../../shared/fastApply'
 
 const IGNORED_DIRS = new Set<string>([...DEFAULT_IGNORE_DIRS])
 
@@ -88,6 +95,10 @@ export interface AgentToolRegistryOptions {
    * Coresident apply llama-server base URL (port+1) when ready; null if unloaded.
    */
   getApplyBaseUrl?: () => string | null
+  /** Apply slot ctx — sizes the apply prompt window and max_tokens. */
+  getApplyCtxSize?: () => number | null
+  /** Live apply-model tokens for the UI (a silent 60s call looked like a freeze). */
+  onApplyToken?: (relativePath: string, token: string) => void
   /** Latest IDE diagnostics snapshot (tsc/eslint). */
   getDiagnostics?: () => DiagnosticsSnapshot
 }
@@ -112,6 +123,8 @@ export class AgentToolRegistry {
   private contextIndex?: AgentToolRegistryOptions['contextIndex']
   private generateImageFn?: AgentToolRegistryOptions['generateImage']
   private getApplyBaseUrl?: () => string | null
+  private getApplyCtxSize?: () => number | null
+  private onApplyToken?: AgentToolRegistryOptions['onApplyToken']
   private getDiagnostics?: () => DiagnosticsSnapshot
   /** First-edit-per-path snapshot for Accept/Reject undo */
   private pendingEdits = new Map<string, PendingEdit>()
@@ -129,6 +142,8 @@ export class AgentToolRegistry {
     this.contextIndex = options.contextIndex
     this.generateImageFn = options.generateImage
     this.getApplyBaseUrl = options.getApplyBaseUrl
+    this.getApplyCtxSize = options.getApplyCtxSize
+    this.onApplyToken = options.onApplyToken
     this.getDiagnostics = options.getDiagnostics
     this.handlers = new Map([
       ['read_file', (a) => this.readFile(a)],
@@ -623,18 +638,16 @@ export class AgentToolRegistry {
       }
     }
 
-    // Huge finished files only: require apply_diff or allow_full_rewrite.
-    // Medium HTML (under LARGE_FILE_OVERWRITE_CHARS) may be overwritten in one
-    // shot — the apply-model slot is often too small for the whole page.
+    // A finished page is edited, never regenerated: rewriting it burns minutes of
+    // tokens and silently drops sections the user never asked to change.
     if (
       overwrite &&
       !append &&
       existed &&
       htmlDocumentComplete(existing) &&
-      existing.length >= 800 &&
+      existing.length >= SMALL_FILE_OVERWRITE_CHARS &&
       htmlDocumentComplete(content) &&
-      !Boolean(args.allow_full_rewrite) &&
-      !allowsFullOverwrite(relativePath, existing.length)
+      !Boolean(args.allow_full_rewrite)
     ) {
       return {
         id: '',
@@ -642,8 +655,8 @@ export class AgentToolRegistry {
         ok: false,
         content:
           `FILE_COMPLETE: "${relativePath}" already ends with </html> (${existing.length} bytes).\n` +
-          'This file is too large for a one-shot overwrite. Use apply_diff / apply_patch, ' +
-          'or pass allow_full_rewrite=true after failed patches.',
+          'Do NOT regenerate the page. Make the requested change with apply_diff ' +
+          '(replace_all=true for a global rename), one edit per distinct snippet.',
         error: `FILE_COMPLETE: ${relativePath} — use apply_diff; full rewrite blocked`
       }
     }
@@ -864,6 +877,7 @@ export class AgentToolRegistry {
       abs,
       original,
       instruction,
+      region: locateApplyRegion(original, searchBlock, instructionArg),
       timeoutMs:
         typeof args.timeout_ms === 'number' && args.timeout_ms > 0
           ? Math.min(90_000, Math.floor(args.timeout_ms))
@@ -889,6 +903,8 @@ export class AgentToolRegistry {
     original: string
     instruction: string
     retargetNote?: string
+    /** Line range the edit targets — the prompt window centers on it. */
+    region?: ApplyRegion
     /** Cap apply wait (default 60s). Keep short for parse-fail fallbacks. */
     timeoutMs?: number
     /** 1 = no retry (fail fast). Default 2. */
@@ -921,8 +937,11 @@ export class AgentToolRegistry {
       instruction: opts.instruction,
       filePath: opts.relativePath,
       content: opts.original,
+      region: opts.region,
+      ctxSize: this.getApplyCtxSize?.() ?? undefined,
       timeoutMs: opts.timeoutMs ?? 60_000,
-      maxAttempts: opts.maxAttempts ?? 2
+      maxAttempts: opts.maxAttempts ?? 2,
+      onToken: (token) => this.onApplyToken?.(opts.relativePath, token)
     })
 
     if (!result.ok) {
@@ -974,6 +993,7 @@ export class AgentToolRegistry {
             original,
             instruction:
               `Apply ONLY this intended addition/change (malformed apply_patch):\n${plusIntent}`,
+            region: locateApplyRegion(original, '', plusIntent),
             timeoutMs: 45_000
           })
         } catch {
@@ -994,8 +1014,13 @@ export class AgentToolRegistry {
     const changed: Array<{ path: string; action: string }> = []
     const errors: string[] = []
     let firstReviewPath: string | null = null
-    let lastFailedUpdate: { path: string; abs: string; original: string } | null =
-      null
+    let lastFailedUpdate: {
+      path: string
+      abs: string
+      original: string
+      /** Context/removed lines of the failed hunk — anchors the apply window. */
+      failedContext: string
+    } | null = null
 
     for (const op of parsed.ops) {
       try {
@@ -1059,7 +1084,17 @@ export class AgentToolRegistry {
         const applied = applyHunksToText(original, op.hunks ?? [])
         if (!applied.ok || applied.content == null) {
           errors.push(`${updatePath}: ${applied.error ?? 'hunk apply failed'}`)
-          lastFailedUpdate = { path: updatePath, abs: updateAbs, original }
+          lastFailedUpdate = {
+            path: updatePath,
+            abs: updateAbs,
+            original,
+            failedContext: (op.hunks ?? [])
+              .flatMap((h) => h.lines)
+              .filter((l) => l.kind !== '+')
+              .map((l) => l.text)
+              .join('\n')
+              .slice(0, 2_000)
+          }
           continue
         }
         this.rememberEdit(updatePath, true, original)
@@ -1089,6 +1124,11 @@ export class AgentToolRegistry {
           plusIntent.length >= 24
             ? `Apply ONLY this intended change (hunks failed):\n${plusIntent}`
             : `Apply this patch intent (deterministic hunks failed).\n\n${patchText.slice(0, 4_000)}`,
+        region: locateApplyRegion(
+          lastFailedUpdate.original,
+          lastFailedUpdate.failedContext,
+          plusIntent
+        ),
         timeoutMs: 45_000
       })
     }
@@ -1144,10 +1184,15 @@ export class AgentToolRegistry {
     }
 
     const glob = typeof args.glob === 'string' ? args.glob : undefined
-    // BM25 when ready; glob still uses walk-grep
-    if (!glob && this.contextIndex?.isReady()) {
+    // BM25 drops punctuation, so "<style>" / ".hero {" / "-->" only work as a
+    // literal grep. Sending those to the index returned a confident "0 hits".
+    const literalQuery = /[<>{}()[\];:="'`*+\\|@#$&!?]/.test(query)
+    // BM25 when ready; glob and literal queries use walk-grep
+    if (!glob && !literalQuery && this.contextIndex?.isReady()) {
       const hit = this.contextIndex.query(query)
-      if (hit && hit.text.trim()) {
+      // hits>0, not text.trim(): an empty result still carries a "hits=0" header
+      // and used to short-circuit the grep fallback entirely.
+      if (hit && hit.hits > 0) {
         return {
           id: '',
           name: 'search_codebase',
@@ -1162,7 +1207,9 @@ export class AgentToolRegistry {
       id: '',
       name: 'search_codebase',
       ok: true,
-      content: matches.length ? matches.join('\n') : 'No matches found'
+      content: matches.length
+        ? matches.join('\n')
+        : `No matches found for ${query}. Try a shorter literal fragment (one selector, tag or identifier).`
     }
   }
 
@@ -1235,6 +1282,30 @@ export class AgentToolRegistry {
           'SHELL_EDIT_FORBIDDEN: shell text substitution cannot edit workspace files — ' +
           'it bypasses the diff review, the file tree refresh and rewind (the change cannot be undone). ' +
           'Global rename: apply_diff with replace_all=true. New file: write_file. Delete: delete_file.'
+      }
+    }
+
+    const operatorMisuse =
+      powershellOperatorMisuse(command) ?? powershellOperatorMisuse(rawCommand)
+    if (operatorMisuse) {
+      return {
+        id: '',
+        name: 'execute_terminal_command',
+        ok: false,
+        content: '',
+        error: operatorMisuse
+      }
+    }
+
+    const recurseRefuse =
+      recursiveListingRefusal(command) ?? recursiveListingRefusal(rawCommand)
+    if (recurseRefuse) {
+      return {
+        id: '',
+        name: 'execute_terminal_command',
+        ok: false,
+        content: '',
+        error: recurseRefuse
       }
     }
 
@@ -1429,8 +1500,9 @@ export class AgentToolRegistry {
         : 'build'
     const override = String(args.command ?? '').trim()
     let command = override
+    let snap: Awaited<ReturnType<typeof probeProjectStack>> | null = null
     if (!command) {
-      const snap = await probeProjectStack(this.projectRoot)
+      snap = await probeProjectStack(this.projectRoot)
       for (const stack of snap.stacks) {
         const cmd = commandForMode(stack, mode)
         if (cmd) {
@@ -1440,6 +1512,10 @@ export class AgentToolRegistry {
       }
     }
     if (!command) {
+      if (!snap) snap = await probeProjectStack(this.projectRoot)
+      if (snap.stacks.some((s) => s.id === 'html')) {
+        return this.verifyStaticHtmlOnce(mode)
+      }
       return {
         id: '',
         name: 'verify_project',
@@ -1458,6 +1534,36 @@ export class AgentToolRegistry {
       ...result,
       name: 'verify_project',
       content: `verify_project mode=${mode}\ncommand: ${command}\n\n${result.content}`
+    }
+  }
+
+  /**
+   * Static HTML has no compiler. One shallow existence check of known entry
+   * files — never a recursive tree walk or Test-Path spam.
+   */
+  private async verifyStaticHtmlOnce(mode: VerifyMode): Promise<AgentToolResult> {
+    const candidates = ['index.html', 'styles.css', 'css/styles.css', 'js/main.js', 'main.js']
+    const lines: string[] = []
+    let indexOk = false
+    for (const rel of candidates) {
+      try {
+        await fs.access(this.safeResolve(rel))
+        lines.push(`OK  ${rel}`)
+        if (rel === 'index.html') indexOk = true
+      } catch {
+        if (rel === 'index.html') lines.push(`MISS ${rel}`)
+      }
+    }
+    const hint =
+      'Static HTML: no build/test/lint. This one-shot check is enough. ' +
+      'Preview once with: Start-Process (Resolve-Path .\\index.html). ' +
+      'Do NOT Get-ChildItem -Recurse or spam Test-Path.'
+    return {
+      id: '',
+      name: 'verify_project',
+      ok: indexOk,
+      content: `verify_project mode=${mode} (static HTML, one-shot)\n${lines.join('\n')}\n\n${hint}`,
+      error: indexOk ? undefined : 'index.html missing at project root'
     }
   }
 

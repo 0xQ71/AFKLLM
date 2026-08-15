@@ -142,18 +142,21 @@ export const AGENT_TOOL_SCHEMAS = [
     function: {
       name: 'read_file',
       description:
-        'Read a file relative to the project root. Optionally pass start_line/end_line (1-based inclusive) to read a slice.',
+        'Read a file relative to the project root. DEFAULT: omit start_line/end_line and read the WHOLE file in one call — that is the fast path. ' +
+        'Only if the result says truncated=true, use its STRUCTURE MAP line numbers to request one exact range. Never guess line numbers and never read the same file in small slices.',
       parameters: {
         type: 'object',
         properties: {
           relative_path: { type: 'string', description: 'Path relative to workspace root' },
           start_line: {
             type: 'integer',
-            description: 'Optional 1-based start line (inclusive). Omit to read from the start.'
+            description:
+              'Optional 1-based start line (inclusive). Omit for a whole-file read. Only use with a line number taken from a STRUCTURE MAP of a truncated read.'
           },
           end_line: {
             type: 'integer',
-            description: 'Optional 1-based end line (inclusive). Omit to read through EOF.'
+            description:
+              'Optional 1-based end line (inclusive). Omit for a whole-file read.'
           }
         },
         required: ['relative_path']
@@ -428,8 +431,9 @@ export const AGENT_TOOL_SCHEMAS = [
     function: {
       name: 'verify_project',
       description:
-        'Run the detected stack’s build, test, lint, or run command (Maven/Gradle/CMake/dotnet/Go/Cargo/npm/pytest/Make). ' +
-        'Prefer this over guessing a shell command. Non-zero exit is a failure — do not claim success.',
+        'Run ONE stack build/test/lint/run command (Maven/Gradle/CMake/dotnet/Go/Cargo/npm/pytest/Make). ' +
+        'Static HTML: one-shot entry check (index.html) — not a recursive tree scan. ' +
+        'Prefer this over guessing shell. Non-zero exit / missing entry is a failure — do not claim success.',
       parameters: {
         type: 'object',
         properties: {

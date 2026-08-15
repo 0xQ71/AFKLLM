@@ -1,7 +1,11 @@
 import { AGENT_TOOL_SCHEMAS } from '../../../shared/types'
 import { filterExploreToolSchemas } from '../../../shared/applyPatch'
 import type { QueueManager } from '../llm/queueManager'
-import { normalizeApiMessages, type ApiMessage } from './agentPure'
+import {
+  normalizeApiMessages,
+  packReadFileForAgent,
+  type ApiMessage
+} from './agentPure'
 
 const MAX_EXPLORE_ROUNDS = 6
 const REPORT_MAX_CHARS = 8_000
@@ -178,12 +182,20 @@ export async function runExploreSubagent(params: {
           if (m?.[1]) seenFiles.add(m[1].replace(/\\/g, '/'))
         }
       }
-      const content = toolResult.ok
-        ? toolResult.content.slice(0, TOOL_RESULT_CHARS)
-        : `ERROR: ${toolResult.error ?? 'failed'}\n${toolResult.content}`.slice(
+      // A raw head slice let the subagent mistake char 6000 for EOF.
+      const content = !toolResult.ok
+        ? `ERROR: ${toolResult.error ?? 'failed'}\n${toolResult.content}`.slice(
             0,
             TOOL_RESULT_CHARS
           )
+        : name === 'read_file' &&
+            !/^\[read_file (?:meta|range)\]/i.test(toolResult.content.trim())
+          ? packReadFileForAgent(toolResult.content, {
+              maxChars: TOOL_RESULT_CHARS,
+              relativePath:
+                typeof args.relative_path === 'string' ? args.relative_path : ''
+            })
+          : toolResult.content.slice(0, TOOL_RESULT_CHARS)
       apiMessages.push({
         role: 'tool',
         tool_call_id: call.id,

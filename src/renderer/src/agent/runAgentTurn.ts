@@ -11,10 +11,10 @@ import { honestClosingNote } from './loop/report'
 import { type StepEvidence } from './loop/evidence'
 import { advanceTodosOnEvidence } from './loop/plan'
 import {
-  userAskedVerify,
   inferredVerifyMode,
   formatVerifyNudge,
-  verifyAlreadyRan
+  verifyAlreadyRan,
+  shouldNudgeVerify
 } from './loop/verify'
 import { THREAD_SUMMARY_MSG_ID } from '../../../shared/chats'
 import {
@@ -44,6 +44,8 @@ import {
   stripChecklistBlock,
   stripCompactBlocks,
   stripPlanBlock,
+  stripThinkBlocks,
+  stripThinkTags,
   sanitizeThinkProse,
   extractThinkInner,
   formatLiveThinkContent,
@@ -57,6 +59,9 @@ import {
   thinkBodyLooksLikeCodeDump,
   thinkLooksLikeChecklist,
   packReadFileForAgent,
+  readFileCharBudget,
+  readFileRangeCacheKey,
+  resolveExhaustedReadBudget,
   contentLooksStructurallyComplete,
   wrapThinkForUi,
   todosAllDone,
@@ -74,7 +79,14 @@ import {
   isBrowserPlanStep,
   isJunkPlanStep,
   isFalseSuccessProse,
+  isRedundantPlanCompleteProse,
   isAgentChatNoise,
+  detectProseStutter,
+  dedupeStutteringProse,
+  looksLikeChatQa,
+  looksLikeFileEditRequest,
+  looksLikeSurgicalFollowUp,
+  filterPlanToCurrentRequest,
   parseGlobalRenameIntent,
   apiContentText,
   mergeChecklistIntoSystem,
@@ -395,11 +407,12 @@ Rules:
 
 const THINK_THROUGH = `
 Think-through protocol (mandatory — always on):
-The app first runs ONE short THINK-ONLY completion, then PLAN_ONLY, then tools.
-1) <think> — ONE compact DeepThink (4–8 sentences, not a novel) about THIS prompt: goal, constraints, approach, risks.
+The app first runs ONE THINK-ONLY completion, then PLAN_ONLY, then tools.
+1) <think> — ONE DeepThink (6–12 sentences) about THIS prompt: goal, constraints, approach, file order, risks, how you verify.
    FORBIDDEN in think: <plan>, todos, HTML/CSS/JS, write_file, claiming "Сделано"/"done" before tools succeed.
 2) PLAN_ONLY: <plan> with 3–6 atomic product steps. FORBIDDEN plan rows: "if patch fails rewrite whole file", tool names, CSS class dumps.
-After prelude: NEVER open another <think> or <plan>. Call tools immediately (write_file first for landings).
+This runs again for EVERY user message. Earlier reasoning in the conversation belongs to previous messages — it never exempts you from thinking about the current one.
+Within one message, after the prelude: NEVER open another <think> or <plan>. Call tools immediately.
 Do NOT Start-Process / browser / done-summary until non-browser plan steps are done.
 `
 
@@ -490,8 +503,8 @@ const CTX_RESERVE_TOKENS = 900
 const MAX_INCOMPLETE_APPENDS_PER_PATH = 4
 /** Identical tool+args repeats before TOOL_LOOP nudge (turn continues). */
 const MAX_IDENTICAL_TOOL_CALLS = 2
-/** read_file same path — allow a few re-reads, with a turn-wide budget. */
-const MAX_READS_PER_PATH = 3
+/** Repeated read_file of the SAME range — allow a few, with a turn-wide budget. */
+const MAX_READS_PER_PATH = 6
 const MAX_READS_TURN_BUDGET = 8
 /** Soft recovery threshold — never hard-stop the turn for the user. */
 const MAX_TOOL_LOOP_HITS = 2
@@ -515,6 +528,8 @@ const MAX_PATCH_FAILS_BEFORE_OVERWRITE = 4
 const COMPACT_SYSTEM_MAX_CHARS = 6_000
 const COMPACT_TAIL_MAX_MSGS = 6
 const COMPACT_TOOL_RESULT_MAX = 600
+/** Newest read_file results survive compact at this size (not 480 chars). */
+const COMPACT_READ_RESULT_MAX = 4_000
 
 async function fetchProjectRules(): Promise<string> {
   try {
@@ -746,7 +761,62 @@ function archiveLiveTodoBubble(messages: ChatMessage[]): void {
     if (m.id === AGENT_TODO_MSG_ID) {
       m.id = `${AGENT_TODO_MSG_ID}-${Date.now()}`
     }
+    if (m.id === AGENT_PLAN_MSG_ID) {
+      m.id = `${AGENT_PLAN_MSG_ID}-${Date.now()}`
+    }
   }
+}
+
+function closingMessageId(userMessageId: string): string {
+  return `agent-closing-${userMessageId}`
+}
+
+function looksLikeClosingSummary(text: string): boolean {
+  const t = text.trim()
+  if (t.length < 48 || /^↻ /.test(t) || /^⏹ /.test(t)) return false
+  if (hasThinkBlock(t) && !stripThinkBlocksLive(t).trim()) return false
+  return (
+    /что\s+изменил|как\s+проверить|what\s+changed|how\s+to\s+(verify|check)|file paths?|путь|paths?:/i.test(
+      t
+    ) ||
+    (/^\s*[-*•\d]/m.test(t) &&
+      /создан|измен|обнов|added|updated|edited|fixed|написан|готово|done\b/i.test(t))
+  )
+}
+
+/** Persist the turn closing summary so later turns cannot splice/overwrite it away. */
+function isClosingMessageId(id: string | undefined): boolean {
+  return Boolean(id && id.startsWith('agent-closing-'))
+}
+
+function ensureClosingMessage(
+  messages: ChatMessage[],
+  userMessageId: string,
+  text: string
+): void {
+  const content = text.trim()
+  if (!content || /^↻ /.test(content) || /^⏹ /.test(content)) return
+  if (isAgentChatNoise(content) && content.length < 80) return
+  const id = closingMessageId(userMessageId)
+  // Drop transient "writing summary…" status lines and duplicate plain bubbles.
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]
+    if (!m || m.role !== 'assistant' || m.toolName) continue
+    if (m.id === id) continue
+    if (/^↻\s*(Пишу заключение|Writing closing)/i.test(m.content ?? '')) {
+      messages.splice(i, 1)
+      continue
+    }
+    if ((m.content ?? '').trim() === content) {
+      messages.splice(i, 1)
+    }
+  }
+  const idx = messages.findIndex((m) => m.id === id)
+  if (idx >= 0) {
+    messages[idx] = { ...messages[idx]!, content, streaming: false }
+    return
+  }
+  messages.push({ id, role: 'assistant', content, streaming: false })
 }
 
 /** Live Cursor-style plan card (model-authored <plan>). Place AFTER think, not before. */
@@ -1134,10 +1204,15 @@ function slimToolArgs(name: string, argsJson: string): string {
   return argsJson.length > 400 ? argsJson.slice(0, 400) + '…' : argsJson
 }
 
-function slimMessage(m: ApiMessage): ApiMessage {
+function slimMessage(m: ApiMessage, opts?: { keepReadsFull?: boolean }): ApiMessage {
   if (m.role === 'tool') {
     const c = apiContentText(m.content)
     if (c.length <= COMPACT_TOOL_RESULT_MAX) return { ...m, content: c }
+    // Squeezing a fresh read down to 480 chars made the model forget the file
+    // and read it again — the second loop path. Keep the newest reads usable.
+    if (opts?.keepReadsFull && /^\[read_file (?:meta|range)\]/i.test(c.trim())) {
+      return { ...m, content: c.slice(0, COMPACT_READ_RESULT_MAX) }
+    }
     return {
       ...m,
       content:
@@ -1215,7 +1290,11 @@ async function compactApiMessages(
   queue?: QueueManager,
   ctxSize = 8192
 ): Promise<{ messages: ApiMessage[]; summary: string }> {
-  const slimmedAll = msgs.map(slimMessage)
+  // The newest reads live in the tail — keep those readable, slim older ones hard.
+  const tailStart = Math.max(0, msgs.length - COMPACT_TAIL_MAX_MSGS)
+  const slimmedAll = msgs.map((m, i) =>
+    slimMessage(m, { keepReadsFull: i >= tailStart })
+  )
 
   if (slimmedAll.length < 4) {
     let messages = normalizeApiMessages(slimmedAll)
@@ -1226,7 +1305,7 @@ async function compactApiMessages(
   }
 
   const head = slimmedAll.slice(0, 1) // system
-  const rawTail = slimmedAll.slice(-COMPACT_TAIL_MAX_MSGS).map(slimMessage)
+  const rawTail = slimmedAll.slice(-COMPACT_TAIL_MAX_MSGS)
   const middle = slimmedAll.slice(1, -COMPACT_TAIL_MAX_MSGS)
 
   const digestLines: string[] = []
@@ -1318,7 +1397,7 @@ async function compactApiMessages(
     },
     ...tail
   ]
-  let messages = normalizeApiMessages(compacted.map(slimMessage))
+  let messages = normalizeApiMessages(compacted.map((m) => slimMessage(m)))
   if (shouldCompactForOverflow(messages, ctxSize)) {
     messages = nuclearFitMessages(messages, ctxSize)
   }
@@ -1499,7 +1578,13 @@ async function buildApiMessages(
 
   const turns: ApiMessage[] = []
   for (const m of kept) {
-    const content = m.content?.trim()
+    // Prior <think>/<plan> belong to earlier messages. Left in, the model reads
+    // "prelude already happened" and answers the next THINK_ONLY with nothing.
+    const content =
+      m.role === 'assistant'
+        ? stripThinkBlocks(stripPlanBlock(m.content ?? '')).trim() ||
+          stripThinkTags(promoteThinkOnlyAnswer(m.content ?? '')).trim()
+        : m.content?.trim()
     if (!content) continue
 
     const last = turns[turns.length - 1]
@@ -1924,6 +2009,9 @@ export async function runAgentTurn(params: {
         msgs[i] = { ...msgs[i]!, streaming: false }
       }
     }
+    if (lastClosingText.trim()) {
+      ensureClosingMessage(msgs, userMessageId, lastClosingText)
+    }
     appendFilesChangedSummary(msgs, turnFileChanges)
     attachStatsToLastVisible(msgs, { turnElapsedMs: Date.now() - turnStartedAt })
     params.onUpdate([...msgs])
@@ -2092,6 +2180,9 @@ export async function runAgentTurn(params: {
   }
 
   let completedTools = 0
+  /** Consecutive rounds that only looked at code — nudge to actually write. */
+  let readOnlyRounds = 0
+  let readOnlyNudges = 0
   let earlyDoneNudges = 0
   let roleRepairAttempts = 0
   let jsonRepairAttempts = 0
@@ -2102,13 +2193,17 @@ export async function runAgentTurn(params: {
   let missingPathHits = 0
   let loopRecoveryWarned = false
   let concludeAsked = false
+  let lastClosingText = ''
   /** Nudge when model paints "writing…" then returns zero tools after think/plan. */
   let emptyToolNudges = 0
   /** Once the model emits <think> this turn, later tool rounds may skip re-thinking. */
   let thinkSatisfied = false
   const coercePlan = (plan: AgentTodoStep[] | null | undefined): AgentTodoStep[] =>
-    coerceProductPlan(plan, { userText: params.userText }).filter(
-      (s) => !isJunkPlanStep(s.text)
+    filterPlanToCurrentRequest(
+      coerceProductPlan(plan, { userText: params.userText }).filter(
+        (s) => !isJunkPlanStep(s.text)
+      ),
+      params.userText
     )
   const paintTodo = (
     steps: AgentTodoStep[],
@@ -2133,14 +2228,19 @@ export async function runAgentTurn(params: {
   let patchParseFails = 0
   /** Successful patches per path — stop endless "add img again" loops. */
   const patchOkByPath = new Map<string, number>()
-  /** read_file counts per path — stop Think re-verify loops. */
+  /** Repeated read_file counts per path — stop Think re-verify loops. */
   const readCountsByPath = new Map<string, number>()
   let readFileCalls = 0
+  /** How many times each path+range was requested — a new range is not a loop. */
+  const readRangeCounts = new Map<string, number>()
   /** Hard cap — model must not restart image gen mid-turn (even with a tweaked prompt). */
   let generateImageCalls = 0
     /** After first successful HTML preview open, block further Start-Process / open loops. */
     let htmlPreviewOpened = false
+    /** Keyed by path|start-end so a cache hit can never serve a different range. */
     const readFileCache = new Map<string, string>()
+    /** Newest read per path — kept fuller than other tool results during compact. */
+    const lastReadByPath = new Map<string, string>()
   /** FILE_COMPLETE redirects — escalate to overwrite, do not fake-stop. */
   let fileCompleteHits = 0
   /** SMART_APPLY_FAIL / APPLY_UNAVAILABLE — escalate to overwrite. */
@@ -2150,7 +2250,8 @@ export async function runAgentTurn(params: {
   let forceEndTurn = false
   const skipCeremony =
     !isPlan && shouldSkipThinkPlanCeremony(params.userText, params.history)
-  const thinkThrough = !isPlan && !skipCeremony
+  const chatQa = !isPlan && looksLikeChatQa(params.userText, params.history)
+  const thinkThrough = !isPlan && !skipCeremony && !chatQa
   const autoApprove = appSettings.agentAutoApprove === true
 
   // Landing shortcuts (open preview / brand rename / adaptive-CSS inject) are gone:
@@ -2191,49 +2292,67 @@ export async function runAgentTurn(params: {
       return name !== 'generate_image'
     })
   }
+  // Chat Q&A (weather / clothing): only optional web_search — never invent a website.
+  if (chatQa) {
+    agentTools = agentTools.filter((tool) => {
+      const name =
+        tool &&
+        typeof tool === 'object' &&
+        'function' in tool &&
+        tool.function &&
+        typeof tool.function === 'object' &&
+        'name' in tool.function
+          ? String((tool.function as { name?: unknown }).name ?? '')
+          : tool && typeof tool === 'object' && 'name' in tool
+            ? String((tool as { name?: unknown }).name ?? '')
+            : ''
+      return name === 'web_search'
+    })
+  }
 
   // Think ON: THINK-ONLY completion first (stream every token), then a separate PLAN completion.
   if (thinkThrough) {
     if (params.signal?.aborted) return finishStopped()
     const preludeId = uid()
     thinkBubbleId = preludeId
-    messages.push({
-      id: preludeId,
-      role: 'assistant',
-      content: '<think>\n</think>',
-      streaming: true
-    })
-    params.onUpdate([...messages])
+    // Create the bubble on first real prose — empty <think></think> caused a blank fold flash.
+    const ensureThinkBubble = (content: string): number => {
+      let idx = messages.findIndex((m) => m.id === preludeId)
+      if (idx === -1) {
+        messages.push({
+          id: preludeId,
+          role: 'assistant',
+          content,
+          streaming: true
+        })
+        idx = messages.length - 1
+      }
+      return idx
+    }
 
     const thinkBudgetTok = appSettings.reasoningBudgetEnabled
-      ? Math.min(Math.max(512, appSettings.reasoningBudget ?? 1024), 1536)
-      : 1024
+      ? Math.min(Math.max(1024, appSettings.reasoningBudget ?? 1800), 2560)
+      : 1800
     const thinkMaxTokens = openPreviewOnly
       ? Math.min(384, AGENT_MAX_TOKENS)
       : Math.min(thinkBudgetTok, AGENT_MAX_TOKENS)
-    const minThinkChars = openPreviewOnly ? 40 : 100
-    const enoughThinkChars = openPreviewOnly ? 120 : 420
+    const minThinkChars = openPreviewOnly ? 40 : 200
+    const enoughThinkChars = openPreviewOnly ? 120 : 1400
 
     const paintThink = (raw: string): void => {
-      const idx = messages.findIndex((m) => m.id === preludeId)
-      if (idx === -1) return
       const prose = liveThinkProse(raw)
       if (prose.length > bestLiveProse.length && !isEllipsisOnly(prose)) {
         bestLiveProse = prose
       }
-      // Avoid blanking the fold while opening tags stream in (blink).
-      if (!prose.trim() && bestLiveProse.trim()) {
-        messages[idx] = {
-          ...messages[idx]!,
-          content: formatLiveThinkContent(`<think>\n${bestLiveProse}\n</think>`),
-          streaming: true
-        }
-        params.onUpdate([...messages])
-        return
-      }
+      const body = prose.trim() ? prose : bestLiveProse
+      // Stay silent until we have something worth showing (one fold, no empty→text blink).
+      if (!body.trim()) return
+      const idx = ensureThinkBubble(
+        formatLiveThinkContent(`<think>\n${body}\n</think>`)
+      )
       messages[idx] = {
         ...messages[idx]!,
-        content: formatLiveThinkContent(raw),
+        content: formatLiveThinkContent(`<think>\n${body}\n</think>`),
         streaming: true
       }
       params.onUpdate([...messages])
@@ -2245,6 +2364,7 @@ export async function runAgentTurn(params: {
         prose
       )
 
+    // Exactly ONE think completion — a second stream was remounting/replacing the fold.
     const streamThinkOnce = async (): Promise<{ text: string; aborted: boolean }> => {
       const ac = new AbortController()
       const onOuter = (): void => {
@@ -2283,7 +2403,7 @@ export async function runAgentTurn(params: {
             return
           }
           const proseLen = liveThinkProse(rawAccum).length
-          // Stop once we have a solid DeepThink — don't wait for a novel.
+          // Soft cap — prefer a fuller DeepThink over an early cut that looked like a "new" think.
           if (proseLen >= enoughThinkChars) {
             budgetAbort = true
             ac.abort('think_budget')
@@ -2318,19 +2438,18 @@ export async function runAgentTurn(params: {
         'FORBIDDEN: <plan>, todos, code, tools, HTML.\n' +
         'Stop right after </think>.'
       : 'THINK_ONLY (tools DISABLED). Output ONLY a <think>…</think> block — nothing after it.\n' +
-        'Write compact first-person reasoning in the USER\'s language (like Cursor / DeepSeek DeepThink):\n' +
-        '- 4–8 sentences (~80–200 words). Stream immediately — do not stay silent then dump.\n' +
-        '- Cover: goal, hard constraints (what is FORBIDDEN), structure, visuals, one risk, how you verify.\n' +
-        '- Tie points to THIS user message — no filler.\n' +
-        `Budget for THIS completion: ≤${thinkBudgetTok} tokens — stop once the point is clear.\n` +
+        'Write first-person reasoning in the USER\'s language (like Cursor / DeepSeek DeepThink):\n' +
+        '- 8–14 sentences (~160–320 words). Stream immediately — do not stay silent then dump.\n' +
+        '- Cover: goal, hard constraints (what is FORBIDDEN), structure / file order, visuals, risks, how you verify.\n' +
+        '- Tie points to THIS user message — no filler; one continuous thought, not a stub.\n' +
+        `Budget for THIS completion: ≤${thinkBudgetTok} tokens — use most of it for real reasoning.\n` +
         'FORBIDDEN: <plan>, [Plan], todos, HTML/CSS/JS, code fences, write_file, tools.\n' +
         'Stop right after </think>.'
 
     pushUserMessage(apiMessages, thinkPrompt)
     apiMessages = normalizeApiMessages(apiMessages)
 
-    // Visible waiting is handled by the UI fold — do not seed placeholder think text (causes blink).
-    let thinkRound = await streamThinkOnce()
+    const thinkRound = await streamThinkOnce()
     if (thinkRound.aborted) {
       const idx = messages.findIndex((m) => m.id === preludeId)
       if (idx !== -1) {
@@ -2344,52 +2463,7 @@ export async function runAgentTurn(params: {
       return finishStopped()
     }
 
-    const thinkWeak = (raw: string): boolean => {
-      const prose = liveThinkProse(raw)
-      return (
-        thinkBodyLooksLikeCodeDump(raw) ||
-        looksLikeToolMarkupLeak(raw) ||
-        thinkLooksLikeChecklist(prose) ||
-        isFalseSuccessProse(prose) ||
-        prose.length < minThinkChars ||
-        isStockThink(prose)
-      )
-    }
-
-    if (!openPreviewOnly && thinkWeak(thinkRound.text)) {
-      // Same bubble stays open — user should see ONE continuous DeepThink, not two folds.
-      const retryIdx = messages.findIndex((m) => m.id === preludeId)
-      if (retryIdx !== -1) {
-        messages[retryIdx] = {
-          ...messages[retryIdx]!,
-          streaming: true,
-          content: formatLiveThinkContent(bestLiveProse || messages[retryIdx]!.content || '')
-        }
-        params.onUpdate([...messages])
-      }
-      pushUserMessage(
-        apiMessages,
-        'REJECTED: think was too short or stock. Continue the SAME <think> with 4–8 real sentences about THIS prompt ' +
-          '(goal, constraints, structure, visuals, risks, verification). Still NO <plan>, NO lists, NO code. ' +
-          'Do not write «Разбираю запрос и дальше действую tools».'
-      )
-      apiMessages = normalizeApiMessages(apiMessages)
-      thinkRound = await streamThinkOnce()
-      if (thinkRound.aborted) {
-        const i2 = messages.findIndex((m) => m.id === preludeId)
-        if (i2 !== -1) {
-          messages[i2] = {
-            ...messages[i2]!,
-            streaming: false,
-            content: formatLiveThinkContent(messages[i2]!.content ?? '')
-          }
-          params.onUpdate([...messages])
-        }
-        return finishStopped()
-      }
-    }
-
-    // Prefer the longest real prose we saw while streaming — never keep a one-liner stock stub.
+    // Prefer the longest real prose we saw while streaming — never wipe a fold the user already saw.
     const streamedBest =
       [stripCodeLeakFromThink(liveThinkProse(thinkRound.text)), stripCodeLeakFromThink(bestLiveProse)]
         .filter(
@@ -2397,40 +2471,59 @@ export async function runAgentTurn(params: {
             p &&
             !isEllipsisOnly(p) &&
             !isStockThink(p) &&
-            !isFalseSuccessProse(p) &&
             !thinkBodyLooksLikeCodeDump(p) &&
             !/^думаю над запросом|^thinking about the request/i.test(p.trim())
         )
         .sort((a, b) => b.length - a.length)[0] ?? ''
+    // Keep whatever streamed into the bubble even if filters were picky (false-success
+    // patterns in think must not delete a real DeepThink the user already watched).
+    const keptLive = stripCodeLeakFromThink(bestLiveProse).trim()
+    const finalProse = streamedBest || (keptLive.length >= 40 ? keptLive : '')
     const thinkMissingNote =
       uiLang === 'ru'
         ? '↻ Модель не выдала рассуждение — перехожу к плану и tools.'
         : '↻ Model produced no reasoning — continuing to plan and tools.'
-    const finalProse = streamedBest
     const uiThink = finalProse
       ? formatLiveThinkContent(`<think>\n${finalProse}\n</think>`)
       : thinkMissingNote
     const pIdx = messages.findIndex((m) => m.id === preludeId)
     if (pIdx !== -1) {
+      // Never replace a non-empty live think fold with the "no reasoning" status line.
+      const prevThink = liveThinkProse(messages[pIdx]!.content ?? '').trim()
+      const nextContent =
+        !finalProse && prevThink.length >= 40
+          ? formatLiveThinkContent(`<think>\n${prevThink}\n</think>`)
+          : uiThink
       messages[pIdx] = {
         ...messages[pIdx]!,
         streaming: false,
-        content: uiThink
+        content: nextContent
       }
       params.onUpdate([...messages])
     }
 
-    if (finalProse) {
-      apiMessages.push({ role: 'assistant', content: uiThink })
+    if (finalProse || keptLive.length >= 40) {
+      apiMessages.push({
+        role: 'assistant',
+        content: finalProse
+          ? uiThink
+          : formatLiveThinkContent(`<think>\n${keptLive}\n</think>`)
+      })
     }
 
     {
+    const surgicalPlan = looksLikeSurgicalFollowUp(params.userText)
     pushUserMessage(
       apiMessages,
-      'PLAN_ONLY (tools still DISABLED). Output ONLY <plan>…</plan> with 3–9 ATOMIC steps from the user request ' +
-        'and your prior <think> (what to create/change, in order). ' +
-        'FORBIDDEN: tool names (execute_terminal_command, write_file, Start-Process, read_file), CSS class names as steps, ' +
-        'syntax-check shells, «Закрыть», mega-steps, code, <think>. Stop after </plan>.'
+      surgicalPlan
+        ? 'PLAN_ONLY (tools still DISABLED). Output ONLY <plan>…</plan> with 2–4 ATOMIC steps for THIS user message only ' +
+            `(«${params.userText.trim().slice(0, 160)}»). ` +
+            'FORBIDDEN: restating earlier chat work (weather, clothing, old sections), RU/EN i18n unless asked, ' +
+            'rewriting the whole landing, tool names, code, <think>. Stop after </plan>.'
+        : 'PLAN_ONLY (tools still DISABLED). Output ONLY <plan>…</plan> with 3–9 ATOMIC steps from the user request ' +
+            'and your prior <think> (what to create/change, in order). ' +
+            'FORBIDDEN: tool names (execute_terminal_command, write_file, Start-Process, read_file), CSS class names as steps, ' +
+            'syntax-check shells, «Закрыть», mega-steps, code, <think>. Stop after </plan>.'
     )
     apiMessages = normalizeApiMessages(apiMessages)
 
@@ -2473,10 +2566,57 @@ export async function runAgentTurn(params: {
     if (params.signal?.aborted && /user_stop/i.test(String(params.signal.reason ?? ''))) {
       return finishStopped()
     }
-    let planFromPrelude =
-      parsePlanBlock(planAccum) ||
-      parsePlanBlock(`${planAccum}\n</plan>`) ||
-      parsePlanBlock(`<plan>\n${planAccum}\n</plan>`)
+    const parsePlanAccum = (raw: string): AgentTodoStep[] | null =>
+      parsePlanBlock(raw) ||
+      parsePlanBlock(`${raw}\n</plan>`) ||
+      parsePlanBlock(`<plan>\n${raw}\n</plan>`)
+
+    let planFromPrelude = parsePlanAccum(planAccum)
+
+    // Silence here used to leave the turn with no plan card at all.
+    if (!coercePlan(planFromPrelude).length && !params.signal?.aborted) {
+      pushUserMessage(
+        apiMessages,
+        'No plan was received. Output ONLY the <plan>…</plan> block now — 3–6 short steps for THIS request, ' +
+          'one per line starting with "- ". No think, no code, no tool names.'
+      )
+      apiMessages = normalizeApiMessages(apiMessages)
+      let retryAccum = ''
+      const retryAc = new AbortController()
+      const onRetryOuter = (): void => {
+        retryAc.abort(params.signal?.reason ?? 'aborted')
+      }
+      if (params.signal?.aborted) {
+        retryAc.abort(params.signal.reason ?? 'aborted')
+      } else {
+        params.signal?.addEventListener('abort', onRetryOuter, { once: true })
+      }
+      await params.queue.chatStream({
+        messages: normalizeApiMessages(apiMessages),
+        maxTokens: 512,
+        signal: retryAc.signal,
+        onToken: (token) => {
+          if (retryAc.signal.aborted) return
+          retryAccum += token
+          if (findCodeLeakIndex(retryAccum) >= 0) {
+            retryAc.abort('plan_code_leak')
+            return
+          }
+          const livePlan = parsePlanAccum(retryAccum)
+          if (livePlan?.length && !planFrozen) {
+            todoSteps = coercePlan(livePlan)
+            paintTodo(todoSteps, { afterId: preludeId })
+            params.onUpdate([...messages])
+          }
+        },
+        priority: 'NORMAL'
+      })
+      params.signal?.removeEventListener('abort', onRetryOuter)
+      if (params.signal?.aborted && /user_stop/i.test(String(params.signal.reason ?? ''))) {
+        return finishStopped()
+      }
+      planFromPrelude = parsePlanAccum(retryAccum) ?? planFromPrelude
+    }
     // Always show a product plan (sections from think/prompt) — never tool-name fluff.
     planFromPrelude = coercePlan(planFromPrelude)
     if (planFromPrelude?.length) {
@@ -2504,17 +2644,37 @@ export async function runAgentTurn(params: {
     apiMessages = normalizeApiMessages(apiMessages)
     thinkSatisfied = true
     } // end !openPreviewOnly plan phase
-  } else if (skipCeremony && !isPlan) {
-    // Ultra-short confirm with prior work — go straight to tools (Cursor-style).
+  } else if ((skipCeremony || chatQa) && !isPlan) {
+    // Ultra-short confirm / chat Q&A — go straight to answer or tools (no second think/plan).
     thinkSatisfied = true
     pushUserMessage(
       apiMessages,
-      'Short confirm: skip another <think>/<plan>. Call tools NOW. ' +
-        'YOU decide from disk: create missing files with write_file; edit existing with apply_diff/apply_patch. ' +
-        'Never rewrite a finished HTML landing for a small tweak. Be honest if an edit fails.'
+      chatQa
+        ? 'Chat Q&A follow-up: answer ONLY in prose in the user\'s language (clothing / weather advice). ' +
+            'FORBIDDEN: write_file, apply_diff, apply_patch, creating index.html/styles.css/js, any coding plan, any website. ' +
+            'Do NOT build an app. One short answer, then stop.'
+        : 'Short confirm: skip another <think>/<plan>. Call tools NOW. ' +
+            'YOU decide from disk: create missing files with write_file; edit existing with apply_diff/apply_patch. ' +
+            'Never rewrite a finished HTML landing for a small tweak. Be honest if an edit fails.'
     )
     apiMessages = normalizeApiMessages(apiMessages)
   }
+
+  if (!isPlan && looksLikeSurgicalFollowUp(params.userText)) {
+    thinkSatisfied = true
+    pushUserMessage(
+      apiMessages,
+      'SURGICAL follow-up: existing landing is already on disk. ' +
+        'Call tools NOW — read_file only if needed, then apply_diff / apply_patch. ' +
+        'Navbar/CSS: patch ONLY the navbar-related rules (search_block ≤ ~80 lines). ' +
+        'FORBIDDEN: write_file overwrite of styles.css, rewriting the whole stylesheet, inventing RU/EN i18n, ' +
+        'rewriting index.html wholesale, narrating "created files" without tools.'
+    )
+    apiMessages = normalizeApiMessages(apiMessages)
+  }
+
+  let lastNoToolFingerprint = ''
+  let proseStutterHits = 0
 
   for (let round = 0; round < maxRounds; round++) {
     if (params.signal?.aborted) return finishStopped()
@@ -2609,9 +2769,8 @@ export async function runAgentTurn(params: {
       result = await params.queue.chatStream({
       messages: normalizeApiMessages(apiMessages),
       ...(isPlan ? {} : { tools: agentTools }),
-      // Small local models drift into prose after the think/plan completions.
-      // Until the first tool actually runs, make a function call mandatory.
-      ...(isPlan || completedTools > 0
+      // Coding turns need a tool call; chat Q&A may answer in prose (optional web_search).
+      ...(isPlan || completedTools > 0 || chatQa
         ? {}
         : { toolChoice: 'required' as const }),
       maxTokens: appSettings.limitResponseLength
@@ -2646,13 +2805,35 @@ export async function runAgentTurn(params: {
           return
         }
         const nextContent = base + token
-        // Native-thinking models often emit another <think> before tool_calls.
-        // Never abort the HTTP stream for that — aborting drops the tools that follow.
-        if (thinkThrough && thinkSatisfied && hasThinkBlock(nextContent)) {
+        // One DeepThink only — after prelude, never grow a second think fold in this bubble.
+        if (
+          thinkThrough &&
+          thinkSatisfied &&
+          (/<\s*(?:think|thinking)\b/i.test(nextContent) || hasThinkBlock(nextContent))
+        ) {
           messages[idx] = {
             ...messages[idx],
             content:
               uiLang === 'ru' ? '↻ Выполняю план…' : '↻ Executing the plan…',
+            streaming: true
+          }
+          params.onUpdate([...messages])
+          return
+        }
+        // Stuck repeating the same paragraph with no tool draft — cut early.
+        if (
+          !isPlan &&
+          thinkSatisfied &&
+          toolDraft.size === 0 &&
+          detectProseStutter(nextContent)
+        ) {
+          abortStream('prose_stutter')
+          messages[idx] = {
+            ...messages[idx],
+            content:
+              uiLang === 'ru'
+                ? '↻ Модель зациклила текст без инструментов — требую tool call…'
+                : '↻ Model looped prose without tools — requiring a tool call…',
             streaming: true
           }
           params.onUpdate([...messages])
@@ -2785,10 +2966,11 @@ export async function runAgentTurn(params: {
     }
     params.signal?.removeEventListener('abort', onOuterAbort)
 
-    // Soft stream guards: size runaway or stall — keep any tool draft.
+    // Soft stream guards: size runaway, stall, or prose stutter — keep any tool draft.
     const softAbort =
       streamAbortReason === 'tool_args_too_large' ||
-      streamAbortReason === 'stream_idle'
+      streamAbortReason === 'stream_idle' ||
+      streamAbortReason === 'prose_stutter'
 
     if (softAbort) {
       result.aborted = false
@@ -2858,7 +3040,9 @@ export async function runAgentTurn(params: {
     if (stats) params.onStats?.(stats)
     if (sIdx !== -1) {
       if (!result.text?.trim()) {
-        messages.splice(sIdx, 1)
+        if (!isClosingMessageId(messages[sIdx]?.id) && !concludeAsked) {
+          messages.splice(sIdx, 1)
+        }
         if (stats) attachStatsToLastVisible(messages, stats)
       } else {
         const prev = messages[sIdx]
@@ -2885,14 +3069,51 @@ export async function runAgentTurn(params: {
           stats: mergedStats
         }
         // One DeepThink only — prelude bubble stays frozen; strip late <think> from this message.
+        // Never splice away a real closing summary (promote think-only salvage if needed).
         if (thinkThrough && thinkSatisfied) {
-          const stripped = stripThinkBlocksLive(messages[sIdx].content ?? '')
-          if (!stripped.trim() && !messages[sIdx].codePreview) {
-            messages.splice(sIdx, 1)
+          const rawBubble = messages[sIdx].content ?? ''
+          if (isClosingMessageId(messages[sIdx].id)) {
+            // Already pinned — leave alone.
           } else {
-            messages[sIdx] = {
-              ...messages[sIdx],
-              content: stripped
+            const stripped = stripThinkBlocksLive(rawBubble)
+            const salvaged =
+              stripped.trim() ||
+              stripPlanBlock(promoteThinkOnlyAnswer(result.text || rawBubble)).trim()
+            if (salvaged) {
+              if (concludeAsked || looksLikeClosingSummary(salvaged)) {
+                lastClosingText = salvaged
+                const closeId = closingMessageId(userMessageId)
+                for (let i = messages.length - 1; i >= 0; i--) {
+                  if (i === sIdx) continue
+                  if (messages[i]?.id === closeId) messages.splice(i, 1)
+                  else if (
+                    /^↻\s*(Пишу заключение|Writing closing)/i.test(
+                      messages[i]?.content ?? ''
+                    )
+                  ) {
+                    messages.splice(i, 1)
+                  }
+                }
+                messages[sIdx] = {
+                  ...messages[sIdx]!,
+                  id: closeId,
+                  content: salvaged,
+                  streaming: false
+                }
+              } else {
+                messages[sIdx] = {
+                  ...messages[sIdx],
+                  content: salvaged
+                }
+              }
+            } else if (
+              !messages[sIdx].codePreview &&
+              !concludeAsked &&
+              !/^↻ /.test(rawBubble.trim()) &&
+              !isClosingMessageId(messages[sIdx].id)
+            ) {
+              // Drop empty "Пишу по плану…" shells only — never a closing card.
+              messages.splice(sIdx, 1)
             }
           }
         }
@@ -2934,7 +3155,7 @@ export async function runAgentTurn(params: {
       const errText = result.error ?? 'aborted'
       // Internal stream guards must never surface as fatal chat errors
       if (
-        /write_file_missing_path|tool_args_too_large|tool_markup_in_content|stream_idle/i.test(
+        /write_file_missing_path|tool_args_too_large|tool_markup_in_content|stream_idle|prose_stutter/i.test(
           errText
         )
       ) {
@@ -3046,7 +3267,7 @@ export async function runAgentTurn(params: {
           apiMessages = nuclearFitMessages(apiMessages, ctxSize)
         }
       } else {
-        apiMessages = normalizeApiMessages(apiMessages.map(slimMessage))
+        apiMessages = normalizeApiMessages(apiMessages.map((m) => slimMessage(m)))
       }
       // Never insert user after tools — attach hint to last tool or merge into last user
       const last = apiMessages[apiMessages.length - 1]
@@ -3061,7 +3282,7 @@ export async function runAgentTurn(params: {
       } else {
         pushUserMessage(apiMessages, repairHint)
       }
-      apiMessages = normalizeApiMessages(apiMessages.map(slimMessage))
+      apiMessages = normalizeApiMessages(apiMessages.map((m) => slimMessage(m)))
       continue
       }
       }
@@ -3316,12 +3537,22 @@ export async function runAgentTurn(params: {
         identicalToolCounts.set(fp, identicalCount)
         if (name === 'generate_image') generateImageCalls++
         const pathKeyForLoop = loopPathKey(filePath || '')
-        if (name === 'read_file' && pathKeyForLoop) {
-          readCountsByPath.set(
-            pathKeyForLoop,
-            (readCountsByPath.get(pathKeyForLoop) ?? 0) + 1
-          )
-          readFileCalls++
+        const readRangeKey =
+          name === 'read_file' && pathKeyForLoop
+            ? readFileRangeCacheKey(pathKeyForLoop, args.start_line, args.end_line)
+            : ''
+        // Only a REPEATED range burns the budget: a full read plus a couple of
+        // distinct ranges is legitimate work, not a loop.
+        const repeatedRange = readRangeKey ? readRangeCounts.has(readRangeKey) : false
+        if (readRangeKey) {
+          readRangeCounts.set(readRangeKey, (readRangeCounts.get(readRangeKey) ?? 0) + 1)
+          if (repeatedRange) {
+            readCountsByPath.set(
+              pathKeyForLoop,
+              (readCountsByPath.get(pathKeyForLoop) ?? 0) + 1
+            )
+            readFileCalls++
+          }
         }
         const identicalLimit =
           name === 'generate_image'
@@ -3348,18 +3579,61 @@ export async function runAgentTurn(params: {
               'TOOL_LOOP: generate_image already ran this turn (including any internal retry). Do NOT call it again — finish HTML/CSS with a CSS/placeholder visual.'
           }
         } else if (
+          !looksLikeExplicitRewrite(params.userText) &&
+          (looksLikeSurgicalFollowUp(params.userText) ||
+            (looksLikeFileEditRequest(params.userText) &&
+              !looksLikeLandingBuildTask(params.userText))) &&
+          /\.css$/i.test(String(resolvedPath || filePath || ''))
+        ) {
+          const search =
+            typeof args.search_block === 'string' ? args.search_block : ''
+          const replace =
+            typeof args.replace_block === 'string' ? args.replace_block : ''
+          const content = typeof args.content === 'string' ? args.content : ''
+          const hugeCssRewrite =
+            (name === 'write_file' &&
+              (Boolean(args.overwrite) ||
+                Boolean(args.allow_full_rewrite) ||
+                content.length >= 3000)) ||
+            (name === 'apply_diff' &&
+              (search.length >= 1800 ||
+                (search.length >= 900 && replace.length >= 1800) ||
+                replace.length >= 4000)) ||
+            (name === 'apply_patch' &&
+              typeof args.patch === 'string' &&
+              args.patch.length >= 4000)
+          if (hugeCssRewrite) {
+            toolResult = {
+              id: call.id,
+              name,
+              ok: false,
+              content: '',
+              error:
+                'SURGICAL_CSS: do NOT rewrite styles.css. Use apply_diff with a SMALL search_block ' +
+                '(navbar / header rules only, typically < 80 lines). Leave the rest of the stylesheet untouched.'
+            }
+          } else {
+            syntheticResult = false
+            toolResult = await window.api.agent.invoke({
+              id: call.id,
+              name,
+              arguments: args
+            })
+          }
+        } else if (
           name === 'read_file' &&
           pathKeyForLoop &&
           (readsOnPath > MAX_READS_PER_PATH || readFileCalls > MAX_READS_TURN_BUDGET)
         ) {
-          const cached = readFileCache.get(pathKeyForLoop)
+          // Cache is keyed by path+range: returning another range's body (or an
+          // empty string with ok:true) made the model distrust the result and
+          // retry forever. Serve only an exact hit; otherwise fail honestly.
+          const cached = readRangeKey ? readFileCache.get(readRangeKey) : undefined
+          const budgeted = resolveExhaustedReadBudget(cached, filePath || pathKeyForLoop)
           toolResult = {
             id: call.id,
             name,
-            ok: true,
-            content:
-              (cached ?? '') +
-              `\n[cached read_file: "${filePath}" already read this turn — do not re-read]`
+            ...budgeted
           }
         } else if (
           name === 'execute_terminal_command' &&
@@ -3938,11 +4212,12 @@ export async function runAgentTurn(params: {
         if (
           toolResult.ok &&
           name === 'read_file' &&
-          pathKeyForLoop &&
+          readRangeKey &&
           !syntheticResult &&
           typeof toolResult.content === 'string'
         ) {
-          readFileCache.set(pathKeyForLoop, toolResult.content)
+          readFileCache.set(readRangeKey, toolResult.content)
+          lastReadByPath.set(pathKeyForLoop, toolResult.content)
         }
         if (
           toolResult.ok &&
@@ -3972,7 +4247,7 @@ export async function runAgentTurn(params: {
         }
         if (
           !toolResult.ok ||
-          /TOOL_LOOP|INCOMPLETE_WRITE_LIMIT|FILE_EXISTS|FILE_COMPLETE|PATCH_OK_LIMIT|PATCH_FAIL_LIMIT|SMART_APPLY_FAIL|APPLY_UNAVAILABLE|THINK_REQUIRED|SURGICAL_EDIT/i.test(
+          /TOOL_LOOP|INCOMPLETE_WRITE_LIMIT|FILE_EXISTS|FILE_COMPLETE|PATCH_OK_LIMIT|PATCH_FAIL_LIMIT|SMART_APPLY_FAIL|APPLY_UNAVAILABLE|THINK_REQUIRED|SURGICAL_EDIT|SURGICAL_CSS/i.test(
             toolResult.error ?? toolResult.content ?? ''
           )
         ) {
@@ -4002,14 +4277,15 @@ export async function runAgentTurn(params: {
               TOOL_RESULT_CHARS
             )
         if (toolResult.ok && name === 'read_file') {
+          const readBudget = readFileCharBudget(ctxSize)
           // Head-only slice looked like EOF → false "file truncated at ~250 lines".
           if (/^\[read_file (?:meta|range)\]/i.test(toolResult.content.trim())) {
-            content = toolResult.content.slice(0, Math.max(TOOL_RESULT_CHARS, 12_000))
+            content = toolResult.content.slice(0, Math.max(readBudget, 12_000))
           } else {
             content = packReadFileForAgent(toolResult.content, {
-              headLines: 80,
-              tailLines: 40,
-              maxChars: TOOL_RESULT_CHARS
+              ctxSize,
+              relativePath:
+                typeof args.relative_path === 'string' ? args.relative_path : ''
             })
           }
         }
@@ -4115,7 +4391,7 @@ export async function runAgentTurn(params: {
             !/INCOMPLETE_WRITE_LIMIT/i.test(content)
           const softRedirect =
             !toolResult.ok &&
-            /FILE_COMPLETE|FILE_EXISTS|OVERWRITE_BLOCKED|INLINE_ASSET|SURGICAL_EDIT/i.test(
+            /FILE_COMPLETE|FILE_EXISTS|OVERWRITE_BLOCKED|INLINE_ASSET|SURGICAL_EDIT|SURGICAL_CSS/i.test(
               toolResult.error ?? toolResult.content ?? content
             )
           const reviewPath =
@@ -4293,6 +4569,12 @@ export async function runAgentTurn(params: {
             apiMessages,
             'INCOMPLETE_WRITE_LIMIT: do not append tiny chunks to that path. Write a larger chunk (≥200 chars) once, or move on to the next unfinished file.'
           )
+        } else if (/READ_BUDGET/i.test(tc)) {
+          appendToolHint(
+            apiMessages,
+            'READ_BUDGET: stop reading. You already have this file in the transcript. ' +
+              'Locate code with search_codebase (it does literal text search), then call apply_diff with an exact search_block.'
+          )
         } else if (/MISSING_PATH/i.test(tc)) {
           appendToolHint(
             apiMessages,
@@ -4334,6 +4616,12 @@ export async function runAgentTurn(params: {
             apiMessages,
             'Decide from disk: if CSS is only inline in index.html and the tweak is small, apply_diff there. ' +
               'If the user wants styles.css or a multi-file layout, create styles.css and link it — that is allowed.'
+          )
+        } else if (/SURGICAL_CSS/i.test(tc)) {
+          appendToolHint(
+            apiMessages,
+            'SURGICAL_CSS: styles.css must stay intact. apply_diff only the navbar/header rules ' +
+              '(small search_block). Do not overwrite or regenerate the stylesheet.'
           )
         } else if (/SURGICAL_EDIT/i.test(tc)) {
           appendToolHint(
@@ -4386,6 +4674,28 @@ export async function runAgentTurn(params: {
       apiMessages = normalizeApiMessages(apiMessages)
       if (params.signal?.aborted) return finishStopped()
 
+      // Reading and searching forever without writing is how turns burned 60+
+      // rounds. After three such rounds, demand the edit.
+      {
+        const inspectedOnly = toolCalls.every((c) =>
+          ['read_file', 'search_codebase', 'list_directory', 'get_diagnostics'].includes(
+            c.function.name
+          )
+        )
+        readOnlyRounds = inspectedOnly ? readOnlyRounds + 1 : 0
+        if (readOnlyRounds >= 3 && readOnlyNudges < 2) {
+          readOnlyNudges++
+          readOnlyRounds = 0
+          appendToolHint(
+            apiMessages,
+            'You have only inspected code for three rounds. Make the edit NOW with write_file / apply_diff ' +
+              '(dependency file first, then the file that references it). No more read_file or search_codebase ' +
+              'until something has been written.'
+          )
+          apiMessages = normalizeApiMessages(apiMessages)
+        }
+      }
+
       const htmlPatchFailHard = [...patchFailsByPath.entries()].some(
         ([p, n]) =>
           n >= MAX_PATCH_FAILS_BEFORE_OVERWRITE && /\.html?$/i.test(p)
@@ -4436,11 +4746,87 @@ export async function runAgentTurn(params: {
 
     // Final assistant text must enter apiMessages before any follow-up user nudge
     const rawFinal = (result.text ?? '').trim()
+    const stuttered = streamAbortReason === 'prose_stutter' || detectProseStutter(rawFinal)
+    const cleanFinal = stuttered ? dedupeStutteringProse(rawFinal) : rawFinal
+
+    // Chat Q&A: prose answer is success — never demand tools or loop closings.
+    if (
+      chatQa &&
+      !toolCalls?.length &&
+      cleanFinal.trim().length >= 40 &&
+      !looksLikeSurgicalFollowUp(params.userText)
+    ) {
+      const si = messages.findIndex((m) => m.id === streamId)
+      const answer = cleanFinal.trim()
+      if (si !== -1) {
+        messages[si] = {
+          ...messages[si]!,
+          streaming: false,
+          content: answer
+        }
+      } else {
+        ensureClosingMessage(messages, userMessageId, answer)
+      }
+      lastClosingText = answer
+      if (todoSteps.length > 0) {
+        todoSteps = todoSteps.map((s) => ({ ...s, status: 'done' as const }))
+        paintTodo(todoSteps, { afterId: thinkBubbleId ?? undefined })
+      }
+      params.onUpdate([...messages])
+      return finishWithTiming(messages)
+    }
 
     // Think+plan done but no tool call. Nudge a few times, then stop honestly.
     // We never "apply the edit ourselves" — that produced instant fake success.
-    const emptyNudgeLimit = 3
+    const fakeProgress =
+      !toolCalls?.length &&
+      (isFalseSuccessProse(cleanFinal) ||
+        /файлы?\s+создан|создаю\s+(styles|js\/|index)|files?\s+created/i.test(cleanFinal))
+    const fp = cleanFinal.replace(/\s+/g, ' ').trim().slice(0, 160).toLowerCase()
+    const repeatedNoToolProse =
+      !toolCalls?.length &&
+      completedTools === 0 &&
+      Boolean(fp) &&
+      fp === lastNoToolFingerprint
+    if (repeatedNoToolProse || stuttered) {
+      proseStutterHits++
+      emptyToolNudges = Math.max(emptyToolNudges, 1)
+    }
+    if (!toolCalls?.length && completedTools === 0 && fp) {
+      lastNoToolFingerprint = fp
+    }
+
+    // Stutter on chat Q&A only — never accept fake "created files" prose as a coding done.
     if (
+      chatQa &&
+      stuttered &&
+      !toolCalls?.length &&
+      cleanFinal.trim().length >= 80 &&
+      !looksLikeFileEditRequest(params.userText)
+    ) {
+      const si = messages.findIndex((m) => m.id === streamId)
+      if (si !== -1) {
+        messages[si] = {
+          ...messages[si]!,
+          streaming: false,
+          content: cleanFinal.trim()
+        }
+      }
+      lastClosingText = cleanFinal.trim()
+      ensureClosingMessage(messages, userMessageId, lastClosingText)
+      params.onUpdate([...messages])
+      return finishWithTiming(messages)
+    }
+
+    const wantsFileEdit = looksLikeFileEditRequest(params.userText)
+    const emptyNudgeLimit =
+      fakeProgress || wantsFileEdit || looksLikeSurgicalFollowUp(params.userText) || proseStutterHits > 0
+        ? wantsFileEdit || fakeProgress
+          ? 5
+          : 2
+        : 3
+    if (
+      !chatQa &&
       !toolCalls?.length &&
       thinkSatisfied &&
       completedTools === 0 &&
@@ -4455,27 +4841,43 @@ export async function runAgentTurn(params: {
           streaming: false,
           content:
             uiLang === 'ru'
-              ? '↻ Плана мало — жду реальный вызов инструментов…'
-              : '↻ A plan is not enough — waiting for a real tool call…'
+              ? fakeProgress || /создаю|созданн|обновляю/i.test(cleanFinal)
+                ? '↻ Текст без tools ничего не меняет — нужен apply_diff / write_file…'
+                : streamAbortReason === 'prose_stutter'
+                  ? '↻ Обрыв зацикленного текста — жду реальный вызов инструментов…'
+                  : '↻ Плана мало — жду реальный вызов инструментов…'
+              : fakeProgress || /creating|created files|updating/i.test(cleanFinal)
+                ? '↻ Prose changes nothing — need apply_diff / write_file…'
+                : streamAbortReason === 'prose_stutter'
+                  ? '↻ Cut stuttering prose — waiting for a real tool call…'
+                  : '↻ A plan is not enough — waiting for a real tool call…'
         }
       }
       params.onUpdate([...messages])
       pushUserMessage(
         apiMessages,
-        'You produced text but NO tool call, so nothing changed on disk. Act now with a structured tool call: ' +
-          'list_directory / read_file to inspect, then write_file for a missing file or apply_diff / apply_patch for an existing one. ' +
+        (fakeProgress || isFalseSuccessProse(cleanFinal)
+          ? 'STOP narrating. You claimed files were created/updated but called ZERO tools — disk is unchanged. '
+          : streamAbortReason === 'prose_stutter'
+            ? 'STOP narrating. You looped the same prose with ZERO tool calls — nothing changed on disk. '
+            : 'You produced text but NO tool call, so nothing changed on disk. ') +
+          'Act NOW with a structured tool call: ' +
+          (looksLikeSurgicalFollowUp(params.userText) || /навбар|navbar/i.test(params.userText)
+            ? 'read_file index.html if needed, then apply_diff / apply_patch to enlarge the existing navbar (or write_file only for a NEW small css/js module). Do NOT rewrite the whole landing. Do NOT invent RU/EN i18n unless asked. '
+            : 'list_directory / read_file to inspect, then write_file for a missing file or apply_diff / apply_patch for an existing one. ') +
           `User request: «${params.userText.trim().slice(0, 240)}». ` +
-          'Never answer "Готово" / "Done" — a completion claim without a successful tool call is a lie.'
+          'Never answer "Готово" / "Файлы созданы" / "Done" without a successful tool call — that is a lie.'
       )
       apiMessages = normalizeApiMessages(apiMessages)
       continue
     }
 
     if (
+      !chatQa &&
       !toolCalls?.length &&
       thinkSatisfied &&
       completedTools === 0 &&
-      emptyToolNudges >= emptyNudgeLimit
+      (emptyToolNudges >= emptyNudgeLimit || (proseStutterHits >= 2 && !wantsFileEdit))
     ) {
       const siStop = messages.findIndex((m) => m.id === streamId)
       if (siStop !== -1) {
@@ -4484,8 +4886,8 @@ export async function runAgentTurn(params: {
           streaming: false,
           content:
             uiLang === 'ru'
-              ? '⏹ Модель не вызвала ни одного инструмента.'
-              : '⏹ Model never called a single tool.'
+              ? '⏹ Модель так и не вызвала инструменты — правки на диск не попали.'
+              : '⏹ Model never called tools — nothing was written to disk.'
         }
       }
       messages.push({
@@ -4493,22 +4895,28 @@ export async function runAgentTurn(params: {
         role: 'assistant',
         content:
           uiLang === 'ru'
-            ? 'Ничего не изменено: модель не вызвала ни одного инструмента, файлы на диске нетронуты. Задача не выполнена — переформулируй запрос или назови конкретный файл.'
-            : 'Nothing changed: the model never called a tool, so files on disk are untouched. Task not completed — rephrase or name the exact file.'
+            ? wantsFileEdit
+              ? 'Задача не выполнена: модель только описала правки, но не вызвала apply_diff / write_file. Файлы нетронуты. Нажми Send ещё раз или Stop → повтори запрос.'
+              : 'Ничего не изменено: модель не вызвала ни одного инструмента, файлы на диске нетронуты. Задача не выполнена — переформулируй запрос или назови конкретный файл.'
+            : wantsFileEdit
+              ? 'Task not done: the model only narrated edits and never called apply_diff / write_file. Files untouched. Press Send again or Stop → retry.'
+              : 'Nothing changed: the model never called a tool, so files on disk are untouched. Task not completed — rephrase or name the exact file.'
       })
       params.onUpdate([...messages])
       return finishWithTiming(messages)
     }
 
-    const planOnly = parsePlanBlock(rawFinal)
+    const planOnly = parsePlanBlock(cleanFinal)
     if (planOnly?.length && todoSteps.length === 0) {
       todoSteps = coercePlan(planOnly)
       planFrozen = true
       paintTodo(todoSteps, { afterId: thinkBubbleId ?? undefined })
     }
-    let finalText = stripPlanBlock(promoteThinkOnlyAnswer(rawFinal))
+    let finalText = stripPlanBlock(promoteThinkOnlyAnswer(cleanFinal))
     const claimsEditSuccess =
-      /сделано|готово|исправлен|fixed|done\.|task completed|визуально проверен/i.test(finalText)
+      /сделано|готово|исправлен|fixed|done\.|task completed|визуально проверен|файлы?\s+создан|files?\s+created/i.test(
+        finalText
+      )
     const claimsVisualOk = /визуально проверен|visually verified|проверено в (браузер|browser)|opened in.*browser/i.test(
       finalText
     )
@@ -4548,7 +4956,12 @@ export async function runAgentTurn(params: {
       for (let i = messages.length - 1; i >= 0; i--) {
         const m = messages[i]
         if (!m || m.role !== 'assistant' || m.toolName) continue
-        if (isAgentTodoMessageId(m.id) || m.id === AGENT_CHECKLIST_MSG_ID || m.id === AGENT_PLAN_MSG_ID) {
+        if (
+          isAgentTodoMessageId(m.id) ||
+          m.id === AGENT_CHECKLIST_MSG_ID ||
+          m.id === AGENT_PLAN_MSG_ID ||
+          isClosingMessageId(m.id)
+        ) {
           continue
         }
         if (/сделано|готово|исправлен|fixed|done\.|task completed/i.test(m.content ?? '')) {
@@ -4573,16 +4986,16 @@ export async function runAgentTurn(params: {
       }
     }
 
-    if (finalText || rawFinal) {
+    if (finalText || cleanFinal) {
       const lastApi = apiMessages[apiMessages.length - 1]
       if (lastApi?.role === 'assistant' && !lastApi.tool_calls?.length) {
         lastApi.content = `${apiContentText(lastApi.content)}\n\n${
-          falseSuccess ? finalText : rawFinal
+          falseSuccess ? finalText : cleanFinal
         }`
-      } else if (rawFinal) {
+      } else if (cleanFinal) {
         apiMessages.push({
           role: 'assistant',
-          content: falseSuccess ? finalText : rawFinal
+          content: falseSuccess ? finalText : cleanFinal
         })
       }
       apiMessages = normalizeApiMessages(apiMessages)
@@ -4612,14 +5025,24 @@ export async function runAgentTurn(params: {
       pendingPlanWork(todoSteps).length === 0
     ) {
       concludeAsked = true
+      const changedThisTurn = [...turnFileChanges.values()]
+        .map((c) => `${c.path} (+${c.added} −${c.removed})`)
+        .join(', ')
+      const scopeNote = uiLang === 'ru'
+        ? 'Только про ЭТУ просьбу пользователя. Не пересказывай, что делал в предыдущих сообщениях чата — ' +
+          'ни секции, ни правки, которые уже были готовы до этого запроса.' +
+          (changedThisTurn ? ` Изменено сейчас: ${changedThisTurn}.` : '')
+        : 'Cover ONLY the current user request. Do not restate work from earlier messages in this chat — ' +
+          'no sections or edits that already existed before this request.' +
+          (changedThisTurn ? ` Changed now: ${changedThisTurn}.` : '')
       const concludeHint =
         mutatingEditFailed
           ? uiLang === 'ru'
-            ? `Правка не удалась${lastMutatingFailDetail ? ` (${lastMutatingFailDetail})` : ''}. Напиши честное короткое заключение: что не применилось и почему. Без ложного «Сделано». Без новых tool calls, если больше нечего пробовать; иначе один corrective apply_diff.`
-            : `The edit failed${lastMutatingFailDetail ? ` (${lastMutatingFailDetail})` : ''}. Write an honest short summary: what did not apply and why. Do not claim "done". No new tools if nothing left to try; otherwise one corrective apply_diff.`
+            ? `Правка не удалась${lastMutatingFailDetail ? ` (${lastMutatingFailDetail})` : ''}. Напиши честное короткое заключение: что не применилось и почему. ${scopeNote} Без ложного «Сделано». Без новых tool calls, если больше нечего пробовать; иначе один corrective apply_diff.`
+            : `The edit failed${lastMutatingFailDetail ? ` (${lastMutatingFailDetail})` : ''}. Write an honest short summary: what did not apply and why. ${scopeNote} Do not claim "done". No new tools if nothing left to try; otherwise one corrective apply_diff.`
           : uiLang === 'ru'
-            ? 'Инструменты уже выполнены. Напиши краткое заключение для пользователя: что сделано, ключевые пути файлов, как проверить. Без новых tool calls, если задача завершена; иначе один следующий tool, затем заключение.'
-            : 'Tools already ran. Write a short closing summary for the user: what changed, key file paths, how to verify. No new tool calls if the task is done; otherwise one next tool, then the summary.'
+            ? `Инструменты уже выполнены. Напиши краткое заключение (2–5 пунктов): что изменилось, пути файлов, как проверить. ${scopeNote} Без новых tool calls, если задача завершена; иначе один следующий tool, затем заключение.`
+            : `Tools already ran. Write a short closing summary (2–5 bullets): what changed, file paths, how to verify. ${scopeNote} No new tool calls if the task is done; otherwise one next tool, then the summary.`
       pushUserMessage(apiMessages, concludeHint)
       apiMessages = normalizeApiMessages(apiMessages)
       pushStatusBubble(
@@ -4726,8 +5149,43 @@ export async function runAgentTurn(params: {
     const landingComplete =
       Boolean(lastHtmlWrite) && contentLooksStructurallyComplete(lastHtmlWrite)
 
+    // Q&A / web_search: answer already in chat — never loop «Доделываю план» 3×.
+    const qaAnswerDone =
+      Boolean(finalText.trim()) &&
+      finalText.trim().length >= 40 &&
+      !mutatingEditOk &&
+      !mutatingEditFailed &&
+      (usedWebSearch || isRedundantPlanCompleteProse(finalText))
+
+    if (qaAnswerDone || isRedundantPlanCompleteProse(finalText)) {
+      if (todoSteps.length > 0) {
+        todoSteps = todoSteps.map((s) =>
+          s.status === 'done' || isBrowserPlanStep(s.text)
+            ? s
+            : { ...s, status: 'done' as const }
+        )
+        paintTodo(todoSteps, { afterId: thinkBubbleId ?? undefined })
+      }
+      if (finalText.trim() && (concludeAsked || looksLikeClosingSummary(finalText) || usedWebSearch)) {
+        lastClosingText = finalText.trim()
+        ensureClosingMessage(messages, userMessageId, lastClosingText)
+      }
+      params.onUpdate([...messages])
+      return finishWithTiming(messages)
+    }
+
+    // Remaining plan rows that still need file/shell work (not search/Q&A fluff).
+    const fileWorkLeft = workLeft.filter(
+      (s) =>
+        !/web_search|поиск\s+в\s+интернет|искать\s+в\s+интернет|погод|weather/i.test(s.text) &&
+        (/write_file|apply_diff|apply_patch|index\.html|\.css|\.js|файл|созда|исправ|правк|edit|patch|html|секци/i.test(
+          s.text
+        ) ||
+          looksLikeLandingBuildTask(s.text))
+    )
+
     if (
-      workLeft.length > 0 &&
+      fileWorkLeft.length > 0 &&
       completedTools > 0 &&
       planFinishNudges < 3 &&
       round < maxRounds - 1 &&
@@ -4735,7 +5193,7 @@ export async function runAgentTurn(params: {
       !mutatingEditOk
     ) {
       planFinishNudges++
-      const pendingList = workLeft.map((s) => `- ${s.text}`).join('\n')
+      const pendingList = fileWorkLeft.map((s) => `- ${s.text}`).join('\n')
       pushUserMessage(
         apiMessages,
         'Open plan steps remain:\n' +
@@ -4787,7 +5245,7 @@ export async function runAgentTurn(params: {
     }
 
     if (
-      userAskedVerify(params.userText) &&
+      shouldNudgeVerify({ userText: params.userText, stacks }) &&
       !verifyAlreadyRan(evidenceLog) &&
       mutatingEditOk &&
       round < maxRounds - 1 &&
@@ -4818,7 +5276,11 @@ export async function runAgentTurn(params: {
     })
     if (honest) {
       finalText = honest
-      messages.push({ id: uid(), role: 'assistant', content: honest })
+      lastClosingText = honest
+      ensureClosingMessage(messages, userMessageId, honest)
+    } else if (finalText.trim() && (concludeAsked || looksLikeClosingSummary(finalText))) {
+      lastClosingText = finalText.trim()
+      ensureClosingMessage(messages, userMessageId, lastClosingText)
     }
 
     if (todoSteps.length > 0 && todosAllDone(todoSteps)) {

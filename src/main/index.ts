@@ -43,6 +43,7 @@ import { setTranslateCacheDir } from './hf/translateRu'
 import { detectGpuInfo } from './hardware/GpuInfo'
 import { hfDownloads } from './hf/HfDownloadManager'
 import { AgentToolRegistry } from './agent/AgentToolRegistry'
+import { fastApplyEdit } from './llama/ApplyEditClient'
 import { SettingsStore } from './settings/SettingsStore'
 import { ChatStore } from './chats/ChatStore'
 import { CheckpointStore, pendingMapToSnaps } from './checkpoints/CheckpointStore'
@@ -351,7 +352,7 @@ function settingsToLlamaOpts(
   } else if (slot === 'apply') {
     modelPath = settings.applyModelPath
     portOut = port + 1
-    ctxSize = Math.min(Math.max(settings.ctxSize || 8192, 8192), 16384)
+    ctxSize = applyCtxSizeFor(settings)
   }
   return {
     binaryPath: resolved,
@@ -376,6 +377,15 @@ function settingsToLlamaOpts(
     contextShift: settings.contextOverflow === 'context_shift',
     ...(slot === 'apply' ? { disableReasoning: true } : {})
   }
+}
+
+/** Apply slot ctx: explicit setting, else follow chat ctx within safe bounds. */
+function applyCtxSizeFor(settings?: AppSettings | null): number {
+  const explicit = Number(settings?.applyCtxSize)
+  if (Number.isFinite(explicit) && explicit >= 4096) {
+    return Math.min(131_072, Math.floor(explicit))
+  }
+  return Math.min(Math.max(Number(settings?.ctxSize) || 8192, 8192), 32_768)
 }
 
 function emitSlotStatus(): void {
@@ -1410,6 +1420,45 @@ function registerIpc(): void {
     return tools.getPendingDiff(String(relativePath ?? ''))
   })
 
+  // Ctrl+K inline edit: run on the fast apply slot, not the chat queue.
+  ipcMain.handle(
+    'agent:apply-edit',
+    async (
+      _e,
+      params: {
+        instruction?: string
+        filePath?: string
+        content?: string
+        region?: { startLine: number; endLine: number }
+      }
+    ) => {
+      const baseUrl =
+        applyLlama?.currentState === 'ready' ? applyLlama.baseUrl : ''
+      if (!baseUrl) {
+        return {
+          ok: false,
+          code: 'APPLY_UNAVAILABLE',
+          error: 'Apply model is not loaded (Settings → Apply model → Load).'
+        }
+      }
+      const filePath = String(params?.filePath ?? '')
+      const result = await fastApplyEdit({
+        baseUrl,
+        instruction: String(params?.instruction ?? ''),
+        filePath,
+        content: String(params?.content ?? ''),
+        region: params?.region,
+        ctxSize: applyCtxSizeFor(settingsStore?.get()),
+        onToken: (token) => {
+          mainWindow?.webContents.send('agent:apply-token', { path: filePath, token })
+        }
+      })
+      return result.ok
+        ? { ok: true, content: result.content, applied: result.applied }
+        : { ok: false, error: result.error, code: result.code }
+    }
+  )
+
   ipcMain.handle('checkpoints:list', (_e, sessionId?: string) => {
     return checkpointStore?.list(sessionId ? String(sessionId) : undefined) ?? []
   })
@@ -1636,6 +1685,10 @@ app.whenReady().then(async () => {
     contextIndex,
     getApplyBaseUrl: () =>
       applyLlama?.currentState === 'ready' ? applyLlama.baseUrl : null,
+    getApplyCtxSize: () => applyCtxSizeFor(settingsStore?.get()),
+    onApplyToken: (relativePath, token) => {
+      mainWindow?.webContents.send('agent:apply-token', { path: relativePath, token })
+    },
     getDiagnostics: () => diagnostics.getLast(),
     runVisibleCommand: (command, cwd) => terminals.runVisibleCommand(command, cwd),
     readTerminalScrollback: (maxChars) => terminals.getPrimaryScrollback(maxChars),

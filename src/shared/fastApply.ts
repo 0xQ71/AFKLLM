@@ -1,9 +1,19 @@
 import type { SearchReplaceBlock } from './types'
+import { applySearchReplaceFuzzy, findFuzzyLineRange } from './applyPatch'
 
-/** Keep apply prompts under ~6k tokens so they fit apply ctx (8192). */
-const FAST_APPLY_MAX_CHARS = 14_000
-const FAST_APPLY_HEAD = 9_000
-const FAST_APPLY_TAIL = 4_000
+/** Chars per token for budgeting the apply prompt against the apply slot ctx. */
+const APPLY_CHARS_PER_TOKEN = 3.2
+/** Context lines kept around a target region. */
+const REGION_CONTEXT_LINES = 40
+
+/**
+ * Prompt budget from the real apply ctx (not a hardcoded 14k clip, which made
+ * the middle of any medium file invisible to the apply model).
+ */
+export function applyPromptCharBudget(ctxSize?: number): number {
+  const ctx = Number.isFinite(ctxSize) && (ctxSize ?? 0) > 0 ? ctxSize! : 16_384
+  return Math.max(8_000, Math.floor(ctx * APPLY_CHARS_PER_TOKEN * 0.55))
+}
 
 /**
  * Parse one or more SEARCH/REPLACE blocks from model output.
@@ -76,6 +86,7 @@ export function applySearchReplaceBlocks(
   original: string,
   blocks: SearchReplaceBlock[]
 ): ApplyBlocksResult {
+  const crlf = original.includes('\r\n')
   let result = original.replace(/\r\n/g, '\n')
   const failed: ApplyBlocksResult['failed'] = []
   let applied = 0
@@ -87,19 +98,31 @@ export function applySearchReplaceBlocks(
       continue
     }
 
+    const replace = block.replace.replace(/\r\n/g, '\n')
     const hit = findUniqueSearch(result, block.search)
-    if (!hit.ok) {
-      failed.push({ index: i + 1, reason: hit.reason })
+    if (hit.ok) {
+      result = result.slice(0, hit.start) + replace + result.slice(hit.end)
+      applied++
       continue
     }
-    result =
-      result.slice(0, hit.start) +
-      block.replace.replace(/\r\n/g, '\n') +
-      result.slice(hit.end)
-    applied++
+    // Same fuzzy matcher apply_diff uses. Judging the small apply model by a
+    // stricter matcher than a hand-written search_block made no sense.
+    const fuzzy = applySearchReplaceFuzzy(result, block.search, replace)
+    if (fuzzy.ok) {
+      result = fuzzy.content.replace(/\r\n/g, '\n')
+      applied++
+      continue
+    }
+    failed.push({ index: i + 1, reason: hit.reason })
   }
 
-  return { content: result, applied, failed }
+  // Windows files must not come back rewritten to LF — that buried the real
+  // change under a whole-file line-ending diff.
+  return {
+    content: crlf ? result.replace(/\n/g, '\r\n') : result,
+    applied,
+    failed
+  }
 }
 
 function findUniqueSearch(
@@ -182,27 +205,125 @@ function mapTrimmedMatch(
   return { ok: true, start, end }
 }
 
-function clipFileForApply(content: string): { text: string; clipped: boolean } {
-  const n = content.replace(/\r\n/g, '\n')
-  if (n.length <= FAST_APPLY_MAX_CHARS) return { text: n, clipped: false }
-  const head = n.slice(0, FAST_APPLY_HEAD)
-  const tail = n.slice(-FAST_APPLY_TAIL)
+export interface ApplyRegion {
+  /** 1-based inclusive line range the edit targets. */
+  startLine: number
+  endLine: number
+}
+
+interface ApplyWindow {
+  text: string
+  /** 1-based inclusive range of `text` inside the file. */
+  startLine: number
+  endLine: number
+  totalLines: number
+  partial: boolean
+}
+
+/**
+ * Window of the file sent to the apply model: the whole file when it fits the
+ * budget, otherwise the target region plus context. Never a head/tail clip with
+ * a hole in the middle.
+ */
+export function buildApplyWindow(
+  fileContent: string,
+  region?: ApplyRegion,
+  budgetChars = applyPromptCharBudget()
+): ApplyWindow {
+  const n = fileContent.replace(/\r\n/g, '\n')
+  const lines = n.split('\n')
+  const totalLines = lines.length
+  if (n.length <= budgetChars) {
+    return { text: n, startLine: 1, endLine: totalLines, totalLines, partial: false }
+  }
+
+  const anchor = region ?? { startLine: 1, endLine: Math.min(totalLines, 200) }
+  let from = Math.max(1, Math.min(anchor.startLine, totalLines) - REGION_CONTEXT_LINES)
+  let to = Math.min(totalLines, Math.max(anchor.endLine, anchor.startLine) + REGION_CONTEXT_LINES)
+
+  // Grow the window while it fits, so the model sees as much as the ctx allows.
+  const sliceLen = (a: number, b: number): number =>
+    lines.slice(a - 1, b).join('\n').length
+  while (sliceLen(from, to) < budgetChars && (from > 1 || to < totalLines)) {
+    const grown = { from, to }
+    if (from > 1) grown.from = Math.max(1, from - 20)
+    if (to < totalLines) grown.to = Math.min(totalLines, to + 20)
+    if (sliceLen(grown.from, grown.to) > budgetChars) break
+    from = grown.from
+    to = grown.to
+  }
+
   return {
-    text:
-      head +
-      `\n\n/* … truncated ${n.length - FAST_APPLY_HEAD - FAST_APPLY_TAIL} chars for apply context … */\n\n` +
-      tail,
-    clipped: true
+    text: lines.slice(from - 1, to).join('\n'),
+    startLine: from,
+    endLine: to,
+    totalLines,
+    partial: !(from === 1 && to === totalLines)
   }
 }
 
-/** Morph-style prompts for coresident apply model (full-file edit intent). */
+/**
+ * Best guess at the lines an edit targets, so the apply prompt is a window and
+ * not the whole file. Uses the fuzzy range of search_block, then a longest-line
+ * anchor, then identifiers quoted in the instruction.
+ */
+export function locateApplyRegion(
+  fileContent: string,
+  searchBlock?: string,
+  instruction?: string
+): ApplyRegion | undefined {
+  const normalized = fileContent.replace(/\r\n/g, '\n')
+  const lines = normalized.split('\n')
+
+  const search = (searchBlock ?? '').trim()
+  if (search) {
+    const fuzzy = findFuzzyLineRange(normalized, search.split('\n'))
+    if (fuzzy.ok) return { startLine: fuzzy.start + 1, endLine: fuzzy.end }
+    const anchors = search
+      .split('\n')
+      .map((l) => l.trim())
+      .filter((l) => l.length >= 10)
+      .sort((a, b) => b.length - a.length)
+    for (const anchor of anchors.slice(0, 4)) {
+      const at = lines.findIndex((l) => l.includes(anchor))
+      if (at !== -1) return { startLine: at + 1, endLine: at + 1 }
+    }
+  }
+
+  const hint = (instruction ?? '').trim()
+  if (hint) {
+    const tokens = [
+      ...hint.matchAll(/["'`]([^"'`\n]{3,60})["'`]/g),
+      ...hint.matchAll(/([.#][A-Za-z][\w-]{2,40})/g),
+      ...hint.matchAll(/<\/?([a-z][\w-]{1,20})\b/gi)
+    ]
+      .map((m) => m[1] ?? '')
+      .filter(Boolean)
+    for (const token of tokens.slice(0, 6)) {
+      const needle = token.toLowerCase()
+      const at = lines.findIndex((l) => l.toLowerCase().includes(needle))
+      if (at !== -1) return { startLine: at + 1, endLine: at + 1 }
+    }
+  }
+
+  return undefined
+}
+
+/** Morph-style prompts for the coresident apply model. */
 export function buildFastApplyMessages(params: {
   instruction: string
   filePath: string
   fileContent: string
+  region?: ApplyRegion
+  ctxSize?: number
+  /** Feedback for a second attempt after blocks failed to match. */
+  retryNote?: string
 }): Array<{ role: 'system' | 'user'; content: string }> {
-  const { text, clipped } = clipFileForApply(params.fileContent)
+  const win = buildApplyWindow(
+    params.fileContent,
+    params.region,
+    applyPromptCharBudget(params.ctxSize)
+  )
   const system = `You are a precise code-editing assistant (fast apply).
 Return ONLY one or more SEARCH/REPLACE blocks. No prose, no markdown fences, no <think>, no explanation.
 
@@ -214,20 +335,23 @@ Format (exact markers — copy these characters):
 >>>>>>> REPLACE
 
 Rules:
-- SEARCH must be copied from the file EXACTLY and must be unique.
+- SEARCH must be copied from the shown content EXACTLY (same indentation) and must be unique.
 - Prefer the smallest unique SEARCH (5–40 lines) that covers the change.
 - Multiple blocks OK for independent edits.
-- Never output a full file dump unless the instruction is an explicit rewrite.
-- Prefer the smallest unique SEARCH (5–40 lines) that covers the change.`
+- Never output a full file dump unless the instruction is an explicit rewrite.`
 
-  const user = `File: ${params.filePath}${clipped ? ' (middle truncated — SEARCH only from the visible head/tail)' : ''}
+  const header = win.partial
+    ? `File: ${params.filePath} — showing lines ${win.startLine}-${win.endLine} of ${win.totalLines}. SEARCH must come from these lines only.`
+    : `File: ${params.filePath} (complete, ${win.totalLines} lines)`
 
-Current file content:
+  const user = `${header}
+
+Current content:
 \`\`\`
-${text}
+${win.text}
 \`\`\`
 
-Instruction: ${params.instruction}`
+Instruction: ${params.instruction}${params.retryNote ? `\n\n${params.retryNote}` : ''}`
 
   return [
     { role: 'system', content: system },

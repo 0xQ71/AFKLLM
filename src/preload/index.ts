@@ -485,7 +485,27 @@ const api = {
       current: string
       existed: boolean
       error?: string
-    }> => ipcRenderer.invoke('agent:pending-diff', relativePath)
+    }> => ipcRenderer.invoke('agent:pending-diff', relativePath),
+    applyEdit: (params: {
+      instruction: string
+      filePath: string
+      content: string
+      region?: { startLine: number; endLine: number }
+    }): Promise<{
+      ok: boolean
+      content?: string
+      applied?: number
+      error?: string
+      code?: string
+    }> => ipcRenderer.invoke('agent:apply-edit', params),
+    onApplyToken: (
+      cb: (payload: { path: string; token: string }) => void
+    ): (() => void) => {
+      const listener = (_: unknown, payload: { path: string; token: string }): void =>
+        cb(payload)
+      ipcRenderer.on('agent:apply-token', listener)
+      return () => ipcRenderer.removeListener('agent:apply-token', listener)
+    }
   },
 
   checkpoints: {

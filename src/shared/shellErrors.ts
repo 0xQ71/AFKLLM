@@ -21,6 +21,42 @@ export function looksLikeGuiLaunchCommand(command: string): boolean {
   return false
 }
 
+/**
+ * `-and` / `-or` are PowerShell operators, not cmdlet parameters. Written as
+ * `Test-Path x -And (...)` the shell only reports "cannot find parameter -And",
+ * which tells the model nothing about the fix.
+ */
+export function powershellOperatorMisuse(command: string): string | null {
+  const c = command.trim()
+  if (!c) return null
+  const m = c.match(/([A-Za-z]+-[A-Za-z]+)\s+[^|;]*?\s(-(?:and|or|not))\b/i)
+  if (!m) return null
+  const cmdlet = m[1]!
+  const op = m[2]!.toLowerCase()
+  return (
+    `SHELL_SYNTAX: "${op}" is a PowerShell operator, not a parameter of ${cmdlet}, ` +
+    'so the command cannot run. Wrap each side in parentheses: ' +
+    `(${cmdlet} "file") ${op} (Test-Path "other"). ` +
+    'Simpler: run one check per command, or just read the file with read_file.'
+  )
+}
+
+/**
+ * Unbounded recursive listing as "verification" hangs on large trees.
+ * Shallow list_directory / verify_project / one Start-Process is enough.
+ */
+export function recursiveListingRefusal(command: string): string | null {
+  const c = command.trim()
+  if (!c) return null
+  if (!/Get-ChildItem\b/i.test(c) || !/-Recurse\b/i.test(c)) return null
+  if (/-Depth\s+\d+/i.test(c)) return null
+  return (
+    'SHELL_REFUSED: Get-ChildItem -Recurse without -Depth is forbidden here ' +
+    '(can hang on huge trees). Use verify_project once, list_directory on a folder, ' +
+    'or Start-Process (Resolve-Path .\\index.html) to preview — do not scan the whole project.'
+  )
+}
+
 export function extractErrorFocus(text: string): string | null {
   const lines = text.split(/\n/)
   const markers: number[] = []

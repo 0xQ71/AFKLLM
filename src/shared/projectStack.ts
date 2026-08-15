@@ -134,6 +134,7 @@ export const STACK_CATALOG: ProjectStack[] = [
     id: 'html',
     label: 'Static HTML',
     markers: ['index.html'],
+    // No build/test/lint — verify_project does a one-shot entry check instead.
     sourceGlobs: ['**/*.{html,css,js}'],
     ignoreDirs: [...DEFAULT_IGNORE_DIRS]
   }
@@ -202,6 +203,13 @@ export function formatStackPromptSection(stacks: ProjectStack[]): string {
     )
   }
   const lines = stacks.map((s) => {
+    if (s.id === 'html') {
+      return (
+        `- ${s.label} (${s.markers.join(', ')}) — no build/test. ` +
+        `Verify ONCE: confirm index.html exists (verify_project) or Start-Process (Resolve-Path .\\index.html). ` +
+        `FORBIDDEN: Get-ChildItem -Recurse, repeated Test-Path, Test-Path -And chains.`
+      )
+    }
     const cmds = (
       [
         s.build && `build: ${s.build}`,
@@ -212,10 +220,14 @@ export function formatStackPromptSection(stacks: ProjectStack[]): string {
     ).filter(Boolean)
     return `- ${s.label} (${s.markers.join(', ')})${cmds.length ? ` — ${cmds.join('; ')}` : ' — no standard verify command'}`
   })
+  const hasCompiler = stacks.some((s) => Boolean(s.build || s.test || s.lint || s.run))
   return (
     'Detected project stack(s):\n' +
     lines.join('\n') +
-    '\nUse verify_project (build/test/lint) or execute_terminal_command with these commands. ' +
-    'Never claim tests/build passed unless the latest command returned exit_code=0.'
+    (hasCompiler
+      ? '\nUse verify_project (build/test/lint) ONCE or execute_terminal_command with these commands. ' +
+        'Never claim tests/build passed unless the latest command returned exit_code=0. ' +
+        'Do not recurse the whole tree to "verify".'
+      : '\nNo compiler/tests for this stack — one preview/open is enough. Do not spam shell checks.')
   )
 }

@@ -279,6 +279,13 @@ function sanitize(input: Record<string, unknown> | AppSettings): AppSettings {
   next.visionModelPath = typeof next.visionModelPath === 'string' ? next.visionModelPath : ''
   next.visionMmprojPath = typeof next.visionMmprojPath === 'string' ? next.visionMmprojPath : ''
   next.applyModelPath = typeof next.applyModelPath === 'string' ? next.applyModelPath : ''
+  // 0 = follow chat ctx; anything positive is clamped to a loadable window.
+  {
+    const raw = Number(next.applyCtxSize)
+    next.applyCtxSize = !Number.isFinite(raw) || raw <= 0
+      ? 0
+      : Math.max(4096, Math.min(131_072, Math.floor(raw)))
+  }
   next.imageGenModelPath =
     typeof next.imageGenModelPath === 'string' ? next.imageGenModelPath : ''
   next.imageGenVaePath =

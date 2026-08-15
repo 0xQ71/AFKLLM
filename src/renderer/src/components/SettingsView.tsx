@@ -941,6 +941,19 @@ function ModelPage({
             </button>
           </div>
         </Field>
+        <Field
+          label={t('settings.model.applyCtx')}
+          hint={t('settings.model.applyCtxHint')}
+        >
+          <input
+            type="number"
+            min={0}
+            step={2048}
+            value={settings.applyCtxSize}
+            onChange={(e) => patch('applyCtxSize', Number(e.target.value) || 0)}
+            className={settingsInputClass}
+          />
+        </Field>
         <SettingRow
           title={t('settings.model.status')}
           description={

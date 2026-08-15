@@ -1,4 +1,4 @@
-﻿/** Persisted agent chats (userData/chats.json), scoped per workspace root. */
+/** Persisted agent chats (userData/chats.json), scoped per workspace root. */
 
 export type PersistedChatRole = 'system' | 'user' | 'assistant' | 'tool'
 
@@ -81,6 +81,15 @@ export const CHAT_MAX_CONTENT_CHARS = 12_000
 
 /** LLM/heuristic digest of earlier turns; survives sanitize. */
 export const THREAD_SUMMARY_MSG_ID = 'thread-summary'
+
+/**
+ * Thread memory stays in persisted history (and the agent system prompt) but
+ * must not render in the chat list — sanitizePersistedMessages pins it after
+ * "welcome", which would otherwise dump a debug block at the top.
+ */
+export function isVisibleChatMessageId(id: string): boolean {
+  return id !== THREAD_SUMMARY_MSG_ID
+}
 
 /** Also used by smoke tests. */
 export function sanitizePersistedMessages(

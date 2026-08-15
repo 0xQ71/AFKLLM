@@ -286,6 +286,9 @@ const en = {
   'settings.model': 'Model',
   'settings.model.gguf': 'Model (.gguf)',
   'settings.model.applyGguf': 'Apply model (.gguf)',
+  'settings.model.applyCtx': 'Apply model context',
+  'settings.model.applyCtxHint':
+    '0 = follow chat context. A larger window lets targeted edits see the whole file. Reload to apply.',
   'settings.model.none': 'No models found — browse…',
   'settings.model.browse': 'Browse',
   'settings.model.browseFolder': 'Open models folder',
@@ -1018,6 +1021,9 @@ const ru: Record<MessageKey, string> = {
   'settings.model': 'Модель',
   'settings.model.gguf': 'Модель (.gguf)',
   'settings.model.applyGguf': 'Apply-модель (.gguf)',
+  'settings.model.applyCtx': 'Контекст apply-модели',
+  'settings.model.applyCtxHint':
+    '0 — как у чата. Больше окно — точечные правки видят файл целиком. Нужен Reload.',
   'settings.model.none': 'Модели не найдены — выберите…',
   'settings.model.browse': 'Обзор',
   'settings.model.browseFolder': 'Открыть папку моделей',
