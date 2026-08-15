@@ -3,10 +3,14 @@
  */
 
 import { looksLikeOpenHtmlCommand } from '../../../shared/localPreview'
-import { contentLooksStructurallyComplete as contentLooksStructurallyCompleteV2 } from './loop/completeness'
+import {
+  contentLooksStructurallyComplete as contentLooksStructurallyCompleteV2,
+  isLandingJsPath,
+  isSourcePath
+} from './loop/completeness'
 import { advanceTodosOnEvidence } from './loop/plan'
 
-export { looksLikeOpenHtmlCommand }
+export { looksLikeOpenHtmlCommand, isLandingJsPath, isSourcePath }
 
 export type ChatRole = 'system' | 'user' | 'assistant' | 'tool'
 
@@ -811,7 +815,18 @@ export function filterPlanToCurrentRequest(
   const out = steps.filter((s) => {
     const x = s.text
     if (/погод|weather|одежд|печк|что\s+лучше\s+одеть/i.test(x)) return false
-    if (/i18n|RU\s*\/\s*EN|переключ\S*\s+язык|language\s+switch/i.test(x) && !/язык/i.test(t)) {
+    if (
+      /i18n|RU\s*\/\s*EN|переключ\S*\s+язык|language\s+switch/i.test(x) &&
+      !/язык|i18n|переключател/i.test(t)
+    ) {
+      return false
+    }
+    if (
+      looksLikeI18nFollowUp(t) &&
+      /git\s+clone|изучить\s+репозитор|создать\s+assets|полный\s+лендинг|все\s+секц|styles\.css|hero\.svg|bootstrap/i.test(
+        x
+      )
+    ) {
       return false
     }
     if (
@@ -824,7 +839,10 @@ export function filterPlanToCurrentRequest(
     }
     return true
   })
-  const capped = (out.length ? out : steps).slice(0, navbarOnly ? 4 : 10)
+  const capped = (out.length ? out : steps).slice(
+    0,
+    navbarOnly || looksLikeI18nFollowUp(t) ? 4 : 10
+  )
   return capped.map((s, i) => ({
     ...s,
     id: `s${i + 1}`,
@@ -1095,8 +1113,12 @@ export function looksLikeFileEditRequest(userText: string): boolean {
   if (!t) return false
   if (looksLikeSurgicalFollowUp(t) || looksLikeLandingBuildTask(t)) return true
   return (
-    /навбар|navbar|header|футер|footer|hero|секци|faq|index\.html|\.css|\.js\b/i.test(t) ||
-    /добав|вставь|сделай|создай|поправ|исправ|убери|вынес|перенес|увели|больш/i.test(t)
+    /навбар|navbar|header|футер|footer|hero|секци|faq|index\.html|\.css|\.js\b|\.tsx?|\.jsx?|\.py\b|\.go\b|\.rs\b|\.java\b|\.cs\b|переключател|i18n|language\s+switch/i.test(
+      t
+    ) ||
+    /добав|вставь|сделай|создай|поправ|исправ|убери|вынес|перенес|увели|больш|не\s+работает/i.test(
+      t
+    )
   ) &&
     !looksLikeChatQa(t)
 }
@@ -1258,10 +1280,45 @@ export function looksLikeChatQa(
   return false
 }
 
-/** Follow-ups that must patch existing files, not invent a new landing. */
+/** Short follow-up: existing landing language switcher / i18n is broken. */
+export function looksLikeI18nFollowUp(userText: string): boolean {
+  const t = userText.trim()
+  if (!t) return false
+  if (looksLikeLandingBuildTask(t) && t.length > 400) return false
+  return (
+    /переключател\S*\s+язык|language\s+switcher|data-i18n|\bi18n\b|\[object Object\]/i.test(
+      t
+    ) ||
+    (t.length <= 280 &&
+      /не\s+работает|doesn'?t\s+work|does\s+not\s+work|is\s+broken|сломан/i.test(t) &&
+      /язык|lang|i18n|переключател|перевод/i.test(t))
+  )
+}
+
+/** Long “build from scratch” briefs — never surgical. */
+export function looksLikeFromScratchTask(userText: string): boolean {
+  const t = userText.trim()
+  if (!t) return false
+  if (looksLikeLandingBuildTask(t) && (t.length > 400 || /с\s*нуля|from\s+scratch/i.test(t))) {
+    return true
+  }
+  if (
+    t.length > 400 &&
+    /создай\s+(приложение|проект|сервис|cli|бот|сайт)|scaffold|from\s+scratch|с\s*нуля|новый\s+(проект|репозитор|сервис)/i.test(
+      t
+    )
+  ) {
+    return true
+  }
+  return false
+}
+
+/** Follow-ups that must patch existing files, not invent a new landing or project. */
 export function looksLikeSurgicalFollowUp(userText: string): boolean {
   const t = userText.trim()
   if (!t) return false
+  if (looksLikeFromScratchTask(t)) return false
+  if (looksLikeChatQa(t)) return false
   return (
     /без\s+полной\s+перепис|without\s+(a\s+)?full\s+rewrite|не\s+переписывай\s+цел/i.test(t) ||
     /вынеси|выделить|отдельн(ый|ую|ое)\s+(компонент|файл|css|js|модул)/i.test(t) ||
@@ -1269,7 +1326,12 @@ export function looksLikeSurgicalFollowUp(userText: string): boolean {
     /поправь\s+cta|fix\s+the\s+cta|только\s+cta/i.test(t) ||
     /добав\S*\s+(больш\S*\s+)?(навбар|navbar|header|футер|footer|секци)/i.test(t) ||
     /как\s+насч[её]т\s+добав/i.test(t) ||
-    /увели\S*\s+(навбар|navbar|header)|больш\S*\s+навбар/i.test(t)
+    /увели\S*\s+(навбар|navbar|header)|больш\S*\s+навбар/i.test(t) ||
+    looksLikeI18nFollowUp(t) ||
+    (t.length <= 400 &&
+      /не\s+работает|doesn'?t\s+work|does\s+not\s+work|is\s+broken|\bbroken\b|сломан|почини|исправ\w*|fix\s+(the\s+)?|typeerror|compile|pytest|go\s+test|cargo\s+test|doesn't\s+compile|test\s+fail|упал\s+тест|\bbug\b|\bбаг\b|\berror\b|\bfails?\b|\bfailed\b|\bfailure\b/i.test(
+        t
+      ))
   )
 }
 
@@ -1473,9 +1535,27 @@ export function isSoftLayoutPlanStep(text: string): boolean {
 }
 
 export function isBrowserPlanStep(text: string): boolean {
-  return /браузер|browser|открыт\w*\s+index|open\s+in\s+browser|visual|визуальн|desktop\s*\+|mobile|проверк\w*\s+в[её]рст|проверк\w*\s+на\s+(desktop|mobile)|Start-Process.*index\.html/i.test(
+  return /браузер|browser|открыт\w*\s+index|open\s+in\s+browser|visual|визуальн|превью|preview|glassmorphism|glass-?morph|бургер|burger|desktop\s*\+|mobile|проверк\w*\s+в[её]рст|проверк\w*\s+на\s+(desktop|mobile)|Start-Process.*index\.html/i.test(
     text
   )
+}
+
+/** Close leftover visual / preview rows once the page was opened or files were written. */
+export function settlePlanAfterWork(
+  steps: AgentTodoStep[],
+  opts: { previewOpened?: boolean; edited?: boolean }
+): AgentTodoStep[] {
+  if (!steps.length) return steps
+  return steps.map((s) => {
+    if (s.status === 'done') return s
+    if (opts.previewOpened && isBrowserPlanStep(s.text)) {
+      return { ...s, status: 'done' as const }
+    }
+    if (opts.edited && (isMetaOrSummaryPlanStep(s.text) || isSoftLayoutPlanStep(s.text))) {
+      return { ...s, status: 'done' as const }
+    }
+    return s
+  })
 }
 
 /** "Write the whole landing / single-file index.html with all sections" mega-step. */
@@ -2053,7 +2133,9 @@ export function fingerprintToolCall(
   // Any Start-Process / open index.html variant is the same action (cwd/path must not bypass dedupe).
   if (
     name === 'execute_terminal_command' &&
-    looksLikeOpenHtmlCommand(content)
+    (looksLikeOpenHtmlCommand(content) ||
+      (/\.html?\b/i.test(content) &&
+        /Start-Process|Invoke-Item|\bii\b|explorer\.exe/i.test(content)))
   ) {
     return `${name}|open_html_preview`
   }

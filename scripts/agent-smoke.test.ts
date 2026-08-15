@@ -45,6 +45,7 @@ import {
   extractThinkInner,
   pendingPlanWork,
   isBrowserPlanStep,
+  settlePlanAfterWork,
   isJunkPlanStep,
   isSoftLayoutPlanStep,
   coerceProductPlan,
@@ -59,6 +60,9 @@ import {
   looksLikeChatQa,
   looksLikeFileEditRequest,
   looksLikeSurgicalFollowUp,
+  looksLikeI18nFollowUp,
+  isLandingJsPath,
+  isSourcePath,
   filterPlanToCurrentRequest,
   parseGlobalRenameIntent,
   wantsOpenAfterEdit,
@@ -108,6 +112,13 @@ import {
   type StepEvidence
 } from '../src/renderer/src/agent/loop/evidence'
 import { honestClosingNote } from '../src/renderer/src/agent/loop/report'
+import {
+  formatI18nSanityHint,
+  htmlJsI18nMismatch,
+  jsI18nDictLooksBroken
+} from '../src/renderer/src/agent/loop/i18nSanity'
+import { formatEditSanityHint } from '../src/renderer/src/agent/loop/editSanity'
+import { formatSurgicalFollowUpHint, isHtmlOnlyStacks } from '../src/renderer/src/agent/loop/prompts'
 import { truncationGuardMessage } from '../src/shared/writeThresholds'
 
 describe('looksLikeToolMarkupLeak', () => {
@@ -152,8 +163,12 @@ describe('looksLikeToolMarkupLeak', () => {
     const c = fingerprintToolCall('execute_terminal_command', {
       command: 'Start-Process (Resolve-Path .\\index.html)'
     })
+    const d = fingerprintToolCall('execute_terminal_command', {
+      command: "Start-Process 'index.html'"
+    })
     assert.equal(a, b)
     assert.equal(b, c)
+    assert.equal(c, d)
     assert.equal(a, 'execute_terminal_command|open_html_preview')
   })
 
@@ -838,6 +853,29 @@ describe('agent todo plan', () => {
     assert.equal(looksLikeChatQa('а если я как печка'), true)
     assert.equal(looksLikeSurgicalFollowUp('как насчёт добавления большого навбара'), true)
     assert.equal(looksLikeFileEditRequest('как насчёт добавления большого навбара'), true)
+    assert.equal(looksLikeSurgicalFollowUp('не работает переключатель языка'), true)
+    assert.equal(looksLikeFileEditRequest('не работает переключатель языка'), true)
+    assert.equal(looksLikeI18nFollowUp('не работает переключатель языка'), true)
+    assert.equal(looksLikeI18nFollowUp('language switcher is broken'), true)
+    assert.equal(looksLikeSurgicalFollowUp('не работает pytest'), true)
+    assert.equal(looksLikeSurgicalFollowUp('TypeError in app.py'), true)
+    assert.equal(looksLikeSurgicalFollowUp('go test fails'), true)
+    assert.equal(looksLikeSurgicalFollowUp("doesn't compile"), true)
+    assert.equal(looksLikeSurgicalFollowUp('не переписывай целиком'), true)
+    assert.equal(looksLikeFileEditRequest('TypeError in app.py'), true)
+    assert.equal(looksLikeFileEditRequest('fix src/main.go'), true)
+    assert.equal(
+      looksLikeSurgicalFollowUp(
+        'Сделай полноценный профессиональный многофайловый лендинг продукта AFKLLM. '.repeat(8) +
+          'Язык лендинга: русский + английский переключатель.'
+      ),
+      false
+    )
+    assert.equal(isLandingJsPath('js/main.js'), true)
+    assert.equal(isLandingJsPath('src/runAgentTurn.ts'), false)
+    assert.equal(isSourcePath('app.py'), true)
+    assert.equal(isSourcePath('cmd/app.go'), true)
+    assert.equal(isSourcePath('readme.txt'), false)
     assert.equal(
       isFalseSuccessProse(
         'Создаю компонент навбара в отдельном файле и обновляю index.html без полной переписи. Созданные файлы: Обновления:'
@@ -866,6 +904,28 @@ describe('agent todo plan', () => {
     )
     assert.equal(scoped.length, 1)
     assert.match(scoped[0]!.text, /навбар/i)
+    const i18nScoped = filterPlanToCurrentRequest(
+      [
+        {
+          id: '1',
+          text: 'Исправить переключатель языка в js/main.js',
+          status: 'pending' as const
+        },
+        {
+          id: '2',
+          text: 'git clone репозиторий и изучить README',
+          status: 'pending' as const
+        },
+        {
+          id: '3',
+          text: 'Создать assets и полный лендинг',
+          status: 'pending' as const
+        }
+      ],
+      'не работает переключатель языка'
+    )
+    assert.ok(i18nScoped.some((s) => /переключател/i.test(s.text)))
+    assert.ok(!i18nScoped.some((s) => /git\s+clone|полный\s+лендинг|создать\s+assets/i.test(s.text)))
     assert.equal(
       looksLikeChatQa('а если ещё теплее', [
         { role: 'user', content: 'какая погода сейчас Москве' },
@@ -1432,6 +1492,28 @@ describe('AgentToolRegistry edit review', () => {
     }
   })
 
+  it('apply_diff without relative_path returns MISSING_PATH', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'afkllm-nopath-'))
+    try {
+      const reg = new AgentToolRegistry({ projectRoot: root })
+      await fs.mkdir(path.join(root, 'js'), { recursive: true })
+      await fs.writeFile(path.join(root, 'js', 'main.js'), 'console.log(1)\n', 'utf8')
+      const res = await reg.invoke({
+        id: '1',
+        name: 'apply_diff',
+        arguments: {
+          search_block: 'console.log(1)',
+          replace_block: 'console.log(2)'
+        }
+      })
+      assert.equal(res.ok, false)
+      assert.match(res.error ?? '', /MISSING_PATH/)
+      assert.equal(await fs.readFile(path.join(root, 'js', 'main.js'), 'utf8'), 'console.log(1)\n')
+    } finally {
+      await fs.rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('reject deletes newly created file', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'afkllm-edit-new-'))
     try {
@@ -1561,6 +1643,48 @@ describe('AgentToolRegistry edit review', () => {
       })
       assert.equal(explicit.ok, true, explicit.error ?? explicit.content)
       assert.match(await fs.readFile(path.join(root, rel), 'utf8'), /Northline Dark/)
+    } finally {
+      await fs.rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('FILE_COMPLETE applies to a large finished Python module', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'afkllm-complete-py-'))
+    try {
+      const reg = new AgentToolRegistry({ projectRoot: root })
+      const rel = 'app.py'
+      const big = 'def main():\n    return 1\n\n' + '# keep\n'.repeat(1200)
+      await fs.writeFile(path.join(root, rel), big, 'utf8')
+      const blocked = await reg.invoke({
+        id: '1',
+        name: 'write_file',
+        arguments: { relative_path: rel, content: big + '# v2\n' }
+      })
+      assert.equal(blocked.ok, false)
+      assert.match(blocked.error ?? '', /FILE_COMPLETE/)
+      const incomplete = await reg.invoke({
+        id: '2',
+        name: 'write_file',
+        arguments: {
+          relative_path: rel,
+          content: 'def main():\n',
+          overwrite: true
+        }
+      })
+      assert.equal(incomplete.ok, false)
+      assert.match(incomplete.error ?? '', /FILE_COMPLETE/)
+      const explicit = await reg.invoke({
+        id: '3',
+        name: 'write_file',
+        arguments: {
+          relative_path: rel,
+          content: big.replace('return 1', 'return 2'),
+          overwrite: true,
+          allow_full_rewrite: true
+        }
+      })
+      assert.equal(explicit.ok, true, explicit.error ?? explicit.content)
+      assert.match(await fs.readFile(path.join(root, rel), 'utf8'), /return 2/)
     } finally {
       await fs.rm(root, { recursive: true, force: true })
     }
@@ -2094,6 +2218,109 @@ describe('powershellOperatorMisuse', () => {
     assert.match(err!, /SHELL_SYNTAX/)
     assert.match(err!, /-and/i)
     assert.match(err!, /\(Test-Path/)
+  })
+})
+
+describe('i18n sanity', () => {
+  it('flags object/selector-array dict values and id vs data-i18n mismatch', () => {
+    const brokenJs =
+      "const t = { featurePrivacy: { ru: 'Приватность', en: 'Privacy' }, downloadTitle: [\"[data-i18n='dl_title']\"] };\n" +
+      "el.textContent = t.featurePrivacy;\n"
+    assert.equal(jsI18nDictLooksBroken(brokenJs), true)
+    const hint = formatI18nSanityHint({ js: brokenJs })
+    assert.ok(hint)
+    assert.match(hint!, /I18N_SANITY/)
+    const okJs =
+      "const t = { ru: { hero: 'Привет' }, en: { hero: 'Hello' } };\n" +
+      "document.querySelector('[data-i18n=\"hero\"]').textContent = t[lang].hero;\n"
+    assert.equal(jsI18nDictLooksBroken(okJs), false)
+    assert.equal(formatI18nSanityHint({ js: okJs }), null)
+    const html = '<h1 data-i18n="hero_title">AFKLLM</h1><p data-i18n="hero_sub">Local IDE</p>'
+    const jsIds = "document.getElementById('hero-title').textContent = t.hero;\n" +
+      "document.querySelector('#hero-subtitle').textContent = t.sub;\n"
+    assert.equal(htmlJsI18nMismatch(html, jsIds), true)
+    assert.match(formatI18nSanityHint({ html, js: jsIds }) ?? '', /I18N_SANITY/)
+  })
+})
+
+describe('edit sanity + html-only stacks', () => {
+  it('flags incomplete source and treats html-only stacks separately', () => {
+    const hint = formatEditSanityHint({
+      path: 'app.py',
+      content: 'def main():\n'
+    })
+    assert.ok(hint)
+    assert.match(hint!, /EDIT_SANITY/)
+    assert.equal(
+      formatEditSanityHint({
+        path: 'app.py',
+        content: 'def main():\n    return 1\n'
+      }),
+      null
+    )
+    assert.equal(isHtmlOnlyStacks([{ id: 'html', label: 'HTML', markers: ['index.html'], sourceGlobs: [], ignoreDirs: [] }]), true)
+    assert.equal(
+      isHtmlOnlyStacks([
+        {
+          id: 'python',
+          label: 'Python',
+          markers: ['requirements.txt'],
+          sourceGlobs: [],
+          ignoreDirs: []
+        }
+      ]),
+      false
+    )
+    assert.equal(isHtmlOnlyStacks([]), false)
+    const pyHint = formatSurgicalFollowUpHint({
+      stacks: [
+        {
+          id: 'python',
+          label: 'Python',
+          markers: ['requirements.txt'],
+          sourceGlobs: [],
+          ignoreDirs: []
+        }
+      ],
+      i18nFix: false
+    })
+    assert.match(pyHint, /verify_project/)
+    assert.match(pyHint, /get_diagnostics is allowed/)
+    const htmlHint = formatSurgicalFollowUpHint({
+      stacks: [
+        {
+          id: 'html',
+          label: 'HTML',
+          markers: ['index.html'],
+          sourceGlobs: [],
+          ignoreDirs: []
+        }
+      ],
+      i18nFix: false
+    })
+    assert.match(htmlHint, /preview ONCE/i)
+    assert.match(htmlHint, /get_diagnostics on static HTML/)
+  })
+})
+
+describe('product README git clone refusal', () => {
+  it('blocks git clone of AFKLLM into /tmp', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'afkllm-clone-'))
+    try {
+      const reg = new AgentToolRegistry({ projectRoot: root })
+      const res = await reg.invoke({
+        id: '1',
+        name: 'execute_terminal_command',
+        arguments: {
+          command: 'git clone https://github.com/0xQ71/AFKLLM.git /tmp/afkllm-repo'
+        }
+      })
+      assert.equal(res.ok, false)
+      assert.match(res.error ?? '', /SHELL_REFUSED/)
+      assert.match(res.error ?? '', /web_search/i)
+    } finally {
+      await fs.rm(root, { recursive: true, force: true })
+    }
   })
 })
 

@@ -57,6 +57,26 @@ export function recursiveListingRefusal(command: string): string | null {
   )
 }
 
+/**
+ * Cloning the advertised product repo (or any git clone into /tmp) just to copy
+ * README facts — use web_search / workspace README instead.
+ */
+export function productReadmeCloneRefusal(command: string): string | null {
+  const c = command.trim()
+  if (!c || !/\bgit\s+clone\b/i.test(c)) return null
+  const clonesProduct =
+    /github\.com[/:]0xq71\/afkllm/i.test(c) || /git@github\.com:0xq71\/afkllm/i.test(c)
+  const clonesToTmp =
+    /(?:^|[\s"'=])(?:\/tmp|\\tmp)(?:[/\\s"']|$)/i.test(c) ||
+    /\s(?:\/tmp|\\tmp)(?:[/\\s"']|$)/i.test(c)
+  if (!clonesProduct && !clonesToTmp) return null
+  return (
+    'SHELL_REFUSED: do not git clone the product repo (or clone into /tmp) just to read README. ' +
+    'Call web_search once (GitHub README / Releases URL) or read_file the workspace README. ' +
+    'Never Copy-Item from a clone.'
+  )
+}
+
 export function extractErrorFocus(text: string): string | null {
   const lines = text.split(/\n/)
   const markers: number[] = []

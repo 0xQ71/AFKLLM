@@ -5,6 +5,7 @@ import {
   extractErrorFocus,
   isUserInterruptExit,
   looksLikeGuiLaunchCommand,
+  productReadmeCloneRefusal,
   recursiveListingRefusal
 } from '../src/shared/shellErrors'
 import {
@@ -13,7 +14,7 @@ import {
   stackSupportsVerify
 } from '../src/renderer/src/agent/loop/verify'
 import { allowsFullOverwrite } from '../src/shared/writeThresholds'
-import { contentLooksStructurallyComplete } from '../src/renderer/src/agent/loop/completeness'
+import { contentLooksStructurallyComplete, isLandingJsPath, isSourcePath } from '../src/renderer/src/agent/loop/completeness'
 import { evidenceSupportsStep, evidenceFromTool, recordEvidence } from '../src/renderer/src/agent/loop/evidence'
 import { advanceTodosOnEvidence } from '../src/renderer/src/agent/loop/plan'
 import { AgentToolRegistry } from '../src/main/agent/AgentToolRegistry'
@@ -101,6 +102,23 @@ describe('recursive listing refusal', () => {
     )
     assert.equal(recursiveListingRefusal('Get-ChildItem -Depth 2'), null)
     assert.equal(recursiveListingRefusal('npm test'), null)
+  })
+})
+
+describe('product README clone refusal', () => {
+  it('blocks cloning AFKLLM or cloning into /tmp', () => {
+    assert.match(
+      productReadmeCloneRefusal(
+        'git clone https://github.com/0xQ71/AFKLLM.git /tmp/afkllm-repo'
+      ) ?? '',
+      /SHELL_REFUSED/
+    )
+    assert.match(
+      productReadmeCloneRefusal('git clone https://github.com/foo/bar.git /tmp/bar') ?? '',
+      /SHELL_REFUSED/
+    )
+    assert.equal(productReadmeCloneRefusal('git clone https://github.com/foo/bar.git'), null)
+    assert.equal(productReadmeCloneRefusal('git status'), null)
   })
 })
 
@@ -219,6 +237,15 @@ describe('completeness by language', () => {
     assert.equal(contentLooksStructurallyComplete('def add(a, b):\n    return a + b\n', 'a.py'), true)
     assert.equal(contentLooksStructurallyComplete('{"a": 1}', 'a.json'), true)
     assert.equal(contentLooksStructurallyComplete('def add(a, b):\n', 'a.py'), false)
+  })
+
+  it('isLandingJsPath matches js/main.js only', () => {
+    assert.equal(isLandingJsPath('js/main.js'), true)
+    assert.equal(isLandingJsPath('main.js'), true)
+    assert.equal(isLandingJsPath('src/renderer/src/agent/runAgentTurn.ts'), false)
+    assert.equal(isSourcePath('app.py'), true)
+    assert.equal(isSourcePath('main.go'), true)
+    assert.equal(isSourcePath('src/app.ts'), true)
   })
 })
 

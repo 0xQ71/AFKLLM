@@ -117,6 +117,8 @@ describe('localPreview', () => {
       'llm_mistake'
     )
     assert.equal(looksLikeOpenHtmlCommand('Start-Process chrome.exe http://localhost:5173/'), true)
+    assert.equal(looksLikeOpenHtmlCommand("Start-Process 'index.html'"), true)
+    assert.equal(looksLikeOpenHtmlCommand('Start-Process index.html'), true)
   })
 
   it('pathToFileUrl + open-html path extraction', () => {

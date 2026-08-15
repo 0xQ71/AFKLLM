@@ -22,6 +22,7 @@ import {
   looksLikeGuiLaunchCommand,
   looksLikeShellFileMutation,
   powershellOperatorMisuse,
+  productReadmeCloneRefusal,
   recursiveListingRefusal
 } from '../../shared/shellErrors'
 import {
@@ -45,6 +46,7 @@ import {
   looksLikeLocalServerCommand,
   pathToFileUrl
 } from '../../shared/localPreview'
+import { contentLooksStructurallyComplete } from '../../shared/completeness'
 import { fastApplyEdit } from '../llama/ApplyEditClient'
 import { locateApplyRegion, type ApplyRegion } from '../../shared/fastApply'
 
@@ -522,7 +524,7 @@ export class AgentToolRegistry {
         ok: false,
         content: '',
         error:
-          'MISSING_PATH: relative_path is required (e.g. "index.html" or "src/app.js"). ' +
+          'MISSING_PATH: relative_path is required (e.g. "src/main.py", "index.html"). ' +
           'Put the path in relative_path BEFORE content. Do not write to the project root.'
       }
     }
@@ -566,9 +568,11 @@ export class AgentToolRegistry {
     // Block silent full rewrites of large files — the #1 cause of "rewrites everything after compact"
     if (!append && !overwrite && existing.trim().length > 40) {
       const tail = existing.slice(-350)
-      const completeHtml =
-        /\.html?$/i.test(relativePath) && htmlDocumentComplete(existing)
-      if (completeHtml) {
+      const htmlDone = /\.html?$/i.test(relativePath) && htmlDocumentComplete(existing)
+      const sourceDone =
+        contentLooksStructurallyComplete(existing, relativePath) &&
+        existing.length >= SMALL_FILE_OVERWRITE_CHARS
+      if (htmlDone || sourceDone) {
         return {
           id: '',
           name: 'write_file',
@@ -578,7 +582,7 @@ export class AgentToolRegistry {
             'Do NOT rewrite the whole file. Use apply_diff / apply_patch for a small fix. File currently ends with:\n<<<\n' +
             tail +
             '\n>>>',
-          error: `FILE_COMPLETE: ${relativePath} — do not overwrite; preview or patch`
+          error: `FILE_COMPLETE: ${relativePath} — do not overwrite; patch instead`
         }
       }
       const small = allowsFullOverwrite(relativePath, existing.length)
@@ -598,13 +602,19 @@ export class AgentToolRegistry {
       }
     }
 
-    // Never clobber a finished landing with a truncated / CSS-only rewrite.
+    const existingComplete =
+      (/\.html?$/i.test(relativePath) && htmlDocumentComplete(existing)) ||
+      contentLooksStructurallyComplete(existing, relativePath)
+    const incomingComplete = contentLooksStructurallyComplete(content, relativePath)
+
+    // Never clobber a finished file with a truncated rewrite.
     if (
       overwrite &&
       !append &&
       existed &&
-      htmlDocumentComplete(existing) &&
-      !htmlDocumentComplete(content)
+      existingComplete &&
+      !incomingComplete &&
+      !Boolean(args.allow_full_rewrite)
     ) {
       return {
         id: '',
@@ -612,14 +622,13 @@ export class AgentToolRegistry {
         ok: false,
         content: '',
         error:
-          `FILE_COMPLETE: "${relativePath}" already ends with </html>. ` +
-          'Refusing to overwrite it with incomplete HTML. Use apply_diff or send a complete document.'
+          `FILE_COMPLETE: "${relativePath}" already looks finished. ` +
+          'Refusing to overwrite it with incomplete content. Use apply_diff or send a complete file.'
       }
     }
 
     if (overwrite && !append && existed) {
-      const complete =
-        htmlDocumentComplete(existing) || existing.length >= 800
+      const complete = existingComplete || existing.length >= 800
       const guard = truncationGuardMessage({
         relativePath,
         existingBytes: existing.length,
@@ -638,15 +647,14 @@ export class AgentToolRegistry {
       }
     }
 
-    // A finished page is edited, never regenerated: rewriting it burns minutes of
-    // tokens and silently drops sections the user never asked to change.
+    // A finished large file is edited, never regenerated.
     if (
       overwrite &&
       !append &&
       existed &&
-      htmlDocumentComplete(existing) &&
+      existingComplete &&
       existing.length >= SMALL_FILE_OVERWRITE_CHARS &&
-      htmlDocumentComplete(content) &&
+      incomingComplete &&
       !Boolean(args.allow_full_rewrite)
     ) {
       return {
@@ -654,8 +662,8 @@ export class AgentToolRegistry {
         name: 'write_file',
         ok: false,
         content:
-          `FILE_COMPLETE: "${relativePath}" already ends with </html> (${existing.length} bytes).\n` +
-          'Do NOT regenerate the page. Make the requested change with apply_diff ' +
+          `FILE_COMPLETE: "${relativePath}" already looks finished (${existing.length} bytes).\n` +
+          'Do NOT regenerate the file. Make the requested change with apply_diff ' +
           '(replace_all=true for a global rename), one edit per distinct snippet.',
         error: `FILE_COMPLETE: ${relativePath} — use apply_diff; full rewrite blocked`
       }
@@ -673,6 +681,7 @@ export class AgentToolRegistry {
     const pathKey = relativePath.replace(/\\/g, '/')
     const writtenBody = append ? existing + content : content
     const lineCount = writtenBody.split(/\r?\n/).length
+    const sourceComplete = contentLooksStructurallyComplete(writtenBody, relativePath)
     const closesHtml = /<\/html\s*>/i.test(writtenBody)
     const closesBody = /<\/body\s*>/i.test(writtenBody)
     const htmlHint =
@@ -681,7 +690,10 @@ export class AgentToolRegistry {
           (closesHtml
             ? ' FILE_COMPLETE — do not rewrite just to "finish the tail".'
             : ' If incomplete, append=true on the SAME path (do not invent a new file).')
-        : ` lines=${lineCount}.`
+        : ` lines=${lineCount}.` +
+          (sourceComplete
+            ? ' FILE_COMPLETE — do not rewrite just to "finish the tail".'
+            : ' If incomplete, append=true on the SAME path (do not invent a new file).')
     return {
       id: '',
       name: 'write_file',
@@ -770,11 +782,23 @@ export class AgentToolRegistry {
   }
 
   private async applyDiff(args: Record<string, unknown>): Promise<AgentToolResult> {
-    const relativePath = String(args.relative_path ?? '')
+    const relativePath = String(args.relative_path ?? '').trim()
     const searchBlock = String(args.search_block ?? '')
     const replaceBlock = String(args.replace_block ?? '')
     const replaceAll = Boolean(args.replace_all)
     const instructionArg = String(args.instruction ?? '').trim()
+
+    if (!relativePath) {
+      return {
+        id: '',
+        name: 'apply_diff',
+        ok: false,
+        content: '',
+        error:
+          'MISSING_PATH: relative_path is required for apply_diff (e.g. "js/main.js"). ' +
+          'Do not call apply_diff without a path.'
+      }
+    }
 
     if (!searchBlock && !instructionArg) {
       return {
@@ -789,7 +813,7 @@ export class AgentToolRegistry {
     // "Replace entire HTML / complete single-page landing" via instruction is a full
     // rewrite in disguise — hangs apply model and fights FILE_COMPLETE.
     const fullRewriteIntent =
-      /replace\s+entire|entire\s+html|whole\s+(html|file|landing)|полный\s+(html|файл|лендинг)|перепис\w*\s+(весь|целиком|полностью)|rewrite\s+(the\s+)?(whole|entire|full)|complete\s+single[- ]?page\s+landing|replace\s+.*\s+with\s+a\s+complete/i.test(
+      /replace\s+entire|entire\s+html|whole\s+(html|file|landing|module)|полный\s+(html|файл|лендинг|модул)|перепис\w*\s+(весь|целиком|полностью)|rewrite\s+(the\s+)?(whole|entire|full)|complete\s+single[- ]?page\s+landing|replace\s+.*\s+with\s+a\s+complete/i.test(
         instructionArg
       )
 
@@ -808,21 +832,21 @@ export class AgentToolRegistry {
       }
     }
 
-    const htmlComplete =
-      /\.html?$/i.test(effectivePath) &&
-      /<\/html\s*>/i.test(original) &&
-      original.length >= 1500
+    const fileComplete =
+      original.length >= 1500 &&
+      ((/\.html?$/i.test(effectivePath) && /<\/html\s*>/i.test(original)) ||
+        contentLooksStructurallyComplete(original, effectivePath))
 
-    if (htmlComplete && fullRewriteIntent && !searchBlock.trim()) {
+    if (fileComplete && fullRewriteIntent && !searchBlock.trim()) {
       return {
         id: '',
         name: 'apply_diff',
         ok: false,
         content: '',
         error:
-          'SURGICAL_EDIT: instruction asks to replace the entire HTML landing. Forbidden on a complete file. ' +
-          'Use a SHORT surgical instruction (one CSS/FAQ tweak) or search_block+replace_block. ' +
-          'Then open preview / summarize — do NOT rewrite the whole page.'
+          'SURGICAL_EDIT: instruction asks to replace the entire file. Forbidden on a complete file. ' +
+          'Use a SHORT surgical instruction or search_block+replace_block. ' +
+          'Then verify / summarize — do NOT rewrite the whole file.'
       }
     }
 
@@ -1309,6 +1333,18 @@ export class AgentToolRegistry {
       }
     }
 
+    const cloneRefuse =
+      productReadmeCloneRefusal(command) ?? productReadmeCloneRefusal(rawCommand)
+    if (cloneRefuse) {
+      return {
+        id: '',
+        name: 'execute_terminal_command',
+        ok: false,
+        content: '',
+        error: cloneRefuse
+      }
+    }
+
     // Intercept preview opens: workspace .html → file://; Vite localhost → that URL;
     // LLM API port (e.g. :8080) → never open llama UI, use workspace HTML instead.
     const openKind =
@@ -1393,6 +1429,26 @@ export class AgentToolRegistry {
       }
     }
     if (!rel || rel === '.' || !/\.html?$/i.test(rel)) {
+      if (rel && /\.[a-z0-9]+$/i.test(rel) && !/\.html?$/i.test(rel)) {
+        try {
+          const snap = await probeProjectStack(this.projectRoot)
+          const htmlOnly =
+            snap.stacks.length > 0 && snap.stacks.every((s) => s.id === 'html')
+          if (!htmlOnly) {
+            return {
+              id: '',
+              name: 'execute_terminal_command',
+              ok: false,
+              content: '',
+              error:
+                `Not an HTML preview (${rel}). Use the stack run/test command or pass an .html path — ` +
+                'do not retarget to index.html on a compiler project.'
+            }
+          }
+        } catch {
+          /* fall through to html fallback */
+        }
+      }
       rel = rel && !/\.[a-z0-9]+$/i.test(rel) ? `${rel.replace(/\/$/, '')}/index.html` : 'index.html'
     }
 

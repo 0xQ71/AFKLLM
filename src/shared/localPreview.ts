@@ -220,8 +220,9 @@ export function looksLikeOpenHtmlFileCommand(cmd: string): boolean {
     /Start-Process\s+.*\.html?/i.test(c) ||
     /webbrowser/i.test(c) ||
     /xdg-open|open\s+.*\.html|Invoke-Item\s+.*\.html/i.test(c) ||
+    /\bii\s+.*\.html?/i.test(c) ||
     (/\.html?\b/i.test(c) &&
-      /Start-Process|Invoke-Item|explorer\.exe|cmd\s*\/c\s*start/i.test(c))
+      /Start-Process|Invoke-Item|explorer\.exe|cmd\s*\/c\s*start|\bii\b/i.test(c))
   )
 }
 
