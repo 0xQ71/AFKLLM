@@ -16,7 +16,7 @@ export type LlamaOptsFactory = (
  * Serializes exclusive GPU use across chat llama-server and
  * one-shot image-gen (sd-cli).
  *
- * Chat slot may keep coresident apply (port+1) and optional vision (port+2)
+ * Chat slot may keep optional vision (port+2). Patches run on the chat model
  * in the same VRAM when visionKeepLoaded is on.
  * Vision cold-swap (keep off) still kills chat+apply and occupies the chat port.
  * imageGen / idle always kill every llama-server.
@@ -285,77 +285,31 @@ export class ModelSlotOrchestrator extends EventEmitter {
     }
   }
 
-  /** True when apply path empty and no process, or apply ready on the wanted path. */
+  /** True when no leftover apply process is running (Apply slot is retired). */
   private async applyMatchesWanted(gen: number): Promise<boolean> {
     if (gen !== this.switchGen) return false
-    let applyOpts: LlamaProcessOptions
-    try {
-      applyOpts = await this.optsFor('apply')
-    } catch {
-      return !this.getApplyLlama()
-    }
-    const want = applyOpts.modelPath?.trim() || ''
     const apply = this.getApplyLlama()
-    if (!want) {
-      return !apply || apply.currentState === 'stopped'
-    }
-    return (
-      !!apply &&
-      apply.currentState === 'ready' &&
-      apply.modelPath === want &&
-      !this.lastApplyError
-    )
+    return !apply || apply.currentState === 'stopped'
   }
 
   /**
-   * Soft-start apply on port+1 after chat is ready. Failures leave chat up.
+   * Apply GGUF is retired — Chat applies patches. Stop any leftover port+1 process.
    */
   private async startApplyCoresident(
-    gen: number,
+    _gen: number,
     chatDetail: string
   ): Promise<string> {
     this.lastApplyError = undefined
-    let applyOpts: LlamaProcessOptions
-    try {
-      applyOpts = await this.optsFor('apply')
-    } catch (err) {
-      this.lastApplyError = err instanceof Error ? err.message : String(err)
-      return `${chatDetail} · Apply failed: ${this.lastApplyError}`
-    }
-
-    const path = applyOpts.modelPath?.trim() || ''
-    if (!path) {
-      return chatDetail
-    }
-    if (!existsSync(path)) {
-      this.lastApplyError = `Apply model not found: ${path}`
-      return `${chatDetail} · Apply failed: ${this.lastApplyError}`
-    }
-
-    this.setStatus({
-      phase: 'switching',
-      detail: 'Loading apply model into VRAM…'
-    })
-
-    applyOpts.loadMode = 'mmap'
-    const apply = this.createLlama(applyOpts)
-    this.setApplyLlama(apply)
-    try {
-      await apply.start({ force: true })
-      if (gen !== this.switchGen) return chatDetail
-      this.lastApplyError = undefined
-      return 'Chat + Apply ready (coresident in VRAM)'
-    } catch (err) {
-      this.lastApplyError = err instanceof Error ? err.message : String(err)
+    const existing = this.getApplyLlama()
+    if (existing) {
       try {
-        await apply.stop()
+        await existing.stop()
       } catch {
         /* ignore */
       }
       this.setApplyLlama(null)
-      LlamaProcessManager.killListenersOnPort(applyOpts.port ?? 8081)
-      return `${chatDetail} · Apply failed: ${this.lastApplyError}`
     }
+    return chatDetail
   }
 
   /** True when vision is not wanted, or coresident vision is ready on the wanted path. */

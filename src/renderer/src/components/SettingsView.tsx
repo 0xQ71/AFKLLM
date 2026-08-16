@@ -994,56 +994,7 @@ function ModelPage({
             </button>
           </div>
         </Field>
-        <Field label={t('settings.model.applyGguf')}>
-          <div className="flex gap-2">
-            <select
-              value={settings.applyModelPath}
-              onChange={(e) => patch('applyModelPath', e.target.value)}
-              className={settingsInputClass + ' font-mono text-xs'}
-            >
-              <option value="">{t('settings.multimodal.none')}</option>
-              {models.map((m) => (
-                <option key={m.path} value={m.path}>
-                  {m.id} ({(m.sizeBytes / 1e9).toFixed(1)} GB)
-                </option>
-              ))}
-              {settings.applyModelPath &&
-                !models.some((m) => m.path === settings.applyModelPath) && (
-                  <option value={settings.applyModelPath}>
-                    {settings.applyModelPath.split(/[/\\]/).pop()}
-                  </option>
-                )}
-            </select>
-            <button
-              type="button"
-              onClick={() => onOpenStore('apply')}
-              className={settingsBtnClass + ' text-signal border-signal/40'}
-            >
-              {t('settings.model.storeShort')}
-            </button>
-            <button
-              type="button"
-              onClick={() => void window.api.hf.openModelsDir()}
-              className={settingsBtnClass}
-              title={t('settings.model.browseFolder')}
-            >
-              {t('settings.model.browse')}
-            </button>
-          </div>
-        </Field>
-        <Field
-          label={t('settings.model.applyCtx')}
-          hint={t('settings.model.applyCtxHint')}
-        >
-          <input
-            type="number"
-            min={0}
-            step={2048}
-            value={settings.applyCtxSize}
-            onChange={(e) => patch('applyCtxSize', Number(e.target.value) || 0)}
-            className={settingsInputClass}
-          />
-        </Field>
+        <p className="text-xs text-ink-mute -mt-2 mb-3">{t('settings.model.applyViaChat')}</p>
         <Field
           label={t('settings.multimodal.visionModel')}
           hint={
@@ -1184,29 +1135,21 @@ function ModelPage({
         </SettingRow>
         <SettingRow
           title={t('settings.model.applyStatus')}
-          description={
-            llmStatus?.applyError && llmStatus.applyState === 'error'
-              ? llmStatus.applyError
-              : !settings.applyModelPath?.trim()
-                ? t('settings.model.applyStatusHint')
-                : undefined
-          }
+          description={t('settings.model.applyStatusHint')}
         >
           <span
             className={
               'text-xs ' +
-              (llmStatus?.applyState === 'ready'
+              (llmStatus?.state === 'ready'
                 ? 'text-signal'
-                : llmStatus?.applyState === 'error'
+                : llmStatus?.state === 'error'
                   ? 'text-rose-400'
-                  : llmStatus?.applyState === 'starting'
+                  : llmStatus?.state === 'starting'
                     ? 'text-amber-400'
                     : 'text-ink-mute')
             }
           >
-            {!settings.applyModelPath?.trim()
-              ? '—'
-              : (llmStatus?.applyState ?? 'stopped')}
+            {llmStatus?.state === 'ready' ? t('settings.model.applyViaChatReady') : (llmStatus?.state ?? 'stopped')}
           </span>
         </SettingRow>
         <SettingRow

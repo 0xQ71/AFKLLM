@@ -1616,7 +1616,7 @@ export default function App(): React.JSX.Element {
                                 filePath={activeTab.path}
                                 queue={queue}
                                 editorTheme={editorTheme}
-                                applyReady={status?.applyState === 'ready'}
+                                applyReady={status?.state === 'ready'}
                                 onAccept={({ content }) => {
                                   setTabs((prev) =>
                                     prev.map((t) =>

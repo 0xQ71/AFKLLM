@@ -18,13 +18,23 @@ export function isBlackwellGpuName(name?: string | null): boolean {
   return /\brtx\s*50[5-9]0(?:\s*ti)?\b/i.test(name)
 }
 
-/** Auto: MTP flags only when the GGUF name looks like MTP and this is a chat slot. */
+/**
+ * Auto: MTP flags when the GGUF name looks like MTP.
+ * Vision mmproj on the same server is allowed — Ornith 1M+Vision ships that way.
+ */
 export function shouldEnableDraftMtp(opts: {
   modelPath: string
   mmprojPath?: string | null
 }): boolean {
-  if (opts.mmprojPath?.trim()) return false
+  void opts.mmprojPath
   return looksLikeMtpGguf(opts.modelPath)
+}
+
+/** Draft depth: 2 = acceptance/stability (Ornith code edits), 3 = throughput. */
+export function mtpDraftMax(modelPath: string): number {
+  return /ornith/i.test(modelPath.replace(/\\/g, '/').split('/').pop() ?? modelPath)
+    ? 2
+    : 3
 }
 
 /** True only when llama-server rejected MTP CLI flags (not OOM / CUDA / GGUF errors). */

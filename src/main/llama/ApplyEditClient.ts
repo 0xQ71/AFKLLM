@@ -15,7 +15,7 @@ export interface FastApplyEditParams {
   content: string
   /** Line range the edit targets — keeps the prompt small on big files. */
   region?: ApplyRegion
-  /** Apply slot ctx, used to size the prompt window and max_tokens. */
+  /** Chat ctx, used to size the prompt window and max_tokens. */
   ctxSize?: number
   /** Abort after this many ms (default 60s). */
   timeoutMs?: number
@@ -23,10 +23,14 @@ export interface FastApplyEditParams {
   maxAttempts?: number
   /** Live tokens for the UI — a silent 60s call looked like a freeze. */
   onToken?: (token: string) => void
+  /** Chat sampling (Ornith official: 0.6 / 0.95 / 20). */
+  temperature?: number
+  topP?: number
+  topK?: number
 }
 
 export type FastApplyEditResult =
-  | { ok: true; content: string; applied: number; via: 'apply_model' }
+  | { ok: true; content: string; applied: number; via: 'chat' }
   | { ok: false; error: string; code: 'APPLY_UNAVAILABLE' | 'SMART_APPLY_FAIL' }
 
 const APPLY_CHARS_PER_TOKEN = 3.2
@@ -61,7 +65,13 @@ async function callApplyModel(
   base: string,
   messages: Array<{ role: string; content: string }>,
   timeoutMs: number,
-  opts?: { ctxSize?: number; onToken?: (token: string) => void }
+  opts?: {
+    ctxSize?: number
+    onToken?: (token: string) => void
+    temperature?: number
+    topP?: number
+    topK?: number
+  }
 ): Promise<{ ok: true; text: string } | { ok: false; error: string }> {
   const ac = new AbortController()
   const timer = setTimeout(() => ac.abort(), timeoutMs)
@@ -71,12 +81,14 @@ async function callApplyModel(
       headers: { 'Content-Type': 'application/json' },
       signal: ac.signal,
       body: JSON.stringify({
-        model: 'apply',
+        model: 'chat',
         messages,
-        temperature: 0.0,
+        temperature: opts?.temperature ?? 0.6,
+        top_p: opts?.topP ?? 0.95,
+        top_k: opts?.topK ?? 20,
         stream: true,
         max_tokens: applyMaxTokens(messages, opts?.ctxSize),
-        // Qwen3.5: without this, all tokens go to reasoning_content and content stays empty.
+        // SEARCH/REPLACE only — do not fill reasoning_content.
         chat_template_kwargs: { enable_thinking: false }
       })
     })
@@ -130,7 +142,7 @@ async function callApplyModel(
     return {
       ok: false,
       error: /abort/i.test(msg)
-        ? `apply model timed out after ${timeoutMs}ms`
+        ? `chat model timed out after ${timeoutMs}ms`
         : msg
     }
   } finally {
@@ -203,8 +215,8 @@ function noMatchRetryNote(fileContent: string, attempt: BlockAttempt): string {
 }
 
 /**
- * Call coresident apply llama-server (Morph-style SEARCH/REPLACE) and merge into file text.
- * Does not touch the chat LLM queue. Retries once with feedback on the real failure.
+ * Call the chat llama-server (Morph-style SEARCH/REPLACE) and merge into file text.
+ * Same weights as the agent — no second Apply GGUF. Thinking is disabled for this call.
  */
 export async function fastApplyEdit(
   params: FastApplyEditParams
@@ -214,7 +226,7 @@ export async function fastApplyEdit(
     return {
       ok: false,
       code: 'APPLY_UNAVAILABLE',
-      error: 'APPLY_UNAVAILABLE: apply model baseUrl is empty'
+      error: 'APPLY_UNAVAILABLE: chat model is not loaded'
     }
   }
 
@@ -228,7 +240,13 @@ export async function fastApplyEdit(
     ctxSize: params.ctxSize
   }
   const messages = buildFastApplyMessages(promptOpts)
-  const callOpts = { ctxSize: params.ctxSize, onToken: params.onToken }
+  const callOpts = {
+    ctxSize: params.ctxSize,
+    onToken: params.onToken,
+    temperature: params.temperature,
+    topP: params.topP,
+    topK: params.topK
+  }
 
   let first = await callApplyModel(base, messages, timeoutMs, callOpts)
   // Transport hiccups and timeouts used to fail instantly — one retry is cheap.
@@ -247,7 +265,7 @@ export async function fastApplyEdit(
       ok: false,
       code: 'SMART_APPLY_FAIL',
       error:
-        'SMART_APPLY_FAIL: apply model returned empty content (thinking not disabled?). Reload Apply after update.'
+        'SMART_APPLY_FAIL: chat returned empty content. Retry apply_diff with an exact search_block.'
     }
   }
 
@@ -257,7 +275,7 @@ export async function fastApplyEdit(
       ok: true,
       content: attempt.content,
       applied: attempt.applied,
-      via: 'apply_model'
+      via: 'chat'
     }
   }
 
@@ -270,7 +288,7 @@ export async function fastApplyEdit(
   if (maxAttempts < 2) {
     return failNow(
       attempt.kind === 'none'
-        ? 'apply model returned no SEARCH/REPLACE blocks.'
+        ? 'chat returned no SEARCH/REPLACE blocks.'
         : `SEARCH blocks did not match file (${attempt.reasons}).`
     )
   }
@@ -304,13 +322,13 @@ export async function fastApplyEdit(
       ok: true,
       content: retryAttempt.content,
       applied: retryAttempt.applied,
-      via: 'apply_model'
+      via: 'chat'
     }
   }
 
   return failNow(
     retryAttempt.kind === 'none'
-      ? 'apply model returned no SEARCH/REPLACE blocks after retry.'
+      ? 'chat returned no SEARCH/REPLACE blocks after retry.'
       : `SEARCH blocks did not match file after retry (${retryAttempt.reasons}).`
   )
 }

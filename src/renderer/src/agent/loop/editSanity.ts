@@ -93,7 +93,7 @@ export function formatLandingCssContractHint(css: string): string | null {
   return (
     'LANDING_CONTRACT: styles.css already defines ' +
     names.map((n) => `.${n}`).join(' ') +
-    '. index.html MUST use these class names — do not invent .site-header / .header-nav / .hero-inner if CSS has .navbar / .nav-links / .hero-content. ' +
+    '. index.html MUST use these class names from THIS stylesheet. ' +
     'Every inline <svg> needs width and height attributes (e.g. 32) or a CSS rule that sets them. ' +
     'When writing index.html, JS getElementById / #id and data-i18n keys must match that markup.'
   )

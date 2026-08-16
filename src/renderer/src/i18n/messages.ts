@@ -289,7 +289,10 @@ const en = {
   'settings.model.applyGguf': 'Apply model (.gguf)',
   'settings.model.applyCtx': 'Apply model context',
   'settings.model.applyCtxHint':
-    '0 = follow chat context. A larger window lets targeted edits see the whole file. Reload to apply.',
+    'Unused. Chat context is used for patches.',
+  'settings.model.applyViaChat':
+    'Patches (apply_diff, Ctrl+K) run on this Chat model. A separate Apply GGUF is not loaded.',
+  'settings.model.applyViaChatReady': 'Chat',
   'settings.model.none': 'No models found — browse…',
   'settings.model.browse': 'Browse',
   'settings.model.browseFolder': 'Open models folder',
@@ -301,11 +304,12 @@ const en = {
   'settings.model.load': 'Load',
   'settings.model.unload': 'Unload',
   'settings.model.loading': 'Cancel load…',
-  'settings.model.applyStatus': 'Apply status',
-  'settings.model.applyStatusHint': 'Set an apply GGUF above — Load starts it with chat in the same VRAM',
+  'settings.model.applyStatus': 'Patches',
+  'settings.model.applyStatusHint':
+    'Chat applies targeted edits. Load Chat — no second Apply GGUF.',
   'settings.model.visionKeep': 'Keep vision loaded',
   'settings.model.visionKeepHint':
-    'On: Load starts vision with chat + apply (port+2) and leaves it in VRAM. Off: swap in on attach, unload after the description. Reload after changing.',
+    'On: Load starts vision with chat (port+2) and leaves it in VRAM. Off: swap in on attach, unload after the description. Reload after changing.',
   'settings.model.visionKeepReuseHint':
     'Chat is already the VL GGUF — mmproj is attached to that one llama-server. A second copy is not started.',
   'settings.model.visionStatus': 'Vision status',
@@ -316,7 +320,7 @@ const en = {
   'settings.model.storeShort': 'Store',
 
   'settings.multimodal.intro':
-    'Image generation still exclusive: chat/apply/vision unload while sd-cli runs. Vision GGUF lives under Model (with Chat and Apply).',
+    'Image generation still exclusive: chat/vision unload while sd-cli runs. Vision GGUF lives under Model (with Chat).',
   'settings.multimodal.visionModel': 'Vision model (.gguf)',
   'settings.multimodal.none': 'Not set',
   'settings.multimodal.visionSameAsChat': 'Same as chat',
@@ -1046,7 +1050,10 @@ const ru: Record<MessageKey, string> = {
   'settings.model.applyGguf': 'Apply-модель (.gguf)',
   'settings.model.applyCtx': 'Контекст apply-модели',
   'settings.model.applyCtxHint':
-    '0 — как у чата. Больше окно — точечные правки видят файл целиком. Нужен Reload.',
+    'Не используется. Для патчей берётся контекст Chat.',
+  'settings.model.applyViaChat':
+    'Патчи (apply_diff, Ctrl+K) выполняет эта Chat-модель. Отдельный Apply GGUF не загружается.',
+  'settings.model.applyViaChatReady': 'Chat',
   'settings.model.none': 'Модели не найдены — выберите…',
   'settings.model.browse': 'Обзор',
   'settings.model.browseFolder': 'Открыть папку моделей',
@@ -1058,12 +1065,12 @@ const ru: Record<MessageKey, string> = {
   'settings.model.load': 'Загрузить',
   'settings.model.unload': 'Выгрузить',
   'settings.model.loading': 'Отменить загрузку…',
-  'settings.model.applyStatus': 'Статус Apply',
+  'settings.model.applyStatus': 'Патчи',
   'settings.model.applyStatusHint':
-    'Выберите apply GGUF выше — Загрузить поднимет её вместе с chat в тот же VRAM',
+    'Точечные правки делает Chat. Загрузите Chat — второй Apply GGUF не нужен.',
   'settings.model.visionKeep': 'Держать vision в памяти',
   'settings.model.visionKeepHint':
-    'Вкл: Load поднимает vision вместе с chat + apply (порт+2) и оставляет в VRAM. Выкл: подмена при attach фото, выгрузка после описания. После смены — Load снова.',
+    'Вкл: Load поднимает vision вместе с chat (порт+2) и оставляет в VRAM. Выкл: подмена при attach фото, выгрузка после описания. После смены — Load снова.',
   'settings.model.visionKeepReuseHint':
     'Chat уже VL GGUF — mmproj вешается на тот же llama-server. Вторая копия не стартует.',
   'settings.model.visionStatus': 'Статус Vision',
@@ -1075,7 +1082,7 @@ const ru: Record<MessageKey, string> = {
   'settings.model.storeShort': 'Магазин',
 
   'settings.multimodal.intro':
-    'Генерация картинок по-прежнему эксклюзивна: chat/apply/vision выгружаются, пока работает sd-cli. Vision GGUF — в разделе Модель (рядом с Chat и Apply).',
+    'Генерация картинок по-прежнему эксклюзивна: chat/vision выгружаются, пока работает sd-cli. Vision GGUF — в разделе Модель (рядом с Chat).',
   'settings.multimodal.visionModel': 'Vision-модель (.gguf)',
   'settings.multimodal.none': 'Не задано',
   'settings.multimodal.visionSameAsChat': 'Та же что и Chat',

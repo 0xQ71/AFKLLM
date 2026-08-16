@@ -708,7 +708,7 @@ export function isToolOrientedPlanStep(text: string): boolean {
   if (!t) return true
   if (isFullRewriteFallbackPlanStep(t)) return true
   if (
-    /\b(execute_terminal_command|write_file|read_file|apply_patch|apply_diff|generate_image|create_directory|list_directory|search_codebase|web_search)\b/i.test(
+    /\b(execute_terminal_command|write_file|read_file|apply_patch|apply_diff|generate_image|create_directory|list_directory|search_codebase|web_search|explore_subagent)\b/i.test(
       t
     )
   ) {
@@ -734,6 +734,31 @@ export function looksLikeFinishMissingLandingFiles(userText: string): boolean {
       t
     )
   return mentionsHtmlCss && finish
+}
+
+/**
+ * User already pasted product facts + GitHub URLs — do not crawl README / explore.
+ */
+export function landingBriefAlreadyHasFacts(userText: string): boolean {
+  const t = userText ?? ''
+  if (!t.trim()) return false
+  if (!looksLikeLandingBuildTask(t) && !looksLikeFromScratchTask(t)) return false
+  const github = /github\.com\/\S+/i.test(t)
+  const product =
+    /llama\.cpp|GGUF|Electron|Monaco|локальн\w*\s+GGUF|on-device|Windows x64/i.test(t)
+  return github && product
+}
+
+/** Plan rows that stall a landing on GitHub scavenger hunts. */
+export function isResearchScavengerPlanStep(text: string): boolean {
+  const t = text.trim()
+  if (!t) return true
+  if (/readme\.md/i.test(t) && /созда|напис|write|лендинг|landing/i.test(t)) return false
+  return (
+    /explore_subagent|web_search|curl(\.exe)?|Invoke-WebRequest|raw\.githubusercontent/i.test(t) ||
+    /изучить\s+(репозитор|github|readme)|исследовать\s+(репозитор|github)/i.test(t) ||
+    /собрать\s+(точн\w*\s+)?факт|fetch\s+(the\s+)?readme|scrape\s+github/i.test(t)
+  )
 }
 
 /** True when the user is asking to build a full landing / new page from scratch. */
@@ -877,7 +902,10 @@ export function coerceProductPlan(
   opts?: CoercePlanOptions
 ): AgentTodoStep[] {
   let cleaned = (steps ?? []).filter(
-    (s) => !isJunkPlanStep(s.text) && !isToolOrientedPlanStep(s.text)
+    (s) =>
+      !isJunkPlanStep(s.text) &&
+      !isToolOrientedPlanStep(s.text) &&
+      !isResearchScavengerPlanStep(s.text)
   )
   if (opts?.surgical) {
     cleaned = cleaned.filter((s) => !isScaffoldLandingPlanStep(s.text))
@@ -1640,6 +1668,7 @@ export function isJunkPlanStep(text: string): boolean {
   if (!t || isEllipsisOnly(t)) return true
   if (isFullRewriteFallbackPlanStep(t)) return true
   if (isToolOrientedPlanStep(t)) return true
+  if (isResearchScavengerPlanStep(t)) return true
   if (isCssClassPlanStep(t)) return true
   // Markdown / think leak into plan: "*План хирургического вмешательства:**"
   // Do not use \b after Cyrillic — JS treats letters as non-word without the unicode flag.

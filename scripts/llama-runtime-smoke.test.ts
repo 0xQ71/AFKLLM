@@ -119,7 +119,8 @@ describe('llamaSpec MTP auto', () => {
       looksLikeNvfp4Gguf,
       isBlackwellGpuName,
       shouldEnableDraftMtp,
-      speculativeMtpUnsupported
+      speculativeMtpUnsupported,
+      mtpDraftMax
     } = await import('../src/shared/llamaSpec.ts')
     assert.equal(looksLikeMtpGguf('C:\\Models\\Ornith-1.0-9B-MTP-Q4_K_M.gguf'), true)
     assert.equal(looksLikeMtpGguf('Ornith-1.0-9B-MTP-NVFP4.gguf'), true)
@@ -140,7 +141,7 @@ describe('llamaSpec MTP auto', () => {
         modelPath: 'Ornith-1.0-9B-MTP-Q4_K_M.gguf',
         mmprojPath: 'mmproj.gguf'
       }),
-      false
+      true
     )
     assert.equal(
       speculativeMtpUnsupported(
@@ -154,6 +155,8 @@ describe('llamaSpec MTP auto', () => {
       ),
       false
     )
+    assert.equal(mtpDraftMax('Ornith-1.0-9B-1M-MTP-Q8_0.gguf'), 2)
+    assert.equal(mtpDraftMax('Qwen3.5-4B-MTP-Q4_K_M.gguf'), 3)
   })
 })
 
@@ -252,5 +255,55 @@ describe('streamDeltaText', () => {
       streamDeltaText({ content: '<plan></plan>', reasoning_content: 'hidden' }),
       '<plan></plan>'
     )
+  })
+})
+
+describe('Ornith defaults + chat apply', () => {
+  it('lifts stock AFKLLM sampling/ctx for Ornith and leaves custom knobs', async () => {
+    const {
+      DEFAULT_SETTINGS,
+      applyOrnithRecommendedTuning,
+      profileForModelPath,
+      switchModelPath
+    } = await import('../src/shared/settings.ts')
+    const {
+      looksLikeOrnithGguf,
+      ORNITH_TEMPERATURE,
+      ORNITH_TOP_P,
+      ORNITH_TOP_K,
+      ORNITH_CTX_SIZE
+    } = await import('../src/shared/ornithDefaults.ts')
+    const path = 'C:\\Models\\Ornith-1.0-9B-1M-MTP-Q8_0.gguf'
+    assert.equal(looksLikeOrnithGguf(path), true)
+    const stock = applyOrnithRecommendedTuning({
+      ...DEFAULT_SETTINGS,
+      modelPath: path
+    })
+    assert.equal(stock.temperature, ORNITH_TEMPERATURE)
+    assert.equal(stock.topP, ORNITH_TOP_P)
+    assert.equal(stock.topK, ORNITH_TOP_K)
+    assert.equal(stock.ctxSize, ORNITH_CTX_SIZE)
+    assert.equal(stock.applyModelPath, '')
+    const custom = applyOrnithRecommendedTuning({
+      ...DEFAULT_SETTINGS,
+      modelPath: path,
+      temperature: 0.7,
+      topK: 20,
+      topP: 0.95,
+      ctxSize: 65536
+    })
+    assert.equal(custom.temperature, 0.7)
+    assert.equal(custom.ctxSize, 65536)
+    const switched = switchModelPath(DEFAULT_SETTINGS, path)
+    assert.equal(switched.temperature, ORNITH_TEMPERATURE)
+    assert.equal(profileForModelPath(path).topK, ORNITH_TOP_K)
+  })
+
+  it('apply_diff schema tells the agent Chat applies patches', async () => {
+    const { AGENT_TOOL_SCHEMAS } = await import('../src/shared/types.ts')
+    const diff = AGENT_TOOL_SCHEMAS.find((t) => t.function.name === 'apply_diff')
+    assert.ok(diff)
+    assert.match(diff.function.description, /Chat/i)
+    assert.doesNotMatch(diff.function.description, /coresident apply model/i)
   })
 })

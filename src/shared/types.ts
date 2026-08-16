@@ -212,7 +212,7 @@ export const AGENT_TOOL_SCHEMAS = [
       description:
         'Edit files with a Codex-style patch: *** Begin Patch / *** Update File: path with @@ hunks / *** End Patch. ' +
         'Prefer this or apply_diff over a full write_file rewrite of an existing file. ' +
-        'If hunks fail, the apply model retries automatically; do not loop read_file.',
+        'If hunks fail, Chat retries SEARCH/REPLACE automatically; do not loop read_file.',
       parameters: {
         type: 'object',
         properties: {
@@ -230,9 +230,9 @@ export const AGENT_TOOL_SCHEMAS = [
     function: {
       name: 'apply_diff',
       description:
-        'Targeted edit: replace one unique search_block with replace_block, or pass instruction for the apply model. ' +
+        'Targeted edit: replace one unique search_block with replace_block, or pass instruction for Chat to apply. ' +
         'Pass replace_all=true to replace every occurrence (global rename). ' +
-        'Preferred for existing complete HTML (theme/FAQ/CSS tweaks). On fuzzy miss the coresident apply model runs once — do NOT re-read or full-rewrite.',
+        'Preferred for existing complete HTML (theme/FAQ/CSS tweaks). On fuzzy miss Chat runs Morph SEARCH/REPLACE once — do NOT re-read or full-rewrite.',
       parameters: {
         type: 'object',
         properties: {
@@ -250,7 +250,7 @@ export const AGENT_TOOL_SCHEMAS = [
           instruction: {
             type: 'string',
             description:
-              'Natural-language edit intent for the apply model (e.g. "darken Bootstrap accordion buttons"). Use when search_block is hard to copy exactly.'
+              'Natural-language edit intent (e.g. "darken Bootstrap accordion buttons"). Chat applies it. Use when search_block is hard to copy exactly.'
           }
         },
         required: ['relative_path']

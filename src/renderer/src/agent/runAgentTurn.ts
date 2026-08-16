@@ -76,6 +76,7 @@ import {
   looksLikeOpenHtmlCommand,
   isLandingJsPath,
   looksLikeLandingBuildTask,
+  landingBriefAlreadyHasFacts,
   evaluateAcceptanceGate,
   fingerprintToolCall,
   looksLikeToolMarkupLeak,
@@ -2618,6 +2619,22 @@ export async function runAgentTurn(params: {
       return name !== 'web_search'
     })
   }
+  if (landingBriefAlreadyHasFacts(params.userText)) {
+    agentTools = agentTools.filter((tool) => {
+      const name =
+        tool &&
+        typeof tool === 'object' &&
+        'function' in tool &&
+        tool.function &&
+        typeof tool.function === 'object' &&
+        'name' in tool.function
+          ? String((tool.function as { name?: unknown }).name ?? '')
+          : tool && typeof tool === 'object' && 'name' in tool
+            ? String((tool as { name?: unknown }).name ?? '')
+            : ''
+      return name !== 'web_search' && name !== 'explore_subagent'
+    })
+  }
 
   // Think ON: THINK-ONLY completion first (stream every token), then a separate PLAN completion.
   if (thinkThrough) {
@@ -2874,8 +2891,8 @@ export async function runAgentTurn(params: {
         : 'PLAN_ONLY (tools still DISABLED). Output ONLY <plan>…</plan> with 3–9 ATOMIC steps from the user request ' +
             'and your prior <think> (what to create/change, in order). ' +
             'If the user asked CSS/JS/assets before index.html, list steps in that dependency order (folders/assets → CSS → JS → HTML → README → preview). ' +
-            'FORBIDDEN: tool names (execute_terminal_command, write_file, Start-Process, read_file), CSS class names as steps, ' +
-            'syntax-check shells, «Закрыть», mega-steps, code, <think>. Stop after </plan>.'
+            'FORBIDDEN: tool names (execute_terminal_command, write_file, Start-Process, read_file, explore_subagent, web_search), CSS class names as steps, ' +
+            'syntax-check shells, GitHub curl/clone, «Закрыть», mega-steps, code, <think>. Stop after </plan>.'
     )
     apiMessages = normalizeApiMessages(apiMessages)
 
@@ -2989,7 +3006,8 @@ export async function runAgentTurn(params: {
       allowsComposerFullRewrite(params.userText)
         ? 'Think/plan already recorded. Do NOT output another <think> or <plan>. ' +
             'Call tools NOW to execute the plan IN ORDER. This is a from-scratch / full rebuild: ' +
-            'ONE complete write_file per path (overwrite=true allow_full_rewrite=true only for the first write of that file). ' +
+            'ONE complete write_file per path (overwrite=true allow_full_rewrite=true). Leftover files from a failed turn may be overwritten with the FULL professional file. ' +
+            'If the user already listed product facts and GitHub URLs, do NOT explore_subagent, web_search, or curl GitHub — write CSS/JS/assets then HTML. ' +
             'Do NOT rewrite js/main.js or index.html after they are complete. Do NOT call apply_diff / Apply to regenerate a whole CSS/JS/HTML file. ' +
             'data-i18n tags MUST contain visible default-language text (JS only swaps on toggle — never empty <h1 data-i18n>). ' +
             'After styles.css exists, index.html MUST reuse its class names; inline SVG needs width/height; JS keys must match HTML data-i18n. ' +
@@ -3730,8 +3748,9 @@ export async function runAgentTurn(params: {
       markupRepairAttempts++
       const htmlReady = contentLooksStructurallyComplete(lastHtmlWrite, 'index.html')
       const cssReady = cssLooksLikeRealStylesheet(lastCssWrite)
+      const jsReady = contentLooksStructurallyComplete(lastJsWrite, 'js/main.js')
       const keepGoingForLanding =
-        (!htmlReady || !cssReady) &&
+        (!htmlReady || !cssReady || !jsReady) &&
         (looksLikeFinishMissingLandingFiles(params.userText) ||
           looksLikeLandingBuildTask(params.userText) ||
           allowsComposerFullRewrite(params.userText))
@@ -3748,7 +3767,7 @@ export async function runAgentTurn(params: {
         if (!keepGoingForLanding || markupRepairAttempts > MAX_MARKUP_REPAIR_ATTEMPTS + 3) {
           return finishWithTiming(messages)
         }
-        const missing = !cssReady ? 'styles.css' : 'index.html'
+        const missing = !cssReady ? 'styles.css' : !htmlReady ? 'index.html' : 'js/main.js'
         pushUserMessage(
           apiMessages,
           `Landing files are still missing. Call write_file NOW with relative_path="${missing}", ` +
@@ -4187,6 +4206,20 @@ export async function runAgentTurn(params: {
               name,
               arguments: args
             })
+          }
+        } else if (
+          (name === 'explore_subagent' || name === 'web_search') &&
+          landingBriefAlreadyHasFacts(params.userText)
+        ) {
+          toolResult = {
+            id: call.id,
+            name,
+            ok: false,
+            content: '',
+            error:
+              name === 'web_search'
+                ? 'SKIP_WEB_SEARCH: product facts and GitHub URLs are already in the user message. write_file styles.css overwrite=true NOW. Do not curl GitHub.'
+                : 'SKIP_EXPLORE: product facts and GitHub URLs are already in the user message. write_file styles.css overwrite=true NOW. Do not curl GitHub.'
           }
         } else if (name === 'explore_subagent') {
           const explore = await runExploreSubagent({
@@ -4658,7 +4691,7 @@ export async function runAgentTurn(params: {
             const hint =
               patchParseFails >= MAX_PATCH_FAILS_BEFORE_OVERWRITE
                 ? 'PATCH_FAIL_LIMIT: apply_patch keeps failing to parse. STOP using apply_patch. ' +
-                  'Use apply_diff with relative_path + search_block/instruction (apply model helps). Do NOT full-rewrite HTML. ' +
+                  'Use apply_diff with relative_path + search_block/instruction (Chat applies the patch). Do NOT full-rewrite HTML. ' +
                   'Do NOT wrap the body in "*** Begin Patch ***".'
                 : 'apply_patch parse error. Prefer apply_diff (relative_path + search_block or instruction); do not re-send the same malformed patch.'
             toolResult = {
@@ -5456,8 +5489,8 @@ export async function runAgentTurn(params: {
             allowsComposerFullRewrite(params.userText)
               ? 'SMART_APPLY_FAIL: Apply cannot patch a new or incomplete landing file. ' +
                 formatScratchWriteFileHint()
-              : 'APPLY_UNAVAILABLE / SMART_APPLY_FAIL: the Apply model is not loaded or failed. Do NOT rewrite the file. ' +
-                'Load Apply in Settings, or call apply_diff with an exact short search_block. Never write_file overwrite a complete module.'
+              : 'APPLY_UNAVAILABLE / SMART_APPLY_FAIL: Chat could not apply the patch. ' +
+                'Call apply_diff with an exact short search_block. Never write_file overwrite a complete module.'
           )
         } else if (/FILE_EXISTS/i.test(tc)) {
           appendToolHint(
@@ -5499,7 +5532,7 @@ export async function runAgentTurn(params: {
           appendToolHint(
             apiMessages,
             /html|landing|<\/html>/i.test(tc)
-              ? 'PATCH_FAIL_LIMIT on HTML: do NOT rewrite. Summarize failure and stop (apply model already tried if available).'
+              ? 'PATCH_FAIL_LIMIT on HTML: do NOT rewrite. Summarize failure and stop (Chat already tried Morph apply if available).'
               : 'PATCH_FAIL_LIMIT: stop retrying apply_patch/apply_diff. For non-HTML you may write_file with overwrite=true and allow_full_rewrite=true.'
           )
         } else if (/PROCESS_ENDED/i.test(tc)) {

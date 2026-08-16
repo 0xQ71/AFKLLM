@@ -9,6 +9,7 @@ import {
   extractModelProfile,
   syncActiveModelProfile,
   switchModelPath,
+  applyOrnithRecommendedTuning,
   type AppSettings,
   type CacheQuant,
   type FlashAttnMode,
@@ -292,7 +293,8 @@ function sanitize(input: Record<string, unknown> | AppSettings): AppSettings {
     next.visionModelPath = VISION_SAME_AS_CHAT
   }
   next.visionKeepLoaded = next.visionKeepLoaded !== false
-  next.applyModelPath = typeof next.applyModelPath === 'string' ? next.applyModelPath : ''
+  // Chat applies patches — never spawn a second Apply GGUF.
+  next.applyModelPath = ''
   // 0 = follow chat ctx; anything positive is clamped to a loadable window.
   {
     const raw = Number(next.applyCtxSize)
@@ -379,5 +381,5 @@ function sanitize(input: Record<string, unknown> | AppSettings): AppSettings {
   }
   next.modelProfiles = profiles
 
-  return syncActiveModelProfile(next)
+  return syncActiveModelProfile(applyOrnithRecommendedTuning(next))
 }

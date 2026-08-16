@@ -296,23 +296,16 @@ function runtimeStatus(): LlmRuntimeStatus {
     slot?.slot === 'vision'
       ? settings?.visionModelPath ?? null
       : settings?.modelPath ?? null
-  const applyPath = settings?.applyModelPath?.trim() || ''
   const applyErr = slotOrch?.getApplyError() ?? applyLlama?.error
   let applyState: LlmRuntimeStatus['applyState'] = 'stopped'
-  if (!applyPath) {
-    applyState = 'stopped'
-  } else if (applyLlama?.currentState === 'ready') {
+  if (llama?.currentState === 'ready') {
     applyState = 'ready'
-  } else if (applyLlama?.currentState === 'starting') {
+  } else if (llama?.currentState === 'starting') {
     applyState = 'starting'
-  } else if (applyErr || applyLlama?.currentState === 'error') {
+  } else if (applyErr || llama?.currentState === 'error') {
     applyState = 'error'
-  } else if (slot?.slot === 'chat' && slot.phase === 'switching') {
-    applyState = 'starting'
   }
 
-  const applyPort = llamaSlotPort(Number(settings?.port) || 8080, 'apply', false)
-  const applyHost = settings?.host || '127.0.0.1'
   const keepVision = settings?.visionKeepLoaded !== false
   const reuseVision = settings
     ? visionReusesChatModel({
@@ -361,9 +354,9 @@ function runtimeStatus(): LlmRuntimeStatus {
     error: bootError ?? llama?.error ?? slot?.error,
     detail: slot?.phase === 'switching' ? slot.detail : llama?.detail || slot?.detail,
     applyState,
-    applyModelPath: applyPath || null,
-    applyBaseUrl: applyLlama?.baseUrl ?? (applyPath ? `http://${applyHost}:${applyPort}` : null),
-    applyError: applyErr,
+    applyModelPath: settings?.modelPath || null,
+    applyBaseUrl: llama?.currentState === 'ready' ? llama.baseUrl : null,
+    applyError: llama?.currentState === 'ready' ? undefined : applyErr,
     visionState,
     visionModelPath: (reuseVision ? settings?.modelPath : visionPath) || null,
     visionBaseUrl:
@@ -440,13 +433,21 @@ function settingsToLlamaOpts(
   }
 }
 
-/** Apply slot ctx: explicit setting, else follow chat ctx within safe bounds. */
+/** Chat ctx for Morph-style apply_diff / Ctrl+K (no separate Apply slot). */
 function applyCtxSizeFor(settings?: AppSettings | null): number {
-  const explicit = Number(settings?.applyCtxSize)
-  if (Number.isFinite(explicit) && explicit >= 4096) {
-    return Math.min(131_072, Math.floor(explicit))
+  return Math.max(4096, Number(settings?.ctxSize) || 8192)
+}
+
+function chatApplySampling(settings?: AppSettings | null): {
+  temperature: number
+  topP: number
+  topK: number
+} {
+  return {
+    temperature: settings?.temperature ?? 0.6,
+    topP: settings?.topPEnabled === false ? 0.95 : (settings?.topP ?? 0.95),
+    topK: settings?.topK ?? 20
   }
-  return Math.min(Math.max(Number(settings?.ctxSize) || 8192, 8192), 32_768)
 }
 
 function emitSlotStatus(): void {
@@ -1533,7 +1534,7 @@ function registerIpc(): void {
     return tools.getPendingDiff(String(relativePath ?? ''))
   })
 
-  // Ctrl+K inline edit: run on the fast apply slot, not the chat queue.
+  // Ctrl+K inline edit: Morph-style SEARCH/REPLACE on the chat model.
   ipcMain.handle(
     'agent:apply-edit',
     async (
@@ -1545,23 +1546,24 @@ function registerIpc(): void {
         region?: { startLine: number; endLine: number }
       }
     ) => {
-      const baseUrl =
-        applyLlama?.currentState === 'ready' ? applyLlama.baseUrl : ''
+      const baseUrl = llama?.currentState === 'ready' ? llama.baseUrl : ''
       if (!baseUrl) {
         return {
           ok: false,
           code: 'APPLY_UNAVAILABLE',
-          error: 'Apply model is not loaded (Settings → Apply model → Load).'
+          error: 'Chat model is not loaded (Settings → Model → Load).'
         }
       }
       const filePath = String(params?.filePath ?? '')
+      const settings = settingsStore?.get()
       const result = await fastApplyEdit({
         baseUrl,
         instruction: String(params?.instruction ?? ''),
         filePath,
         content: String(params?.content ?? ''),
         region: params?.region,
-        ctxSize: applyCtxSizeFor(settingsStore?.get()),
+        ctxSize: applyCtxSizeFor(settings),
+        ...chatApplySampling(settings),
         onToken: (token) => {
           mainWindow?.webContents.send('agent:apply-token', { path: filePath, token })
         }
@@ -1797,8 +1799,9 @@ app.whenReady().then(async () => {
     projectRoot: placeholder,
     contextIndex,
     getApplyBaseUrl: () =>
-      applyLlama?.currentState === 'ready' ? applyLlama.baseUrl : null,
+      llama?.currentState === 'ready' ? llama.baseUrl : null,
     getApplyCtxSize: () => applyCtxSizeFor(settingsStore?.get()),
+    getApplySampling: () => chatApplySampling(settingsStore?.get()),
     onApplyToken: (relativePath, token) => {
       mainWindow?.webContents.send('agent:apply-token', { path: relativePath, token })
     },

@@ -25,7 +25,7 @@ export interface InlineEditModalProps {
   filePath: string
   queue: QueueManager
   editorTheme?: string
-  /** Coresident apply model is loaded — use it instead of the chat queue. */
+  /** Chat model is loaded — Ctrl+K uses Morph SEARCH/REPLACE on Chat. */
   applyReady?: boolean
   /** Called after user Accepts — parent should persist content */
   onAccept: (payload: { filePath: string; content: string }) => void
@@ -120,8 +120,7 @@ export function InlineEditModal({
     setStreamPreview('')
 
     try {
-      // Fast path: the coresident apply model. It is built for SEARCH/REPLACE
-      // and leaves the chat queue free, so Ctrl+K stays snappy.
+      // Morph SEARCH/REPLACE on Chat (thinking off). Falls back to the chat queue.
       const applyResult = applyReady
         ? await window.api.agent.applyEdit({
             instruction: instruction.trim(),

@@ -72,8 +72,33 @@ export function productReadmeCloneRefusal(command: string): string | null {
   if (!clonesProduct && !clonesToTmp) return null
   return (
     'SHELL_REFUSED: do not git clone the product repo (or clone into /tmp) just to read README. ' +
-    'Call web_search once (GitHub README / Releases URL) or read_file the workspace README. ' +
+    'Use facts already in the user message, or read_file the workspace README. write_file landing files NOW. ' +
     'Never Copy-Item from a clone.'
+  )
+}
+
+/** curl/iwr of the advertised product README — same scavenger hunt as git clone. */
+export function productReadmeFetchRefusal(command: string): string | null {
+  const c = command.trim()
+  if (!c) return null
+  if (!/\b(curl\.exe|curl|wget|Invoke-WebRequest|Invoke-RestMethod)\b/i.test(c)) return null
+  if (!/github\.com\/0xq71\/afkllm|raw\.githubusercontent\.com\/0xq71\/afkllm/i.test(c)) {
+    return null
+  }
+  return (
+    'SHELL_REFUSED: do not curl/wget the product GitHub README. ' +
+    'Facts are in the user message. write_file styles.css / js/main.js / index.html NOW.'
+  )
+}
+
+/** curl.exe does not take -UseBasicParsing (that is Invoke-WebRequest). */
+export function curlIwrFlagRefusal(command: string): string | null {
+  const c = command.trim()
+  if (!c || !/\bcurl(\.exe)?\b/i.test(c)) return null
+  if (!/-UseBasicParsing\b/i.test(c)) return null
+  return (
+    'SHELL_SYNTAX: -UseBasicParsing is an Invoke-WebRequest flag, not curl.exe. ' +
+    'Do not fetch GitHub. write_file the landing files from the facts in the user message.'
   )
 }
 

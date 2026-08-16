@@ -23,6 +23,8 @@ import {
   looksLikeShellFileMutation,
   powershellOperatorMisuse,
   productReadmeCloneRefusal,
+  productReadmeFetchRefusal,
+  curlIwrFlagRefusal,
   powershellNodeEvalRefusal,
   recursiveListingRefusal
 } from '../../shared/shellErrors'
@@ -98,12 +100,14 @@ export interface AgentToolRegistryOptions {
    */
   generateImage?: (args: Record<string, unknown>) => Promise<AgentToolResult>
   /**
-   * Coresident apply llama-server base URL (port+1) when ready; null if unloaded.
+   * Chat llama-server base URL when ready; null if Chat is unloaded.
+   * apply_diff instruction / fuzzy-miss Morph apply runs on Chat, not a second GGUF.
    */
   getApplyBaseUrl?: () => string | null
-  /** Apply slot ctx — sizes the apply prompt window and max_tokens. */
+  /** Chat ctx — sizes the apply prompt window and max_tokens. */
   getApplyCtxSize?: () => number | null
-  /** Live apply-model tokens for the UI (a silent 60s call looked like a freeze). */
+  getApplySampling?: () => { temperature?: number; topP?: number; topK?: number }
+  /** Live apply tokens for the UI (a silent 60s call looked like a freeze). */
   onApplyToken?: (relativePath: string, token: string) => void
   /** Latest IDE diagnostics snapshot (tsc/eslint). */
   getDiagnostics?: () => DiagnosticsSnapshot
@@ -130,6 +134,7 @@ export class AgentToolRegistry {
   private generateImageFn?: AgentToolRegistryOptions['generateImage']
   private getApplyBaseUrl?: () => string | null
   private getApplyCtxSize?: () => number | null
+  private getApplySampling?: () => { temperature?: number; topP?: number; topK?: number }
   private onApplyToken?: AgentToolRegistryOptions['onApplyToken']
   private getDiagnostics?: () => DiagnosticsSnapshot
   /** First-edit-per-path snapshot for Accept/Reject undo */
@@ -149,6 +154,7 @@ export class AgentToolRegistry {
     this.generateImageFn = options.generateImage
     this.getApplyBaseUrl = options.getApplyBaseUrl
     this.getApplyCtxSize = options.getApplyCtxSize
+    this.getApplySampling = options.getApplySampling
     this.onApplyToken = options.onApplyToken
     this.getDiagnostics = options.getDiagnostics
     this.handlers = new Map([
@@ -827,7 +833,7 @@ export class AgentToolRegistry {
         name: 'apply_diff',
         ok: false,
         content: '',
-        error: 'search_block is empty (or pass instruction for apply-model edit)'
+        error: 'search_block is empty (or pass instruction for a Chat SEARCH/REPLACE edit)'
       }
     }
 
@@ -955,7 +961,7 @@ export class AgentToolRegistry {
   }
 
   /**
-   * Morph-style edit via coresident apply model when fuzzy/search fails.
+   * Morph-style edit via Chat (same weights as the agent) when fuzzy/search fails.
    */
   private async smartApplyToFile(opts: {
     toolName: 'apply_diff' | 'apply_patch'
@@ -979,8 +985,8 @@ export class AgentToolRegistry {
         ok: false,
         content: '',
         error:
-          'APPLY_UNAVAILABLE: apply model is not loaded (Settings → Apply model → Load). ' +
-          'Do NOT re-read or full-rewrite; ask the user to Load chat+apply, or summarize failure.'
+          'APPLY_UNAVAILABLE: Chat model is not loaded (Settings → Model → Load). ' +
+          'Do NOT re-read or full-rewrite; Load Chat, or summarize failure.'
       }
     }
     if (!opts.instruction.trim()) {
@@ -993,6 +999,7 @@ export class AgentToolRegistry {
       }
     }
 
+    const sampling = this.getApplySampling?.() ?? {}
     const result = await fastApplyEdit({
       baseUrl,
       instruction: opts.instruction,
@@ -1002,6 +1009,9 @@ export class AgentToolRegistry {
       ctxSize: this.getApplyCtxSize?.() ?? undefined,
       timeoutMs: opts.timeoutMs ?? 60_000,
       maxAttempts: opts.maxAttempts ?? 2,
+      temperature: sampling.temperature,
+      topP: sampling.topP,
+      topK: sampling.topK,
       onToken: (token) => this.onApplyToken?.(opts.relativePath, token)
     })
 
@@ -1023,7 +1033,7 @@ export class AgentToolRegistry {
       id: '',
       name: opts.toolName,
       ok: true,
-      content: `Applied via apply model (${result.applied} block(s)) to ${opts.relativePath}${opts.retargetNote ?? ''}`,
+      content: `Applied via chat (${result.applied} block(s)) to ${opts.relativePath}${opts.retargetNote ?? ''}`,
       editReview: { path: pathKey, status: 'pending' },
       diffStat: diffStatFromBeforeAfter(opts.original, result.content)
     }
@@ -1395,6 +1405,21 @@ export class AgentToolRegistry {
         ok: false,
         content: '',
         error: cloneRefuse
+      }
+    }
+
+    const fetchRefuse =
+      productReadmeFetchRefusal(command) ??
+      productReadmeFetchRefusal(rawCommand) ??
+      curlIwrFlagRefusal(command) ??
+      curlIwrFlagRefusal(rawCommand)
+    if (fetchRefuse) {
+      return {
+        id: '',
+        name: 'execute_terminal_command',
+        ok: false,
+        content: '',
+        error: fetchRefuse
       }
     }
 

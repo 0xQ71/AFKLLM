@@ -7,7 +7,8 @@ import { execSync } from 'node:child_process'
 import type { CacheQuant, FlashAttnMode, LoadMode } from '../../shared/settings'
 import {
   shouldEnableDraftMtp,
-  speculativeMtpUnsupported
+  speculativeMtpUnsupported,
+  mtpDraftMax
 } from '../../shared/llamaSpec'
 import { looksLikeMmprojMismatch } from '../../shared/visionDetect'
 
@@ -206,7 +207,7 @@ export class LlamaProcessManager extends EventEmitter {
       })
     // Speculative MTP is single-stream; keep user --parallel for non-MTP models only.
     const parallel = useMtp ? 1 : Math.max(1, this.options.parallel | 0)
-    const draftN = 3
+    const draftN = mtpDraftMax(this.options.modelPath)
     const args = [
       '-m',
       this.options.modelPath,

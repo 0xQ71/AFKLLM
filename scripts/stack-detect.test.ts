@@ -6,6 +6,8 @@ import {
   isUserInterruptExit,
   looksLikeGuiLaunchCommand,
   productReadmeCloneRefusal,
+  productReadmeFetchRefusal,
+  curlIwrFlagRefusal,
   powershellNodeEvalRefusal,
   recursiveListingRefusal
 } from '../src/shared/shellErrors'
@@ -126,6 +128,35 @@ describe('product README clone refusal', () => {
     )
     assert.equal(productReadmeCloneRefusal('git clone https://github.com/foo/bar.git'), null)
     assert.equal(productReadmeCloneRefusal('git status'), null)
+  })
+})
+
+describe('product README fetch refusal', () => {
+  it('blocks curl/wget of AFKLLM GitHub README', () => {
+    assert.match(
+      productReadmeFetchRefusal(
+        'curl.exe -sL "https://raw.githubusercontent.com/0xQ71/AFKLLM/main/README.md"'
+      ) ?? '',
+      /SHELL_REFUSED/
+    )
+    assert.match(
+      productReadmeFetchRefusal('curl -sL https://github.com/0xQ71/AFKLLM') ?? '',
+      /SHELL_REFUSED/
+    )
+    assert.equal(
+      productReadmeFetchRefusal('curl -sL https://github.com/foo/bar/raw/main/README.md'),
+      null
+    )
+    assert.equal(productReadmeFetchRefusal('git status'), null)
+  })
+
+  it('blocks curl.exe -UseBasicParsing', () => {
+    assert.match(
+      curlIwrFlagRefusal('curl.exe -sL -UseBasicParsing https://example.com') ?? '',
+      /SHELL_SYNTAX/
+    )
+    assert.equal(curlIwrFlagRefusal('curl.exe -sL https://example.com'), null)
+    assert.equal(curlIwrFlagRefusal('Invoke-WebRequest -UseBasicParsing https://example.com'), null)
   })
 })
 

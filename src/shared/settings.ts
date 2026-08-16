@@ -2,6 +2,11 @@ import { isUiTheme, type UiTheme } from './theme'
 import type { McpServerConfig } from './mcp'
 import type { LlamaRuntimeSelection } from './llamaRuntime'
 import { DEFAULT_UI_LANGUAGE, type UiLanguage } from './i18n'
+import {
+  looksLikeOrnithGguf,
+  ornithTuningOverlay,
+  isStockAfkllmSampling
+} from './ornithDefaults'
 
 export type FlashAttnMode = 'on' | 'off' | 'auto'
 export type CacheQuant = 'f16' | 'q8_0' | 'q4_0' | 'q4_1' | 'q5_0' | 'bf16'
@@ -99,6 +104,40 @@ export function applyModelProfile(
 
 export function defaultModelProfile(): ModelTuningProfile {
   return extractModelProfile(DEFAULT_SETTINGS)
+}
+
+export function profileForModelPath(modelPath: string): ModelTuningProfile {
+  const base = defaultModelProfile()
+  if (!looksLikeOrnithGguf(modelPath)) return base
+  return { ...base, ...ornithTuningOverlay() }
+}
+
+/**
+ * If Chat is Ornith and knobs are still the stock AFKLLM 0.1/0.1/8k profile,
+ * lift them to official agent sampling + 256K ctx. Custom values stay.
+ */
+export function applyOrnithRecommendedTuning(settings: AppSettings): AppSettings {
+  if (!looksLikeOrnithGguf(settings.modelPath)) return settings
+  const overlay = ornithTuningOverlay()
+  const sampling = isStockAfkllmSampling(settings)
+  const ctx = settings.ctxSize > 0 && settings.ctxSize <= 8192
+  if (!sampling && !ctx) return settings
+  const next: AppSettings = {
+    ...settings,
+    ...(sampling
+      ? {
+          temperature: overlay.temperature,
+          topK: overlay.topK,
+          topP: overlay.topP,
+          topPEnabled: overlay.topPEnabled
+        }
+      : {}),
+    ...(ctx ? { ctxSize: overlay.ctxSize } : {})
+  }
+  const profiles = { ...(next.modelProfiles ?? {}) }
+  if (next.modelPath) profiles[next.modelPath] = extractModelProfile(next)
+  next.modelProfiles = profiles
+  return next
 }
 
 export interface AppSettings {
@@ -209,14 +248,13 @@ export interface AppSettings {
   /** Projector for visionModelPath; empty = auto sibling *mmproj*.gguf */
   visionMmprojPath: string
   /**
-   * When true (default): load vision with chat + apply on Load (port+2) and keep it.
+   * When true (default): load vision with chat on Load (port+2) and keep it.
    * When false: cold-swap chat↔vision on attach, then unload vision after use.
    */
   visionKeepLoaded: boolean
   /**
-   * Fast-apply / Morph-style edit GGUF — loaded coresident with chat on Load
-   * (second llama-server on port+1, same VRAM; no cold-swap).
-   * Empty = no apply process (agent falls back to chat later).
+   * Fast-apply / Morph-style edit GGUF — unused. Chat applies patches.
+   * Kept so older settings.json still loads; SettingsStore clears the path.
    */
   applyModelPath: string
   /**
@@ -438,7 +476,7 @@ export function switchModelPath(settings: AppSettings, nextPath: string): AppSet
   if (settings.modelPath) {
     profiles[settings.modelPath] = extractModelProfile(settings)
   }
-  const loaded = profiles[path] ?? defaultModelProfile()
+  const loaded = profiles[path] ?? profileForModelPath(path)
   profiles[path] = loaded
   return applyModelProfile(
     { ...settings, modelPath: path, modelProfiles: profiles },

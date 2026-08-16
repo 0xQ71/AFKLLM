@@ -70,6 +70,8 @@ import {
   looksLikeExplicitRewrite,
   looksLikeFromScratchTask,
   looksLikeFinishMissingLandingFiles,
+  landingBriefAlreadyHasFacts,
+  isResearchScavengerPlanStep,
   allowsComposerFullRewrite,
   shouldBlockSurgicalOverwrite,
   shouldBlockSurgicalCssRewrite,
@@ -667,6 +669,10 @@ describe('agent todo plan', () => {
       true
     )
     assert.equal(isToolOrientedPlanStep('Закрыть'), true)
+    assert.equal(
+      isToolOrientedPlanStep('Исследовать репозиторий AFKLLM через explore_subagent'),
+      true
+    )
     const raw = parsePlanBlock(
       '<plan>\n' +
         '- execute_terminal_command для проверки синтаксиса HTML\n' +
@@ -686,6 +692,45 @@ describe('agent todo plan', () => {
       'must not invent a landing template'
     )
     assert.ok(coerced.some((s) => /визуальн|вёрст|верст/i.test(s.text)))
+  })
+
+  it('drops GitHub scavenger plan rows when the brief already has facts', () => {
+    const brief =
+      'Сделай полноценный профессиональный многофайловый лендинг продукта AFKLLM. ' +
+      'Факты только из https://github.com/0xQ71/AFKLLM. ' +
+      'Local AI coding IDE for Windows: Electron + Monaco + llama.cpp. ' +
+      'Локальные GGUF, MIT, Windows x64 installer.'
+    assert.equal(landingBriefAlreadyHasFacts(brief), true)
+    assert.equal(
+      landingBriefAlreadyHasFacts('Сделай лендинг про кофе без ссылок'),
+      false
+    )
+    assert.equal(
+      isResearchScavengerPlanStep('Исследовать репозиторий AFKLLM через explore_subagent'),
+      true
+    )
+    assert.equal(isResearchScavengerPlanStep('web_search AFKLLM github 0xQ71'), true)
+    assert.equal(
+      isResearchScavengerPlanStep(
+        'Создать README.md лендинга — инструкция открыть index.html в браузере'
+      ),
+      false
+    )
+    const raw = parsePlanBlock(
+      '<plan>\n' +
+        '- Исследовать репозиторий AFKLLM через explore_subagent\n' +
+        '- web_search для фактов из GitHub\n' +
+        '- Создать assets/ — SVG-иконки\n' +
+        '- Написать styles.css — dark-тема\n' +
+        '- Создать README.md лендинга — как открыть\n' +
+        '</plan>'
+    )
+    const coerced = coerceProductPlan(raw, { userText: brief })
+    assert.ok(!coerced.some((s) => isResearchScavengerPlanStep(s.text)))
+    assert.ok(!coerced.some((s) => /explore_subagent|web_search/i.test(s.text)))
+    assert.ok(coerced.some((s) => /assets|SVG/i.test(s.text)))
+    assert.ok(coerced.some((s) => /styles\.css/i.test(s.text)))
+    assert.ok(coerced.some((s) => /README\.md/i.test(s.text)))
   })
 
   it('keeps model plan rows like verify and user-summary', () => {
@@ -2792,6 +2837,14 @@ describe('edit sanity + html-only stacks', () => {
     assert.ok(contract)
     assert.match(contract!, /LANDING_CONTRACT/)
     assert.match(contract!, /\.navbar/)
+    const navContainerCss =
+      '.nav-container { display:flex } .hero { min-height:80vh } .hero-title { font-size:4rem } ' +
+      '.btn-primary { background:#6c63ff } .feature-grid { display:grid } .footer { padding:2rem } ' +
+      '.section { padding:4rem }\n'
+    const ownContract = formatLandingCssContractHint(navContainerCss)
+    assert.ok(ownContract)
+    assert.match(ownContract!, /\.nav-container/)
+    assert.doesNotMatch(ownContract!, /\.navbar/)
   })
 })
 
@@ -2809,7 +2862,36 @@ describe('product README git clone refusal', () => {
       })
       assert.equal(res.ok, false)
       assert.match(res.error ?? '', /SHELL_REFUSED/)
-      assert.match(res.error ?? '', /web_search/i)
+      assert.match(res.error ?? '', /write_file/i)
+    } finally {
+      await fs.rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('blocks curl of the product README and curl.exe -UseBasicParsing', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'afkllm-curl-'))
+    try {
+      const reg = new AgentToolRegistry({ projectRoot: root })
+      const fetchReadme = await reg.invoke({
+        id: '1',
+        name: 'execute_terminal_command',
+        arguments: {
+          command:
+            'curl.exe -sL "https://raw.githubusercontent.com/0xQ71/AFKLLM/main/README.md"'
+        }
+      })
+      assert.equal(fetchReadme.ok, false)
+      assert.match(fetchReadme.error ?? '', /SHELL_REFUSED/)
+      const iwrFlag = await reg.invoke({
+        id: '2',
+        name: 'execute_terminal_command',
+        arguments: {
+          command:
+            'curl.exe -sL -UseBasicParsing "https://raw.githubusercontent.com/0xQ71/AFKLLM/main/README.md"'
+        }
+      })
+      assert.equal(iwrFlag.ok, false)
+      assert.match(iwrFlag.error ?? '', /SHELL_SYNTAX|SHELL_REFUSED/)
     } finally {
       await fs.rm(root, { recursive: true, force: true })
     }
