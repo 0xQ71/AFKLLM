@@ -376,7 +376,9 @@ function runtimeStatus(): LlmRuntimeStatus {
             : null,
     visionError:
       reuseVision && llama?.currentState === 'ready' && !llama.mmprojPath
-        ? 'Chat is the VL model — set mmproj (or place *mmproj*.gguf next to the GGUF).'
+        ? llama.droppedMmprojPath
+          ? `mmproj does not match Chat (n_embd). Dropped ${llama.droppedMmprojPath.replace(/^.*[/\\]/, '')}. Pick a projector for this GGUF.`
+          : 'Chat is the VL model — set a matching mmproj (or place *mmproj*.gguf next to the GGUF).'
         : visionErr
   }
 }
@@ -1240,6 +1242,12 @@ function registerIpc(): void {
     const dir = settingsStore?.get().modelsDir
     if (!dir) return []
     return scanMmprojFiles(dir)
+  })
+
+  ipcMain.handle('llm:list-weights', async () => {
+    const dir = settingsStore?.get().modelsDir
+    if (!dir) return []
+    return scanWeightFiles(dir)
   })
 
   ipcMain.handle('sd-runtime:status', () => {

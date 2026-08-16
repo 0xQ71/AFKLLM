@@ -428,7 +428,9 @@ export class ModelSlotOrchestrator extends EventEmitter {
         return 'Chat + Vision ready (same GGUF + mmproj)'
       }
       this.lastVisionError =
-        'Chat is the VL model — set mmproj (or place *mmproj*.gguf next to the GGUF), then Load.'
+        llama?.droppedMmprojPath
+          ? `mmproj does not match Chat (n_embd). Dropped ${llama.droppedMmprojPath.replace(/^.*[/\\]/, '')}. Pick a projector for this GGUF.`
+          : 'Chat is the VL model — set a matching mmproj (or place *mmproj*.gguf next to the GGUF), then Load.'
       return `${chatDetail} · Vision failed: ${this.lastVisionError}`
     }
     let visionOpts: LlamaProcessOptions

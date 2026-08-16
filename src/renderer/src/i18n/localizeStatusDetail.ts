@@ -24,6 +24,7 @@ export function localizeStatusDetail(detail: string | null | undefined, t: TFn):
     'loading model…': 'status.detail.loadingModel',
     'spawning llama-server…': 'status.detail.spawning',
     'MTP flags unsupported · retrying without…': 'status.detail.mtpRetry',
+    'mmproj mismatch · loading chat without vision…': 'status.detail.mmprojRetry',
     'loading model weights…': 'status.detail.loadingWeights',
     'offloading to GPU…': 'status.detail.offloadingGpu',
     'Image gen: timed out': 'status.detail.imageTimedOut',

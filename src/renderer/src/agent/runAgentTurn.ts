@@ -67,9 +67,12 @@ import {
   readFileRangeCacheKey,
   resolveExhaustedReadBudget,
   contentLooksStructurallyComplete,
+  cssLooksLikeRealStylesheet,
   wrapThinkForUi,
   todosAllDone,
   pendingPlanWork,
+  isFileWorkPlanStep,
+  shouldNudgeRemainingFileWork,
   looksLikeOpenHtmlCommand,
   isLandingJsPath,
   looksLikeLandingBuildTask,
@@ -90,14 +93,17 @@ import {
   detectProseStutter,
   dedupeStutteringProse,
   looksLikeChatQa,
+  looksLikeImageQa,
   looksLikeFileEditRequest,
   looksLikeSurgicalFollowUp,
   looksLikeI18nFollowUp,
   looksLikeThemeToggleRequest,
   looksLikeExplicitRewrite,
   allowsComposerFullRewrite,
+  looksLikeFinishMissingLandingFiles,
   shouldHandoffWriteToApply,
   shouldBlockSurgicalOverwrite,
+  shouldBlockSurgicalCssRewrite,
   isComposerApplyPath,
   priorCompleteForWritePath,
   shouldPersistIncompleteWrite,
@@ -125,6 +131,7 @@ import {
   formatScratchWriteFileHint,
   formatWriteFileRequiredError,
   formatWriteOnceError,
+  formatLandingJsBeforeHtmlHint,
   isCappedLandingWritePath,
   landingBundleReady,
   shouldRefuseLandingRewrite,
@@ -343,6 +350,7 @@ async function describeImagesWithVision(params: {
   images: Array<{ id: string; path: string; mime: string; name?: string }>
   signal?: AbortSignal
   keepLoaded: boolean
+  directAnswer?: boolean
 }): Promise<string> {
   await window.api.slots.ensure('vision')
   if (params.signal?.aborted) {
@@ -359,7 +367,9 @@ async function describeImagesWithVision(params: {
     {
       type: 'text',
       text:
-        'Describe the attached image(s) / document page scan(s) in detail for a coding agent. Focus on UI layout, text, tables, diagrams, errors, and anything relevant to this user request. Be concrete and concise (max ~400 words).\n\nUser request:\n' +
+        (params.directAnswer
+          ? 'Answer the user about this image in their language. 2–8 sentences. No tools, no <plan>, no todos, no “task complete”, no P.S., no offer to build a page. Then stop.\n\nUser request:\n'
+          : 'Describe the attached image(s) / document page scan(s) in detail for a coding agent. Focus on UI layout, text, tables, diagrams, errors, and anything relevant to this user request. Be concrete and concise (max ~400 words).\n\nUser request:\n') +
         params.userText.slice(0, 2000)
     }
   ]
@@ -2272,6 +2282,46 @@ export async function runAgentTurn(params: {
     }
   }
 
+  const surgicalCssBlocked = async (
+    toolName: string,
+    toolArgs: Record<string, unknown>,
+    cssPath: string
+  ): Promise<boolean> => {
+    if (!/\.css$/i.test(cssPath)) return false
+    if (toolName !== 'write_file' && toolName !== 'apply_diff' && toolName !== 'apply_patch') {
+      return false
+    }
+    const search = typeof toolArgs.search_block === 'string' ? toolArgs.search_block : ''
+    const replace = typeof toolArgs.replace_block === 'string' ? toolArgs.replace_block : ''
+    const content = typeof toolArgs.content === 'string' ? toolArgs.content : ''
+    const huge =
+      (toolName === 'write_file' &&
+        (Boolean(toolArgs.overwrite) ||
+          Boolean(toolArgs.allow_full_rewrite) ||
+          content.length >= 3000)) ||
+      (toolName === 'apply_diff' &&
+        (search.length >= 1800 ||
+          (search.length >= 900 && replace.length >= 1800) ||
+          replace.length >= 4000)) ||
+      (toolName === 'apply_patch' &&
+        typeof toolArgs.patch === 'string' &&
+        toolArgs.patch.length >= 4000)
+    if (!huge) return false
+    let cssDisk = lastCssWrite
+    if (!cssLooksLikeRealStylesheet(cssDisk)) {
+      try {
+        const disk = await window.api.workspace.readFile(cssPath)
+        if (disk.ok && typeof disk.content === 'string') cssDisk = disk.content
+      } catch {
+        /* missing */
+      }
+    }
+    return shouldBlockSurgicalCssRewrite({
+      userText: params.userText,
+      cssOnDisk: cssDisk
+    })
+  }
+
   let planFinishNudges = 0
   let sectionFillTried = true
   /** A mutating edit (write_file / apply_diff / apply_patch) succeeded this turn. */
@@ -2307,14 +2357,24 @@ export async function runAgentTurn(params: {
       return finishWithTiming(messages)
     }
     try {
+      const imageQa = looksLikeImageQa(params.userText, true)
       const description = await describeImagesWithVision({
         queue: params.queue,
         userText: params.userText,
         images: imageRefs,
         signal: params.signal,
-        keepLoaded: reuseVision || appSettings.visionKeepLoaded !== false
+        keepLoaded: reuseVision || appSettings.visionKeepLoaded !== false,
+        directAnswer: imageQa
       })
       if (params.signal?.aborted) return finishStopped()
+      if (imageQa && description.trim()) {
+        messages.push({
+          id: uid(),
+          role: 'assistant',
+          content: description.trim()
+        })
+        return finishWithTiming(messages)
+      }
       if (description.trim()) {
         const label = docPageImages.length
           ? '[Document page notes]'
@@ -2477,7 +2537,10 @@ export async function runAgentTurn(params: {
   let forceEndTurn = false
   const skipCeremony =
     !isPlan && shouldSkipThinkPlanCeremony(params.userText, params.history)
-  const chatQa = !isPlan && looksLikeChatQa(params.userText, params.history)
+  const chatQa =
+    !isPlan &&
+    (looksLikeChatQa(params.userText, params.history) ||
+      looksLikeImageQa(params.userText, imageRefs.length > 0))
   const thinkThrough = !isPlan && !skipCeremony && !chatQa
   const autoApprove = appSettings.agentAutoApprove === true
 
@@ -2610,7 +2673,8 @@ export async function runAgentTurn(params: {
         prose
       )
 
-    // Exactly ONE think completion — a second stream was remounting/replacing the fold.
+    // One think completion; retry only if that stream was empty (Gemma/Qwen
+    // sometimes emit reasoning_content with no `content` — salvage is in SSE).
     const streamThinkOnce = async (): Promise<{ text: string; aborted: boolean }> => {
       const ac = new AbortController()
       const onOuter = (): void => {
@@ -2695,7 +2759,19 @@ export async function runAgentTurn(params: {
     pushUserMessage(apiMessages, thinkPrompt)
     apiMessages = normalizeApiMessages(apiMessages)
 
-    const thinkRound = await streamThinkOnce()
+    const pickThinkProse = (roundText: string): string =>
+      [stripCodeLeakFromThink(liveThinkProse(roundText)), stripCodeLeakFromThink(bestLiveProse)]
+        .filter(
+          (p) =>
+            p &&
+            !isEllipsisOnly(p) &&
+            !isStockThink(p) &&
+            !thinkBodyLooksLikeCodeDump(p) &&
+            !/^думаю над запросом|^thinking about the request/i.test(p.trim())
+        )
+        .sort((a, b) => b.length - a.length)[0] ?? ''
+
+    let thinkRound = await streamThinkOnce()
     if (thinkRound.aborted) {
       const idx = messages.findIndex((m) => m.id === preludeId)
       if (idx !== -1) {
@@ -2710,21 +2786,36 @@ export async function runAgentTurn(params: {
     }
 
     // Prefer the longest real prose we saw while streaming — never wipe a fold the user already saw.
-    const streamedBest =
-      [stripCodeLeakFromThink(liveThinkProse(thinkRound.text)), stripCodeLeakFromThink(bestLiveProse)]
-        .filter(
-          (p) =>
-            p &&
-            !isEllipsisOnly(p) &&
-            !isStockThink(p) &&
-            !thinkBodyLooksLikeCodeDump(p) &&
-            !/^думаю над запросом|^thinking about the request/i.test(p.trim())
-        )
-        .sort((a, b) => b.length - a.length)[0] ?? ''
+    let streamedBest = pickThinkProse(thinkRound.text)
     // Keep whatever streamed into the bubble even if filters were picky (false-success
     // patterns in think must not delete a real DeepThink the user already watched).
-    const keptLive = stripCodeLeakFromThink(bestLiveProse).trim()
-    const finalProse = streamedBest || (keptLive.length >= 40 ? keptLive : '')
+    let keptLive = stripCodeLeakFromThink(bestLiveProse).trim()
+    let finalProse = streamedBest || (keptLive.length >= 40 ? keptLive : '')
+
+    if (!finalProse && keptLive.length < 40 && !params.signal?.aborted) {
+      pushUserMessage(
+        apiMessages,
+        'THINK_ONLY retry: previous reply was empty. Output ONLY a <think>…</think> block NOW — ' +
+          '8–14 sentences in the USER\'s language. No <plan>, tools, or code. Stop after </think>.'
+      )
+      apiMessages = normalizeApiMessages(apiMessages)
+      thinkRound = await streamThinkOnce()
+      if (thinkRound.aborted) {
+        const idx = messages.findIndex((m) => m.id === preludeId)
+        if (idx !== -1) {
+          messages[idx] = {
+            ...messages[idx]!,
+            streaming: false,
+            content: formatLiveThinkContent(messages[idx]!.content ?? '')
+          }
+          params.onUpdate([...messages])
+        }
+        return finishStopped()
+      }
+      streamedBest = pickThinkProse(thinkRound.text)
+      keptLive = stripCodeLeakFromThink(bestLiveProse).trim()
+      finalProse = streamedBest || (keptLive.length >= 40 ? keptLive : '')
+    }
     const thinkMissingNote =
       uiLang === 'ru'
         ? 'Модель не выдала рассуждение — перехожу к плану и tools.'
@@ -2921,9 +3012,10 @@ export async function runAgentTurn(params: {
     pushUserMessage(
       apiMessages,
       chatQa
-        ? 'Chat Q&A follow-up: answer ONLY in prose in the user\'s language (clothing / weather advice). ' +
-            'FORBIDDEN: write_file, apply_diff, apply_patch, creating index.html/styles.css/js, any coding plan, any website. ' +
-            'Do NOT build an app. One short answer, then stop.'
+        ? 'Chat Q&A follow-up: answer ONLY in prose in the user\'s language. ' +
+            'If [Image notes] are present, answer from those notes in 2–8 sentences. ' +
+            'FORBIDDEN: write_file, apply_diff, apply_patch, <plan>, todos, creating files, ' +
+            '"задача завершена", P.S., offering to build a page, repeating goodbye. One short answer, then stop.'
         : 'Short confirm: skip another <think>/<plan>. Call tools NOW. ' +
             'YOU decide from disk: create missing files with write_file; edit existing with apply_diff/apply_patch. ' +
             'Never rewrite a finished HTML landing for a small tweak. Be honest if an edit fails.'
@@ -3636,17 +3728,35 @@ export async function runAgentTurn(params: {
       round < maxRounds - 1
     ) {
       markupRepairAttempts++
+      const htmlReady = contentLooksStructurallyComplete(lastHtmlWrite, 'index.html')
+      const cssReady = cssLooksLikeRealStylesheet(lastCssWrite)
+      const keepGoingForLanding =
+        (!htmlReady || !cssReady) &&
+        (looksLikeFinishMissingLandingFiles(params.userText) ||
+          looksLikeLandingBuildTask(params.userText) ||
+          allowsComposerFullRewrite(params.userText))
       messages.push({
         id: uid(),
         role: 'assistant',
         content:
-          markupRepairAttempts > MAX_MARKUP_REPAIR_ATTEMPTS
+          markupRepairAttempts > MAX_MARKUP_REPAIR_ATTEMPTS && !keepGoingForLanding
             ? '⚠ Model leaked tool-call syntax into plain text. Stopping to avoid a write loop.'
             : '⚠ Detected leaked tool-call syntax in the reply (not a real tool call). Asking the model to use structured tools…'
       })
       params.onUpdate([...messages])
       if (markupRepairAttempts > MAX_MARKUP_REPAIR_ATTEMPTS) {
-        return finishWithTiming(messages)
+        if (!keepGoingForLanding || markupRepairAttempts > MAX_MARKUP_REPAIR_ATTEMPTS + 3) {
+          return finishWithTiming(messages)
+        }
+        const missing = !cssReady ? 'styles.css' : 'index.html'
+        pushUserMessage(
+          apiMessages,
+          `Landing files are still missing. Call write_file NOW with relative_path="${missing}", ` +
+            'overwrite=true, and the FULL file in the JSON content argument. ' +
+            'Do not paste <tool_call> or call:write_file as plain text.'
+        )
+        apiMessages = normalizeApiMessages(apiMessages)
+        continue
       }
       pushUserMessage(
         apiMessages,
@@ -3872,46 +3982,16 @@ export async function runAgentTurn(params: {
               'TOOL_LOOP: generate_image already ran this turn (including any internal retry). Do NOT call it again — finish remaining files or summarize.'
           }
         } else if (
-          !looksLikeExplicitRewrite(params.userText) &&
-          (looksLikeSurgicalFollowUp(params.userText) ||
-            (looksLikeFileEditRequest(params.userText) &&
-              !looksLikeLandingBuildTask(params.userText))) &&
-          /\.css$/i.test(String(resolvedPath || filePath || ''))
+          await surgicalCssBlocked(name, args, String(resolvedPath || filePath || ''))
         ) {
-          const search =
-            typeof args.search_block === 'string' ? args.search_block : ''
-          const replace =
-            typeof args.replace_block === 'string' ? args.replace_block : ''
-          const content = typeof args.content === 'string' ? args.content : ''
-          const hugeCssRewrite =
-            (name === 'write_file' &&
-              (Boolean(args.overwrite) ||
-                Boolean(args.allow_full_rewrite) ||
-                content.length >= 3000)) ||
-            (name === 'apply_diff' &&
-              (search.length >= 1800 ||
-                (search.length >= 900 && replace.length >= 1800) ||
-                replace.length >= 4000)) ||
-            (name === 'apply_patch' &&
-              typeof args.patch === 'string' &&
-              args.patch.length >= 4000)
-          if (hugeCssRewrite) {
-            toolResult = {
-              id: call.id,
-              name,
-              ok: false,
-              content: '',
-              error:
-                'SURGICAL_CSS: do NOT rewrite this stylesheet. Use apply_diff with a SMALL search_block ' +
-                '(navbar / header / theme rules only, typically < 80 lines). Leave the rest of the stylesheet untouched.'
-            }
-          } else {
-            syntheticResult = false
-            toolResult = await window.api.agent.invoke({
-              id: call.id,
-              name,
-              arguments: args
-            })
+          toolResult = {
+            id: call.id,
+            name,
+            ok: false,
+            content: '',
+            error:
+              'SURGICAL_CSS: do NOT rewrite this stylesheet. Use apply_diff with a SMALL search_block ' +
+              '(navbar / header / theme rules only, typically < 80 lines). Leave the rest of the stylesheet untouched.'
           }
         } else if (
           name === 'read_file' &&
@@ -4395,19 +4475,22 @@ export async function runAgentTurn(params: {
           if (
             name === 'write_file' &&
             !toolResult.ok &&
-            /FILE_EXISTS/i.test(toolResult.error ?? toolResult.content ?? '') &&
+            /FILE_EXISTS|STUB_ON_DISK/i.test(toolResult.error ?? toolResult.content ?? '') &&
             pathStr &&
             contentStr
           ) {
             const pathInFlight =
               incompleteAppendsByPath.has(pathKey) ||
               checklist.incomplete.some((p) => loopPathKey(p) === pathKey)
+            const stubReplace = /STUB_ON_DISK/i.test(
+              toolResult.error ?? toolResult.content ?? ''
+            )
             const landingRewrite =
               allowsLandingOverwrite(pathStr, contentStr.length) &&
               (/<!DOCTYPE\s+html|<html[\s>]/i.test(contentStr) ||
-                contentLooksStructurallyComplete(contentStr) ||
+                contentLooksStructurallyComplete(contentStr, pathStr) ||
                 contentStr.length >= 1500)
-            if (pathInFlight && !landingRewrite) {
+            if (pathInFlight && !landingRewrite && !stubReplace) {
               const appended = await window.api.agent.invoke({
                 id: call.id,
                 name,
@@ -4437,7 +4520,7 @@ export async function runAgentTurn(params: {
                   }
                 }
               }
-            } else if (landingRewrite || pathInFlight) {
+            } else if (landingRewrite || pathInFlight || stubReplace) {
               const priorComplete =
                 bufferCompleteForPath(pathStr) ||
                 (await pathLooksCompleteOnDisk(pathStr))
@@ -4469,7 +4552,7 @@ export async function runAgentTurn(params: {
               ) {
                 name = 'apply_diff'
                 toolResult = await invokeApplyHandoff(call.id, pathStr, contentStr)
-              } else if ((priorComplete || incomingComplete) && !allowFull) {
+              } else if (priorComplete && !allowFull) {
                 toolResult = {
                   id: call.id,
                   name,
@@ -4785,7 +4868,11 @@ export async function runAgentTurn(params: {
           if (!html) {
             try {
               const disk = await window.api.workspace.readFile(lastHtmlWritePath || 'index.html')
-              if (disk.ok && typeof disk.content === 'string') {
+              if (
+                disk.ok &&
+                typeof disk.content === 'string' &&
+                contentLooksStructurallyComplete(disk.content, lastHtmlWritePath || 'index.html')
+              ) {
                 html = disk.content
                 lastHtmlWrite = disk.content
               }
@@ -4880,6 +4967,15 @@ export async function runAgentTurn(params: {
               }
             }
           }
+          if (
+            /\.(js|mjs|cjs)$/i.test(written) &&
+            !contentLooksStructurallyComplete(lastHtmlWrite || html || '', 'index.html')
+          ) {
+            toolResult = {
+              ...toolResult,
+              content: `${toolResult.content || ''}\n${formatLandingJsBeforeHtmlHint()}`.trim()
+            }
+          }
         }
         if (
           toolResult.ok &&
@@ -4919,7 +5015,7 @@ export async function runAgentTurn(params: {
         }
         if (
           !toolResult.ok ||
-          /TOOL_LOOP|INCOMPLETE_WRITE_LIMIT|FILE_EXISTS|FILE_COMPLETE|PATCH_OK_LIMIT|PATCH_FAIL_LIMIT|SMART_APPLY_FAIL|APPLY_UNAVAILABLE|THINK_REQUIRED|SURGICAL_EDIT|SURGICAL_CSS|I18N_SANITY|EDIT_SANITY|WRITE_ONCE|WRITE_FILE_REQUIRED/i.test(
+          /TOOL_LOOP|INCOMPLETE_WRITE_LIMIT|FILE_EXISTS|FILE_COMPLETE|STUB_ON_DISK|PATCH_OK_LIMIT|PATCH_FAIL_LIMIT|SMART_APPLY_FAIL|APPLY_UNAVAILABLE|THINK_REQUIRED|SURGICAL_EDIT|SURGICAL_CSS|I18N_SANITY|EDIT_SANITY|WRITE_ONCE|WRITE_FILE_REQUIRED/i.test(
             toolResult.error ?? toolResult.content ?? ''
           )
         ) {
@@ -5063,7 +5159,7 @@ export async function runAgentTurn(params: {
             !/INCOMPLETE_WRITE_LIMIT/i.test(content)
           const softRedirect =
             !toolResult.ok &&
-            /FILE_COMPLETE|FILE_EXISTS|OVERWRITE_BLOCKED|INLINE_ASSET|SURGICAL_EDIT|SURGICAL_CSS/i.test(
+            /FILE_COMPLETE|FILE_EXISTS|STUB_ON_DISK|OVERWRITE_BLOCKED|INLINE_ASSET|SURGICAL_EDIT|SURGICAL_CSS/i.test(
               toolResult.error ?? toolResult.content ?? content
             )
           const reviewPath =
@@ -5305,8 +5401,8 @@ export async function runAgentTurn(params: {
           appendToolHint(
             apiMessages,
             'WRITE_ONCE: that file is already complete in this turn. ' +
-              'Write any still-missing path, or Start-Process (Resolve-Path .\\index.html) ONCE, then STOP. ' +
-              'Do not rewrite js/main.js.'
+              'Missing HTML ids are expected until index.html exists. ' +
+              'Write any still-missing path (styles.css / index.html / README.md). Do not rewrite js/main.js.'
           )
         } else if (/WRITE_FILE_REQUIRED/i.test(tc)) {
           appendToolHint(
@@ -5338,6 +5434,12 @@ export async function runAgentTurn(params: {
             apiMessages,
             'INCOMPLETE_WRITE: if this is a NEW unfinished file, next call MUST be write_file append=true on the SAME path. ' +
               'If the file was already complete, do NOT overwrite — apply_diff with a short instruction only.'
+          )
+        } else if (/STUB_ON_DISK/i.test(tc)) {
+          appendToolHint(
+            apiMessages,
+            'STUB_ON_DISK: that path is a placeholder, not a finished file. ' +
+              'Call write_file overwrite=true with the FULL content. Do not apply_diff the stub.'
           )
         } else if (/FILE_COMPLETE/i.test(tc)) {
           appendToolHint(
@@ -6000,6 +6102,10 @@ export async function runAgentTurn(params: {
     const workLeft = pendingPlanWork(todoSteps)
     const landingComplete =
       Boolean(lastHtmlWrite) && contentLooksStructurallyComplete(lastHtmlWrite)
+    const fileWorkLeft = workLeft.filter((s) => isFileWorkPlanStep(s.text))
+    const missingNamedFiles = fileWorkLeft.some((s) =>
+      /index\.html|readme|\.md\b|styles\.css|main\.js/i.test(s.text)
+    )
 
     // Q&A / web_search: answer already in chat — never loop «Доделываю план» 3×.
     const qaAnswerDone =
@@ -6009,7 +6115,10 @@ export async function runAgentTurn(params: {
       !mutatingEditFailed &&
       (usedWebSearch || isRedundantPlanCompleteProse(finalText))
 
-    if (qaAnswerDone || isRedundantPlanCompleteProse(finalText)) {
+    if (
+      (qaAnswerDone || isRedundantPlanCompleteProse(finalText)) &&
+      fileWorkLeft.length === 0
+    ) {
       if (todoSteps.length > 0) {
         todoSteps = todoSteps.map((s) =>
           s.status === 'done' || isBrowserPlanStep(s.text)
@@ -6027,30 +6136,29 @@ export async function runAgentTurn(params: {
     }
 
     // Remaining plan rows that still need file/shell work (not search/Q&A fluff).
-    const fileWorkLeft = workLeft.filter(
-      (s) =>
-        !/web_search|поиск\s+в\s+интернет|искать\s+в\s+интернет|погод|weather/i.test(s.text) &&
-        (/write_file|apply_diff|apply_patch|index\.html|\.css|\.js|файл|созда|исправ|правк|edit|patch|html|секци/i.test(
-          s.text
-        ) ||
-          looksLikeLandingBuildTask(s.text))
-    )
-
     if (
-      fileWorkLeft.length > 0 &&
-      completedTools > 0 &&
-      planFinishNudges < 3 &&
-      round < maxRounds - 1 &&
-      !landingComplete &&
-      !mutatingEditOk
+      shouldNudgeRemainingFileWork({
+        fileWorkCount: fileWorkLeft.length,
+        completedTools,
+        landingComplete,
+        missingNamedFiles,
+        surgicalFollowUp: looksLikeSurgicalFollowUp(params.userText),
+        mutatingEditOk,
+        planFinishNudges
+      }) &&
+      round < maxRounds - 1
     ) {
       planFinishNudges++
       const pendingList = fileWorkLeft.map((s) => `- ${s.text}`).join('\n')
+      const needHtml =
+        fileWorkLeft.some((s) => /index\.html|\bhtml\b/i.test(s.text)) && !lastHtmlWrite
       pushUserMessage(
         apiMessages,
-        'Open plan steps remain:\n' +
+        'PLAN_INCOMPLETE: these files are still missing:\n' +
           pendingList +
-          '\nKeep using tools if work is still needed, or write an honest summary. Opening preview is allowed.'
+          (needHtml
+            ? '\nindex.html is still missing — call write_file for it NOW. Do not summarize.\n'
+            : '\nCall write_file for the next missing path NOW. Do not write a summary yet.\n')
       )
       apiMessages = normalizeApiMessages(apiMessages)
       pushStatusBubble(

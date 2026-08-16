@@ -8,6 +8,12 @@
 
 export const I18N_SANITY_PREFIX = 'I18N_SANITY:'
 
+/** Full page on disk — JS↔HTML id/key matching before this is noise (JS-first landings). */
+export function htmlReadyForI18nContract(html: string): boolean {
+  const t = (html ?? '').trim()
+  return /<!DOCTYPE\s+html|<html[\s>]/i.test(t) && /<\/html\s*>/i.test(t)
+}
+
 export function extractDataI18nKeys(html: string): string[] {
   const keys: string[] = []
   const re = /data-i18n\s*=\s*["']([^"']+)["']/gi
@@ -176,15 +182,16 @@ export function formatI18nSanityHint(opts: { html?: string; js?: string }): stri
   const html = opts.html ?? ''
   const js = opts.js ?? ''
   if (!html.trim() && !js.trim()) return null
+  const htmlReady = htmlReadyForI18nContract(html)
   const parts: string[] = []
-  if (htmlHasEmptyI18nShells(html)) {
+  if (htmlReady && htmlHasEmptyI18nShells(html)) {
     parts.push(
       `${I18N_SANITY_PREFIX} ${countEmptyDataI18nNodes(html)} data-i18n tags have no visible fallback text. ` +
         'HTML MUST contain the default-language copy inside the tags (JS only swaps on toggle). ' +
         'Fix index.html ONCE — do not rewrite js/main.js in a loop.'
     )
   }
-  if (jsI18nDictLooksBroken(js) || jsAssignsNonStringToDom(js)) {
+  if (htmlReady && (jsI18nDictLooksBroken(js) || jsAssignsNonStringToDom(js))) {
     parts.push(
       `${I18N_SANITY_PREFIX} i18n *values* are objects/arrays assigned to textContent ([object Object]). ` +
         'Each translation must be a STRING. Nested ru/en maps of strings are OK. Fix js/main.js once — do not write tmp/check.js.'
@@ -193,13 +200,13 @@ export function formatI18nSanityHint(opts: { html?: string; js?: string }): stri
   const missingKeys = missingI18nKeysInJs(html, js)
   const htmlKeys = extractDataI18nKeys(html)
   const foundKeys = htmlKeys.filter((k) => jsHasI18nKey(js, k)).length
-  if (htmlKeys.length >= 3 && foundKeys < 2) {
+  if (htmlReady && htmlKeys.length >= 3 && foundKeys < 2) {
     parts.push(
       `${I18N_SANITY_PREFIX} data-i18n keys missing from JS dict: ${missingKeys.slice(0, 8).join(', ')}. ` +
         'Keys may be identifiers (heroSubtitle:) not only quoted strings. Align HTML keys with js/main.js in ONE write. Do NOT node -e / tmp/check.js.'
     )
   }
-  if (html.trim() && js.trim()) {
+  if (htmlReady && js.trim()) {
     const htmlIds = extractHtmlIds(html)
     const jsIds = extractJsIdSelectors(js)
     const langOk = htmlHasLangSwitcher(html)
@@ -208,7 +215,7 @@ export function formatI18nSanityHint(opts: { html?: string; js?: string }): stri
     if (!langOk && badToggle.length) {
       parts.push(
         `${I18N_SANITY_PREFIX} JS looks up #${badToggle[0]} but HTML has no such id. ` +
-          'Add the id, or bind .lang-btn[data-lang]. Do not invent check.js.'
+          'Put that id (or .lang-btn[data-lang]) on index.html ONCE. Do not rewrite js/main.js to chase missing markup.'
       )
     } else if (
       !parts.length &&
@@ -217,7 +224,7 @@ export function formatI18nSanityHint(opts: { html?: string; js?: string }): stri
     ) {
       parts.push(
         `${I18N_SANITY_PREFIX} JS looks up #${missingIds[0]} but HTML has no such id. ` +
-          'Match #id / data-i18n with the markup. Do not invent check.js.'
+          'Add the id to index.html — do not rewrite JS. Do not invent check.js.'
       )
     }
   }

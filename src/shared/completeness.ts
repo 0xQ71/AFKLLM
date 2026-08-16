@@ -98,6 +98,43 @@ function lastNonEmptyLine(text: string): string {
   return ''
 }
 
+export function countCssRuleBlocks(css: string): number {
+  const t = (css ?? '').replace(/\/\*[\s\S]*?\*\//g, '')
+  return (t.match(/\{[^{}]*\}/g) ?? []).length
+}
+
+/** Real stylesheet — not a comment stub or empty `:root {}`. */
+export function cssLooksLikeRealStylesheet(css: string): boolean {
+  const t = (css ?? '').trim()
+  if (t.length < 400) return false
+  return countCssRuleBlocks(t) >= 3
+}
+
+/** Drawn SVG — not `<svg></svg>` / a 6-line placeholder. */
+export function svgLooksLikeRealGraphic(svg: string): boolean {
+  const t = (svg ?? '').trim()
+  if (t.length < 150) return false
+  if (!/<svg[\s>]/i.test(t)) return false
+  return /<(?:path|circle|rect|polygon|polyline|ellipse|line|use)\b/i.test(t)
+}
+
+export function contentLooksLikeSourceStub(content: string, relativePath = ''): boolean {
+  const t = (content ?? '').trim()
+  if (!t) return true
+  const ext = extOf(relativePath)
+  if (ext === '.css') return !cssLooksLikeRealStylesheet(t)
+  if (ext === '.svg') return !svgLooksLikeRealGraphic(t)
+  return !contentLooksStructurallyComplete(t, relativePath)
+}
+
+export function formatStubOnDiskHint(relativePath: string, bytes: number): string {
+  const p = (relativePath ?? '').replace(/\\/g, '/') || 'this file'
+  return (
+    `STUB_ON_DISK: "${p}" is a placeholder (${bytes} bytes), not a finished file. ` +
+    'Call write_file overwrite=true with the FULL content. Do not apply_diff this stub.'
+  )
+}
+
 /**
  * True when the buffer looks like a finished source file for `relativePath`.
  * Without a path: HTML needs `</html>`; other languages use brace/JSON/Python heuristics.
@@ -110,6 +147,8 @@ export function contentLooksStructurallyComplete(
   if (!t) return false
   const ext = extOf(relativePath)
 
+  if (ext === '.css') return cssLooksLikeRealStylesheet(t)
+  if (ext === '.svg') return svgLooksLikeRealGraphic(t)
   if (ext === '.html' || ext === '.htm' || (!ext && looksLikeHtml(t))) {
     return /<\/html\s*>/i.test(t)
   }

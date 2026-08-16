@@ -5,6 +5,7 @@ import {
   parseSearchReplaceBlocks,
   type ApplyRegion
 } from '../../shared/fastApply'
+import { streamDeltaText } from '../../shared/llmDelta'
 import type { SearchReplaceBlock } from '../../shared/types'
 
 export interface FastApplyEditParams {
@@ -113,9 +114,7 @@ async function callApplyModel(
             }>
           }
           const delta = json.choices?.[0]?.delta
-          const piece = String(
-            delta?.content ?? delta?.reasoning_content ?? delta?.reasoning ?? ''
-          )
+          const piece = streamDeltaText(delta)
           if (piece) {
             text += piece
             opts?.onToken?.(piece)

@@ -46,6 +46,8 @@ import {
   displayThinkProse,
   extractThinkInner,
   pendingPlanWork,
+  isFileWorkPlanStep,
+  shouldNudgeRemainingFileWork,
   isBrowserPlanStep,
   settlePlanAfterWork,
   isJunkPlanStep,
@@ -60,14 +62,20 @@ import {
   detectProseStutter,
   dedupeStutteringProse,
   looksLikeChatQa,
+  looksLikeImageQa,
   looksLikeFileEditRequest,
   looksLikeSurgicalFollowUp,
   looksLikeI18nFollowUp,
   looksLikeThemeToggleRequest,
   looksLikeExplicitRewrite,
   looksLikeFromScratchTask,
+  looksLikeFinishMissingLandingFiles,
   allowsComposerFullRewrite,
   shouldBlockSurgicalOverwrite,
+  shouldBlockSurgicalCssRewrite,
+  cssLooksLikeRealStylesheet,
+  contentLooksLikeSourceStub,
+  formatStubOnDiskHint,
   shouldHandoffWriteToApply,
   shouldPersistIncompleteWrite,
   priorCompleteForWritePath,
@@ -137,6 +145,7 @@ import {
 import {
   formatWriteFileRequiredError,
   formatWriteOnceError,
+  formatLandingJsBeforeHtmlHint,
   landingBundleReady,
   shouldRefuseLandingRewrite,
   shouldRequireWriteFileForApply
@@ -873,7 +882,15 @@ describe('agent todo plan', () => {
     const deduped = dedupeStutteringProse(`Ответ короткий.${dashed}`)
     assert.ok(deduped.includes('Ответ короткий'))
     assert.ok(!deduped.includes(dashBlock.repeat(2)))
+    assert.equal(looksLikeChatQa('что на этом фото'), true)
+    assert.equal(looksLikeImageQa('что на этом фото', true), true)
+    assert.equal(looksLikeImageQa('что на этом фото', false), false)
+    assert.equal(looksLikeImageQa('сделай лендинг по этому скрину', true), false)
+    assert.equal(looksLikeImageQa('исправь кнопку на скрине', true), false)
     assert.equal(looksLikeChatQa('что лучше одеть'), true)
+    const signOffLoop =
+      'Яблоки на тарелке.\n\n---\nЗадача завершена.\n\n---\nДо новых встреч!\n\n---\nГотов к новым задачам!\n\n---\nЗадача завершена.\n\n---\nКонец сообщения.'
+    assert.equal(detectProseStutter(signOffLoop), true)
     assert.equal(looksLikeChatQa('какая погода сейчас в Москвее'), true)
     assert.equal(looksLikeChatQa('исправь index.html hero'), false)
     assert.equal(looksLikeChatQa('а если я как печка'), true)
@@ -2407,24 +2424,30 @@ describe('i18n sanity', () => {
       "el.textContent = t.featurePrivacy;\n"
     assert.equal(jsI18nDictLooksBroken(brokenJs), true)
     const hint = formatI18nSanityHint({ js: brokenJs })
-    assert.ok(hint)
-    assert.match(hint!, /I18N_SANITY/)
-    assert.match(hint!, /object Object/)
-    assert.match(formatI18nCloserWhy(hint!, 'ru'), /объект/)
+    assert.equal(hint, null)
+    const page = '<!DOCTYPE html><html><body><h1>AFKLLM</h1></body></html>'
+    const brokenOnPage = formatI18nSanityHint({ html: page, js: brokenJs })
+    assert.match(brokenOnPage ?? '', /I18N_SANITY/)
+    assert.match(brokenOnPage ?? '', /object Object/)
+    assert.match(formatI18nCloserWhy(brokenOnPage!, 'ru'), /объект/)
     const okJs =
       "const t = { ru: { hero: 'Привет' }, en: { hero: 'Hello' } };\n" +
       "document.querySelector('[data-i18n=\"hero\"]').textContent = t[lang].hero;\n"
     assert.equal(jsI18nDictLooksBroken(okJs), false)
     assert.equal(formatI18nSanityHint({ js: okJs }), null)
-    const html = '<h1 data-i18n="hero_title">AFKLLM</h1><p data-i18n="hero_sub">Local IDE</p>'
+    const html = '<!DOCTYPE html><html><body>' +
+      '<h1 data-i18n="hero_title">AFKLLM</h1><p data-i18n="hero_sub">Local IDE</p>' +
+      '</body></html>'
     const jsIds = "document.getElementById('hero-title').textContent = t.hero;\n" +
       "document.querySelector('#hero-subtitle').textContent = t.sub;\n"
     assert.equal(htmlJsI18nMismatch(html, jsIds), true)
-    assert.match(formatI18nSanityHint({ html, js: jsIds }) ?? '', /I18N_SANITY/)
+    assert.match(formatI18nSanityHint({ html, js: jsIds }) ?? '', /do not rewrite JS/i)
     const landingHtml =
+      '<!DOCTYPE html><html><body>' +
       '<nav><ul class="nav-links"></ul><button id="langToggle">EN</button></nav>' +
       '<h1 data-i18n="nav-how">Как</h1><p data-i18n="cta-download">Скачать</p>' +
-      '<p data-i18n="features-title">Возможности</p><p data-i18n="why-title">Почему</p>'
+      '<p data-i18n="features-title">Возможности</p><p data-i18n="why-title">Почему</p>' +
+      '</body></html>'
     const landingJs =
       "const i18n = { ru: { 'nav-how-it-works': 'Как', 'btn-download': 'Скачать' } };\n" +
       "document.getElementById('lang-toggle').addEventListener('click', () => {});\n" +
@@ -2440,7 +2463,8 @@ describe('i18n sanity', () => {
       '<h3 data-i18n="feature1.title"></h3><p data-i18n="feature1.desc"></p>' +
       '<a data-i18n="hero.cta1">Download for Windows</a>'
     assert.equal(htmlHasEmptyI18nShells(emptyHtml), true)
-    const hint = formatI18nSanityHint({ html: emptyHtml })
+    const emptyPage = `<!DOCTYPE html><html><body>${emptyHtml}</body></html>`
+    const hint = formatI18nSanityHint({ html: emptyPage })
     assert.ok(hint)
     assert.match(hint!, /I18N_SANITY/)
     assert.match(hint!, /visible fallback/)
@@ -2479,6 +2503,19 @@ describe('i18n sanity', () => {
     assert.equal(inventedI18nVerifierPath('check.js', landing), true)
     assert.equal(inventedI18nVerifierPath('js/main.js', landing), false)
     assert.equal(inventedI18nVerifierPath('tmp/check.js', 'напиши tmp/check.js для аудита ключей'), false)
+  })
+
+  it('does not treat missing HTML ids as a JS bug before index.html exists', () => {
+    const js =
+      "document.getElementById('lang-switcher').addEventListener('click', () => {});\n" +
+      "document.getElementById('download-cta').href = 'https://github.com';\n"
+    assert.equal(formatI18nSanityHint({ js }), null)
+    assert.equal(
+      formatI18nSanityHint({ html: '<div id="app"></div>', js }),
+      null
+    )
+    assert.match(formatLandingJsBeforeHtmlHint(), /LANDING_ORDER/)
+    assert.match(formatLandingJsBeforeHtmlHint(), /Do NOT rewrite/)
   })
 })
 
@@ -2543,6 +2580,25 @@ describe('landing WRITE_ONCE cap', () => {
     ])
     assert.equal(landingBundleReady(m), true)
     assert.equal(landingBundleReady(new Map([['styles.css', 1]])), false)
+  })
+
+  it('stub CSS/SVG are not complete and do not lock WRITE_ONCE', () => {
+    const stubCss = '/* AFKLLM landing */\n:root { --bg: #0a0a0f; }\n'
+    const stubSvg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"></svg>\n'
+    assert.equal(contentLooksStructurallyComplete(stubCss, 'styles.css'), false)
+    assert.equal(contentLooksLikeSourceStub(stubCss, 'styles.css'), true)
+    assert.equal(contentLooksStructurallyComplete(stubSvg, 'assets/icon-agent.svg'), false)
+    assert.equal(
+      shouldRefuseLandingRewrite({
+        path: 'styles.css',
+        completeWritesThisTurn: 0,
+        recoveryUsedOnPath: false,
+        sanityFailedOnThisPath: false
+      }),
+      'ok'
+    )
+    assert.match(formatStubOnDiskHint('styles.css', stubCss.length), /STUB_ON_DISK/)
+    assert.match(formatStubOnDiskHint('styles.css', stubCss.length), /overwrite=true/)
   })
 })
 
@@ -2810,6 +2866,48 @@ describe('composer apply handoff', () => {
     )
   })
 
+  it('finish-missing HTML/CSS is not surgical CSS on an empty disk', () => {
+    const finish = 'не трогай JS, допиши index.html и styles.css'
+    assert.equal(looksLikeFinishMissingLandingFiles(finish), true)
+    assert.equal(looksLikeFromScratchTask(finish), true)
+    assert.equal(looksLikeSurgicalFollowUp(finish), false)
+    assert.equal(allowsComposerFullRewrite(finish), true)
+    assert.equal(
+      shouldHandoffWriteToApply({ userText: finish, relativePath: 'styles.css' }),
+      false
+    )
+    assert.equal(shouldBlockSurgicalCssRewrite({ userText: finish, cssOnDisk: '' }), false)
+    assert.equal(
+      shouldBlockSurgicalCssRewrite({
+        userText: finish,
+        cssOnDisk: '/* stub */\n:root { --x: 1; }\n'
+      }),
+      false
+    )
+    const realCss =
+      ':root { --bg: #0a0a0f; --fg: #e8e8ef; --accent: #7c3aed; --muted: #9ca3af; }\n' +
+      'body { margin: 0; background: var(--bg); color: var(--fg); font-family: system-ui, sans-serif; line-height: 1.6; }\n' +
+      '.navbar { display: flex; gap: 16px; align-items: center; padding: 12px 24px; backdrop-filter: blur(16px); }\n' +
+      '.hero { min-height: 70vh; padding: 80px 24px; background: radial-gradient(ellipse at top, #1a1030, #0a0a0f); }\n' +
+      '.feature-card { border-radius: 12px; backdrop-filter: blur(16px); border: 1px solid rgba(255,255,255,0.08); padding: 24px; }\n'
+    assert.equal(cssLooksLikeRealStylesheet(realCss), true)
+    assert.equal(
+      shouldBlockSurgicalCssRewrite({
+        userText: 'поправь только navbar в styles.css без полной переписи',
+        cssOnDisk: realCss
+      }),
+      true
+    )
+    assert.equal(
+      shouldBlockSurgicalOverwrite({
+        userText: finish,
+        relativePath: 'styles.css',
+        overwrite: true
+      }),
+      false
+    )
+  })
+
   it('long landing rebuild without «с нуля» still skips Apply handoff', () => {
     const user =
       'Сделай полноценный профессиональный многофайловый лендинг продукта AFKLLM. ' +
@@ -2973,6 +3071,48 @@ describe('composer apply handoff', () => {
       '</p></body></html>\n'
     assert.equal(isWholeFileSearchBlock(html.length, html.length), true)
     assert.equal(isWholeFileSearchBlock(40, html.length), false)
+  })
+
+  it('keeps file-work nudge after CSS/JS writes when index.html is still open', () => {
+    assert.equal(isFileWorkPlanStep('Write index.html — full landing structure'), true)
+    assert.equal(isFileWorkPlanStep('Write README.md — brief instructions'), true)
+    assert.equal(isFileWorkPlanStep('web_search for weather'), false)
+    assert.equal(
+      shouldNudgeRemainingFileWork({
+        fileWorkCount: 2,
+        completedTools: 7,
+        landingComplete: false,
+        missingNamedFiles: true,
+        surgicalFollowUp: false,
+        mutatingEditOk: true,
+        planFinishNudges: 0
+      }),
+      true
+    )
+    assert.equal(
+      shouldNudgeRemainingFileWork({
+        fileWorkCount: 1,
+        completedTools: 1,
+        landingComplete: true,
+        missingNamedFiles: false,
+        surgicalFollowUp: false,
+        mutatingEditOk: true,
+        planFinishNudges: 0
+      }),
+      false
+    )
+    assert.equal(
+      shouldNudgeRemainingFileWork({
+        fileWorkCount: 1,
+        completedTools: 1,
+        landingComplete: false,
+        missingNamedFiles: true,
+        surgicalFollowUp: true,
+        mutatingEditOk: true,
+        planFinishNudges: 0
+      }),
+      false
+    )
   })
 })
 

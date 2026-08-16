@@ -1,4 +1,5 @@
 import type { ReactNode } from 'react'
+import type { DiscoveredModel } from '../../../../shared/settings'
 
 export function Well({ children }: { children: ReactNode }): React.JSX.Element {
   return (
@@ -92,3 +93,57 @@ export const settingsBtnClass =
 
 export const settingsPrimaryBtnClass =
   'rounded-md bg-signal px-3 py-1.5 text-xs text-signal-on hover:bg-signal-dim disabled:opacity-50'
+
+export function PathSelect({
+  value,
+  options,
+  onChange,
+  emptyLabel,
+  onStore,
+  onBrowse,
+  storeLabel,
+  browseLabel
+}: {
+  value: string
+  options: DiscoveredModel[]
+  onChange: (path: string) => void
+  emptyLabel: string
+  onStore?: () => void
+  onBrowse?: () => void
+  storeLabel?: string
+  browseLabel?: string
+}): React.JSX.Element {
+  return (
+    <div className="flex gap-2">
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className={settingsInputClass + ' min-w-0 flex-1 font-mono text-xs'}
+      >
+        <option value="">{emptyLabel}</option>
+        {options.map((m) => (
+          <option key={m.path} value={m.path}>
+            {m.id} ({(m.sizeBytes / 1e9).toFixed(1)} GB)
+          </option>
+        ))}
+        {value && !options.some((m) => m.path === value) && (
+          <option value={value}>{value.split(/[/\\]/).pop()}</option>
+        )}
+      </select>
+      {onStore ? (
+        <button
+          type="button"
+          className={settingsBtnClass + ' text-signal border-signal/40'}
+          onClick={onStore}
+        >
+          {storeLabel ?? 'Store'}
+        </button>
+      ) : null}
+      {onBrowse ? (
+        <button type="button" className={settingsBtnClass} onClick={onBrowse}>
+          {browseLabel ?? 'Browse'}
+        </button>
+      ) : null}
+    </div>
+  )
+}

@@ -76,17 +76,20 @@ export async function scanMmprojFiles(root: string): Promise<DiscoveredModel[]> 
 }
 
 /**
- * Prefer an explicit path; otherwise pick the *mmproj*.gguf in the same folder
- * that best matches the vision GGUF name (not localeCompare-first).
+ * Prefer an explicit path when it matches the model family; otherwise pick
+ * the *mmproj*.gguf in the same folder that best matches the vision GGUF.
+ * Never return an Ornith projector for Gemma (n_embd mismatch).
  */
 export async function findMmprojForModel(
   visionModelPath: string,
   explicitMmprojPath?: string
 ): Promise<string | null> {
+  const model = visionModelPath?.trim() || ''
   const explicit = explicitMmprojPath?.trim()
-  if (explicit && existsSync(explicit)) return explicit
+  if (explicit && existsSync(explicit)) {
+    if (!model || scoreMmprojForVision(explicit, model) >= 0) return explicit
+  }
 
-  const model = visionModelPath?.trim()
   if (!model || !existsSync(model)) return null
 
   const dir = dirname(model)
@@ -99,6 +102,7 @@ export async function findMmprojForModel(
     for (const n of mmprojs) {
       const full = join(dir, n)
       const score = scoreMmprojForVision(full, model)
+      if (score < 0) continue
       if (!best || score > best.score) best = { path: full, score }
     }
     if (best) return best.path

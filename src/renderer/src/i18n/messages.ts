@@ -323,7 +323,10 @@ const en = {
   'settings.multimodal.visionSameAsChatHint':
     'Uses the Chat GGUF + mmproj in one llama-server. Does not load a second copy.',
   'settings.multimodal.mmproj': 'Vision mmproj (.gguf)',
-  'settings.multimodal.mmprojHint': 'Empty = auto-pick *mmproj* next to the vision model',
+  'settings.multimodal.mmprojHint': 'Empty = auto-pick a matching *mmproj* next to the model',
+  'settings.multimodal.mmprojAuto': 'Auto (match Chat / Vision)',
+  'settings.multimodal.mmprojMismatch':
+    'This projector does not match the selected GGUF (e.g. Ornith mmproj on Gemma). Chat will load without vision until you pick a matching mmproj.',
   'settings.multimodal.imageGenModel': 'Image gen model (diffusion)',
   'settings.multimodal.imageGenHint': 'FLUX / SD3.5 / SDXL .gguf or .safetensors',
   'settings.multimodal.stackHint':
@@ -666,6 +669,7 @@ const en = {
   'status.detail.loadingModel': 'Loading model…',
   'status.detail.spawning': 'Starting llama-server…',
   'status.detail.mtpRetry': 'MTP flags unsupported · retrying without…',
+  'status.detail.mmprojRetry': 'mmproj mismatch · loading chat without vision…',
   'status.detail.loadingWeights': 'Loading model weights…',
   'status.detail.offloadingGpu': 'Offloading to GPU…',
   'status.detail.imageTimedOut': 'Image gen: timed out',
@@ -1078,7 +1082,10 @@ const ru: Record<MessageKey, string> = {
   'settings.multimodal.visionSameAsChatHint':
     'Chat GGUF + mmproj на одном llama-server. Вторая копия не грузится.',
   'settings.multimodal.mmproj': 'Vision mmproj (.gguf)',
-  'settings.multimodal.mmprojHint': 'Пусто = авто *mmproj* рядом с vision-моделью',
+  'settings.multimodal.mmprojHint': 'Пусто = авто подходящий *mmproj* рядом с моделью',
+  'settings.multimodal.mmprojAuto': 'Авто (под Chat / Vision)',
+  'settings.multimodal.mmprojMismatch':
+    'Этот projector не подходит к выбранному GGUF (например Ornith mmproj на Gemma). Chat загрузится без vision, пока не выберете парный mmproj.',
   'settings.multimodal.imageGenModel': 'Модель генерации (diffusion)',
   'settings.multimodal.imageGenHint': 'FLUX / SD3.5 / SDXL .gguf или .safetensors',
   'settings.multimodal.stackHint':
@@ -1421,6 +1428,7 @@ const ru: Record<MessageKey, string> = {
   'status.detail.loadingModel': 'Загрузка модели…',
   'status.detail.spawning': 'Запуск llama-server…',
   'status.detail.mtpRetry': 'Флаги MTP не поддерживаются · повтор без них…',
+  'status.detail.mmprojRetry': 'mmproj не подходит · грузим chat без vision…',
   'status.detail.loadingWeights': 'Загрузка весов модели…',
   'status.detail.offloadingGpu': 'Выгрузка на GPU…',
   'status.detail.imageTimedOut': 'Генерация изображения: таймаут',

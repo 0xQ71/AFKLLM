@@ -303,7 +303,8 @@ const api = {
     restart: (): Promise<LlmRuntimeStatus> => ipcRenderer.invoke('llm:restart'),
     unload: (): Promise<LlmRuntimeStatus> => ipcRenderer.invoke('llm:unload'),
     listModels: (): Promise<DiscoveredModel[]> => ipcRenderer.invoke('llm:list-models'),
-    listMmproj: (): Promise<DiscoveredModel[]> => ipcRenderer.invoke('llm:list-mmproj')
+    listMmproj: (): Promise<DiscoveredModel[]> => ipcRenderer.invoke('llm:list-mmproj'),
+    listWeights: (): Promise<DiscoveredModel[]> => ipcRenderer.invoke('llm:list-weights')
   },
 
   slots: {

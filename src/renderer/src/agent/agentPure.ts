@@ -6,11 +6,17 @@ import { looksLikeOpenHtmlCommand } from '../../../shared/localPreview'
 import {
   contentLooksStructurallyComplete as contentLooksStructurallyCompleteV2,
   isLandingJsPath,
-  isSourcePath
+  isSourcePath,
+  cssLooksLikeRealStylesheet
 } from './loop/completeness'
 import { advanceTodosOnEvidence } from './loop/plan'
 
-export { looksLikeOpenHtmlCommand, isLandingJsPath, isSourcePath }
+export { looksLikeOpenHtmlCommand, isLandingJsPath, isSourcePath, cssLooksLikeRealStylesheet }
+export {
+  svgLooksLikeRealGraphic,
+  contentLooksLikeSourceStub,
+  formatStubOnDiskHint
+} from '../../../shared/completeness'
 
 export type ChatRole = 'system' | 'user' | 'assistant' | 'tool'
 
@@ -718,6 +724,18 @@ export function isToolOrientedPlanStep(text: string): boolean {
   return false
 }
 
+/** Finish remaining landing files (HTML/CSS) without touching JS. Not a surgical CSS tweak. */
+export function looksLikeFinishMissingLandingFiles(userText: string): boolean {
+  const t = (userText ?? '').trim()
+  if (!t) return false
+  const mentionsHtmlCss = /index\.html|styles\.css|\.css\b/i.test(t)
+  const finish =
+    /допиши|доделай|дописать|finish|remaining|missing|напиши\s+(index|styles)|не\s+трогай\s+js|don't\s+touch\s+(the\s+)?js|не\s+меняй\s+js/i.test(
+      t
+    )
+  return mentionsHtmlCss && finish
+}
+
 /** True when the user is asking to build a full landing / new page from scratch. */
 export function looksLikeLandingBuildTask(userText: string): boolean {
   const t = userText ?? ''
@@ -1221,6 +1239,14 @@ export function looksLikeFileEditRequest(userText: string): boolean {
  * Used to abort the stream early instead of burning max_tokens.
  */
 export function detectProseStutter(text: string): boolean {
+  if (
+    (text.match(
+      /задача завершена|до новых встреч|готов к новым задачам|конечный ответ|конец сообщения/gi
+    ) ?? []).length >= 3
+  ) {
+    return true
+  }
+  if ((text.match(/\n\s*---\s*\n/g) ?? []).length >= 5) return true
   if (text.length < 240) return false
   const maxUnit = Math.min(280, Math.floor(text.length / 3))
   for (let size = 48; size <= maxUnit; size++) {
@@ -1334,7 +1360,7 @@ export function looksLikeChatQa(
     return false
   }
   if (
-    /\?$|погод|weather|одеть|надеть|wear|что\s+лучше|как\s+(лучше|одеться)|посоветуй|recommend|сколько\s+градус|какая\s+погода|какой\s+прогноз|печк|жаркт|мерзн|замёрз|замерз|hot\s+person|i'?m\s+hot|i'?m\s+cold/i.test(
+    /\?$|погод|weather|одеть|надеть|wear|что\s+лучше|как\s+(лучше|одеться)|посоветуй|recommend|сколько\s+градус|какая\s+погода|какой\s+прогноз|печк|жаркт|мерзн|замёрз|замерз|hot\s+person|i'?m\s+hot|i'?m\s+cold|что\s+на\s+.{0,16}(фото|картинк|изображен|скрин)|что\s+(это|тут|здесь)\s*\??$|опиши\s+(фото|картинк|изображен)|what('s|\s+is)\s+(on\s+|in\s+)?(this\s+)?(photo|image|picture)|describe\s+(the\s+)?(photo|image|picture)/i.test(
       t
     )
   ) {
@@ -1371,6 +1397,22 @@ export function looksLikeChatQa(
     if (threadLooksLikeAdvice) return true
   }
   return false
+}
+
+/**
+ * Attached image + “what’s in this photo” — answer in prose, never a coding plan.
+ * Screenshots that ask to fix/build a page stay on the agent loop.
+ */
+export function looksLikeImageQa(userText: string, hasImages: boolean): boolean {
+  if (!hasImages) return false
+  const t = userText.trim()
+  if (!t) return true
+  if (looksLikeChatQa(t)) return true
+  if (looksLikeFileEditRequest(t) || looksLikeLandingBuildTask(t)) return false
+  return (
+    t.length <= 180 &&
+    /фото|картинк|изображен|скрин|image|photo|picture/i.test(t)
+  )
 }
 
 /** User asked to add a light/dark (or theme) control. */
@@ -1421,8 +1463,27 @@ export function shouldBlockSurgicalOverwrite(opts: {
 }): boolean {
   if (!opts.overwrite) return false
   if (looksLikeExplicitRewrite(opts.userText)) return false
+  if (looksLikeFinishMissingLandingFiles(opts.userText)) return false
   if (!looksLikeSurgicalFollowUp(opts.userText)) return false
   return isComposerApplyPath(opts.relativePath)
+}
+
+/**
+ * Full CSS rewrite is only blocked when a real stylesheet is already on disk
+ * and the user asked for a surgical tweak — not “finish missing styles.css”.
+ */
+export function shouldBlockSurgicalCssRewrite(opts: {
+  userText: string
+  cssOnDisk?: string
+}): boolean {
+  const t = opts.userText ?? ''
+  if (looksLikeExplicitRewrite(t) || looksLikeFinishMissingLandingFiles(t)) return false
+  if (looksLikeFromScratchTask(t)) return false
+  if (!cssLooksLikeRealStylesheet(opts.cssOnDisk ?? '')) return false
+  return (
+    looksLikeSurgicalFollowUp(t) ||
+    (looksLikeFileEditRequest(t) && !looksLikeLandingBuildTask(t))
+  )
 }
 
 /**
@@ -1453,6 +1514,7 @@ export function shouldHandoffWriteToApply(opts: {
   if (!isComposerApplyPath(p)) return false
   const t = opts.userText ?? ''
   if (allowsComposerFullRewrite(t)) return false
+  if (looksLikeFinishMissingLandingFiles(t)) return false
   if (looksLikeThemeToggleRequest(t)) return true
   if (looksLikeI18nFollowUp(t)) return true
   if (looksLikeSurgicalFollowUp(t)) return true
@@ -1520,6 +1582,7 @@ export { isWholeFileSearchBlock } from '../../../shared/writeThresholds'
 export function looksLikeFromScratchTask(userText: string): boolean {
   const t = userText.trim()
   if (!t) return false
+  if (looksLikeFinishMissingLandingFiles(t)) return true
   if (looksLikeLandingBuildTask(t) && (t.length > 400 || /с\s*нуля|from\s+scratch/i.test(t))) {
     return true
   }
@@ -1539,6 +1602,7 @@ export function looksLikeSurgicalFollowUp(userText: string): boolean {
   const t = userText.trim()
   if (!t) return false
   if (looksLikeFromScratchTask(t)) return false
+  if (looksLikeFinishMissingLandingFiles(t)) return false
   if (looksLikeChatQa(t)) return false
   return (
     /без\s+полной\s+перепис|without\s+(a\s+)?full\s+rewrite|не\s+переписывай\s+цел/i.test(t) ||
@@ -1800,6 +1864,41 @@ export function pendingPlanWork(steps: AgentTodoStep[]): AgentTodoStep[] {
       !isFluffPlanStep(s.text) &&
       !isSoftLayoutPlanStep(s.text)
   )
+}
+
+/** Plan row that still needs a file write/patch (not search / weather fluff). */
+export function isFileWorkPlanStep(text: string): boolean {
+  const t = text ?? ''
+  if (/web_search|поиск\s+в\s+интернет|искать\s+в\s+интернет|погод|weather/i.test(t)) {
+    return false
+  }
+  return (
+    /write_file|apply_diff|apply_patch|index\.html|\.css|\.js|\.md\b|readme|файл|созда|исправ|правк|edit|patch|html|секци/i.test(
+      t
+    ) || looksLikeLandingBuildTask(t)
+  )
+}
+
+/**
+ * Keep the tool loop going when CSS/JS already landed but index.html / README
+ * (or other named files) are still open. Surgical follow-ups that already
+ * patched must not be dragged back into a landing rewrite.
+ */
+export function shouldNudgeRemainingFileWork(opts: {
+  fileWorkCount: number
+  completedTools: number
+  landingComplete: boolean
+  missingNamedFiles: boolean
+  surgicalFollowUp: boolean
+  mutatingEditOk: boolean
+  planFinishNudges: number
+  maxNudges?: number
+}): boolean {
+  if (opts.fileWorkCount <= 0 || opts.completedTools <= 0) return false
+  if (opts.planFinishNudges >= (opts.maxNudges ?? 3)) return false
+  if (opts.surgicalFollowUp && opts.mutatingEditOk) return false
+  if (opts.landingComplete && !opts.missingNamedFiles) return false
+  return true
 }
 
 /** Mark plan steps done when HTML/content clearly contains that section. */

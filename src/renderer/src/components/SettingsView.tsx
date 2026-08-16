@@ -12,7 +12,7 @@ import {
 import type { UiLanguage } from '../../../shared/i18n'
 import type { McpServerConfig, McpServerStatus } from '../../../shared/mcp'
 import { applyDocumentTheme, UI_THEMES } from '../../../shared/theme'
-import { visionReusesChatModel, VISION_SAME_AS_CHAT, isVisionSameAsChat } from '../../../shared/visionDetect'
+import { scoreMmprojForVision, visionReusesChatModel, VISION_SAME_AS_CHAT, isVisionSameAsChat } from '../../../shared/visionDetect'
 import { parseTelemetryLogText } from '../../../shared/telemetry'
 import { applyMonacoTheme } from '../editor/monacoSetup'
 import { useI18n } from '../i18n/I18nProvider'
@@ -32,6 +32,7 @@ import type { UpdaterCheckResult } from '../../../shared/updater'
 import { PAGE_TITLE, SETTINGS_NAV, type SettingsPageId } from './settings/nav'
 import {
   Field,
+  PathSelect,
   SettingRow,
   Toggle,
   Well,
@@ -39,6 +40,45 @@ import {
   settingsInputClass,
   settingsPrimaryBtnClass
 } from './settings/ui'
+
+function leafName(path: string): string {
+  return path.replace(/^.*[/\\]/, '').toLowerCase()
+}
+
+function filterWeights(
+  weights: DiscoveredModel[],
+  kind: 'model' | 'vae' | 'clipL' | 'clipG' | 't5' | 'llm'
+): DiscoveredModel[] {
+  const hit = (w: DiscoveredModel, re: RegExp): boolean => re.test(leafName(w.path))
+  let out: DiscoveredModel[]
+  switch (kind) {
+    case 'vae':
+      out = weights.filter((w) => hit(w, /vae|^ae\.|\bae[-_.]/))
+      break
+    case 'clipL':
+      out = weights.filter((w) => hit(w, /clip[_-]?l/))
+      break
+    case 'clipG':
+      out = weights.filter((w) => hit(w, /clip[_-]?g/))
+      break
+    case 't5':
+      out = weights.filter((w) => hit(w, /t5xxl|t5-xxl|t5_/))
+      break
+    case 'llm':
+      out = weights.filter(
+        (w) => hit(w, /qwen|mistral|llm/) && !hit(w, /mmproj|vae|clip|t5/)
+      )
+      break
+    default:
+      out = weights.filter(
+        (w) =>
+          !hit(w, /mmproj/) &&
+          (hit(w, /flux|sdxl|sd3|stable.?diff|klein|dev/) ||
+            !hit(w, /vae|clip[_-]?[lg]|t5xxl|t5-xxl|^ae\./))
+      )
+  }
+  return out.length > 0 ? out : weights
+}
 
 export interface SettingsViewProps {
   open: boolean
@@ -61,6 +101,8 @@ export function SettingsView({
   const [page, setPage] = useState<SettingsPageId>(initialPage)
   const [settings, setSettings] = useState<AppSettings | null>(null)
   const [models, setModels] = useState<DiscoveredModel[]>([])
+  const [mmprojs, setMmprojs] = useState<DiscoveredModel[]>([])
+  const [weights, setWeights] = useState<DiscoveredModel[]>([])
   const [busy, setBusy] = useState(false)
   const [message, setMessage] = useState<string | null>(null)
   const [saveOk, setSaveOk] = useState(false)
@@ -79,8 +121,14 @@ export function SettingsView({
     void (async () => {
       const s = await window.api.settings.get()
       setSettings(s)
-      const list = await window.api.llm.listModels()
+      const [list, mm, w] = await Promise.all([
+        window.api.llm.listModels(),
+        window.api.llm.listMmproj(),
+        window.api.llm.listWeights()
+      ])
       setModels(list)
+      setMmprojs(mm)
+      setWeights(w)
       try {
         setMcpStatus(await window.api.mcp.status())
       } catch {
@@ -180,8 +228,14 @@ export function SettingsView({
     setSettings((prev) => (prev ? { ...prev, modelsDir: dir } : prev))
     try {
       let next = await window.api.settings.save({ modelsDir: dir })
-      const list = await window.api.llm.listModels()
+      const [list, mm, w] = await Promise.all([
+        window.api.llm.listModels(),
+        window.api.llm.listMmproj(),
+        window.api.llm.listWeights()
+      ])
       setModels(list)
+      setMmprojs(mm)
+      setWeights(w)
       if (
         list.length > 0 &&
         (!next.modelPath || !list.some((m) => m.path === next.modelPath))
@@ -271,6 +325,8 @@ export function SettingsView({
                     settings={settings}
                     patch={patch}
                     models={models}
+                    mmprojs={mmprojs}
+                    weights={weights}
                     llmStatus={llmStatus}
                     busy={busy}
                     modelActionBusy={modelActionBusy}
@@ -389,7 +445,15 @@ export function SettingsView({
           }
           setStoreOpen(false)
           setMessage(t('store.imported', { path: localPath }))
-          void window.api.llm.listModels().then(setModels).catch(() => {
+          void Promise.all([
+            window.api.llm.listModels(),
+            window.api.llm.listMmproj(),
+            window.api.llm.listWeights()
+          ]).then(([list, mm, w]) => {
+            setModels(list)
+            setMmprojs(mm)
+            setWeights(w)
+          }).catch(() => {
             /* ignore */
           })
         }}
@@ -722,6 +786,8 @@ function ModelPage({
   settings,
   patch,
   models,
+  mmprojs,
+  weights,
   llmStatus,
   busy,
   modelActionBusy,
@@ -734,6 +800,8 @@ function ModelPage({
   settings: AppSettings
   patch: <K extends keyof AppSettings>(key: K, value: AppSettings[K]) => void
   models: DiscoveredModel[]
+  mmprojs: DiscoveredModel[]
+  weights: DiscoveredModel[]
   llmStatus: LlmRuntimeStatus | null
   busy: boolean
   modelActionBusy: boolean
@@ -749,6 +817,12 @@ function ModelPage({
     visionPath: settings.visionModelPath,
     mmprojPath: settings.visionMmprojPath
   })
+  const mmTarget = reuseVision ? settings.modelPath : settings.visionModelPath
+  const mmMismatch = Boolean(
+    settings.visionMmprojPath?.trim() &&
+      mmTarget?.trim() &&
+      scoreMmprojForVision(settings.visionMmprojPath, mmTarget) < 0
+  )
   const [sdStatus, setSdStatus] = useState<SdRuntimeStatus | null>(null)
   const [sdBusy, setSdBusy] = useState(false)
   const [sdMessage, setSdMessage] = useState<string | null>(null)
@@ -1022,33 +1096,28 @@ function ModelPage({
             </button>
           </div>
         </Field>
-        <Field label={t('settings.multimodal.mmproj')}>
-          <div className="flex gap-2">
-            <input
-              value={settings.visionMmprojPath}
-              onChange={(e) => patch('visionMmprojPath', e.target.value)}
-              placeholder={t('settings.multimodal.mmprojHint')}
-              className={settingsInputClass + ' min-w-0 flex-1 font-mono text-xs'}
-            />
-            <button
-              type="button"
-              className={settingsBtnClass + ' text-signal border-signal/40'}
-              onClick={() => onOpenStore('mmproj')}
-            >
-              {t('settings.model.storeShort')}
-            </button>
-            <button
-              type="button"
-              className={settingsBtnClass}
-              onClick={() => {
-                void window.api.workspace.pickMmproj().then((p) => {
-                  if (p) patch('visionMmprojPath', p)
-                })
-              }}
-            >
-              {t('settings.model.browse')}
-            </button>
-          </div>
+        <Field
+          label={t('settings.multimodal.mmproj')}
+          hint={
+            mmMismatch
+              ? t('settings.multimodal.mmprojMismatch')
+              : t('settings.multimodal.mmprojHint')
+          }
+        >
+          <PathSelect
+            value={settings.visionMmprojPath}
+            options={mmprojs}
+            onChange={(p) => patch('visionMmprojPath', p)}
+            emptyLabel={t('settings.multimodal.mmprojAuto')}
+            onStore={() => onOpenStore('mmproj')}
+            onBrowse={() => {
+              void window.api.workspace.pickMmproj().then((p) => {
+                if (p) patch('visionMmprojPath', p)
+              })
+            }}
+            storeLabel={t('settings.model.storeShort')}
+            browseLabel={t('settings.model.browse')}
+          />
         </Field>
         <Toggle
           title={t('settings.model.visionKeep')}
@@ -1203,32 +1272,20 @@ function ModelPage({
       <p className="mb-2 text-[11px] text-ink-mute">{t('settings.multimodal.agentGateHint')}</p>
       <Well>
         <Field label={t('settings.multimodal.imageGenModel')}>
-          <div className="flex gap-2">
-            <input
-              value={settings.imageGenModelPath}
-              onChange={(e) => patch('imageGenModelPath', e.target.value)}
-              placeholder={t('settings.multimodal.imageGenHint')}
-              className={settingsInputClass + ' min-w-0 flex-1 font-mono text-xs'}
-            />
-            <button
-              type="button"
-              className={settingsBtnClass + ' text-signal border-signal/40'}
-              onClick={() => onOpenStore('imageGen')}
-            >
-              {t('settings.model.storeShort')}
-            </button>
-            <button
-              type="button"
-              className={settingsBtnClass}
-              onClick={() => {
-                void window.api.workspace.pickImageGenModel().then((p) => {
-                  if (p) patch('imageGenModelPath', p)
-                })
-              }}
-            >
-              {t('settings.model.browse')}
-            </button>
-          </div>
+          <PathSelect
+            value={settings.imageGenModelPath}
+            options={filterWeights(weights, 'model')}
+            onChange={(p) => patch('imageGenModelPath', p)}
+            emptyLabel={t('settings.multimodal.none')}
+            onStore={() => onOpenStore('imageGen')}
+            onBrowse={() => {
+              void window.api.workspace.pickImageGenModel().then((p) => {
+                if (p) patch('imageGenModelPath', p)
+              })
+            }}
+            storeLabel={t('settings.model.storeShort')}
+            browseLabel={t('settings.model.browse')}
+          />
         </Field>
         <p className="px-1 text-[11px] leading-snug text-ink-mute">
           {t('settings.multimodal.stackHint')}
@@ -1241,62 +1298,50 @@ function ModelPage({
             [
               'imageGenVaePath',
               'settings.multimodal.vae',
-              'settings.multimodal.vaeHint',
-              'imageGenVae'
+              'imageGenVae',
+              'vae'
             ],
             [
               'imageGenClipLPath',
               'settings.multimodal.clipL',
-              'settings.multimodal.clipLHint',
-              'imageGenClipL'
+              'imageGenClipL',
+              'clipL'
             ],
             [
               'imageGenClipGPath',
               'settings.multimodal.clipG',
-              'settings.multimodal.clipGHint',
-              'imageGenClipG'
+              'imageGenClipG',
+              'clipG'
             ],
             [
               'imageGenT5Path',
               'settings.multimodal.t5',
-              'settings.multimodal.t5Hint',
-              'imageGenT5'
+              'imageGenT5',
+              't5'
             ],
             [
               'imageGenLlmPath',
               'settings.multimodal.llm',
-              'settings.multimodal.llmHint',
-              'imageGenLlm'
+              'imageGenLlm',
+              'llm'
             ]
           ] as const
-        ).map(([key, labelKey, hintKey, storeKey]) => (
+        ).map(([key, labelKey, storeKey, kind]) => (
           <Field key={key} label={t(labelKey)}>
-            <div className="flex gap-2">
-              <input
-                value={settings[key]}
-                onChange={(e) => patch(key, e.target.value)}
-                placeholder={t(hintKey)}
-                className={settingsInputClass + ' min-w-0 flex-1 font-mono text-xs'}
-              />
-              <button
-                type="button"
-                className={settingsBtnClass + ' text-signal border-signal/40'}
-                onClick={() => onOpenStore(storeKey)}
-              >
-                {t('settings.model.storeShort')}
-              </button>
-              <button
-                type="button"
-                className={settingsBtnClass}
-                onClick={() => {
-                  void window.api.workspace.pickImageGenModel().then((p) => {
-                    if (p) patch(key, p)
-                  })
-                }}
-              >
-                {t('settings.model.browse')}
-              </button>
-            </div>
+            <PathSelect
+              value={settings[key]}
+              options={filterWeights(weights, kind)}
+              onChange={(p) => patch(key, p)}
+              emptyLabel={t('settings.multimodal.none')}
+              onStore={() => onOpenStore(storeKey)}
+              onBrowse={() => {
+                void window.api.workspace.pickImageGenModel().then((p) => {
+                  if (p) patch(key, p)
+                })
+              }}
+              storeLabel={t('settings.model.storeShort')}
+              browseLabel={t('settings.model.browse')}
+            />
             {key === 'imageGenT5Path' &&
             /scaled/i.test(settings.imageGenT5Path) ? (
               <p className="mt-1 text-[11px] leading-snug text-amber-400/90">

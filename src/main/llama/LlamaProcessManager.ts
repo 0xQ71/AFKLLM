@@ -9,6 +9,7 @@ import {
   shouldEnableDraftMtp,
   speculativeMtpUnsupported
 } from '../../shared/llamaSpec'
+import { looksLikeMmprojMismatch } from '../../shared/visionDetect'
 
 export interface LlamaProcessOptions {
   binaryPath?: string
@@ -69,6 +70,7 @@ export class LlamaProcessManager extends EventEmitter {
   private statusDetail = ''
   private recentLogs = ''
   private startEpoch = 0
+  private droppedMmproj = ''
 
   constructor(options: LlamaProcessOptions) {
     super()
@@ -118,6 +120,10 @@ export class LlamaProcessManager extends EventEmitter {
     return this.options.mmprojPath ?? ''
   }
 
+  get droppedMmprojPath(): string {
+    return this.droppedMmproj
+  }
+
   get port(): number {
     return this.options.port
   }
@@ -152,7 +158,7 @@ export class LlamaProcessManager extends EventEmitter {
     return false
   }
 
-  async start(opts?: { force?: boolean; skipMtp?: boolean }): Promise<void> {
+  async start(opts?: { force?: boolean; skipMtp?: boolean; skipMmprojRetry?: boolean }): Promise<void> {
     if (!opts?.force && this.state === 'ready') return
 
     if (!opts?.force && this.state === 'starting') {
@@ -189,6 +195,7 @@ export class LlamaProcessManager extends EventEmitter {
     this.lastError = undefined
     this.statusDetail = 'spawning llama-server…'
     this.recentLogs = ''
+    if (opts?.skipMmprojRetry !== true) this.droppedMmproj = ''
 
     const skipMtp = opts?.skipMtp === true
     const useMtp =
@@ -326,6 +333,23 @@ export class LlamaProcessManager extends EventEmitter {
         this.statusDetail = 'MTP flags unsupported · retrying without…'
         this.emit('log', '[afkllm] llama-server has no --spec-type draft-mtp; retrying without MTP\n')
         await this.start({ force: true, skipMtp: true })
+        return
+      }
+      const blob = `${this.recentLogs}\n${this.lastError ?? ''}\n${err instanceof Error ? err.message : String(err)}`
+      if (
+        this.options.mmprojPath?.trim() &&
+        opts?.skipMmprojRetry !== true &&
+        looksLikeMmprojMismatch(blob)
+      ) {
+        const dropped = this.options.mmprojPath
+        this.droppedMmproj = dropped
+        this.options = { ...this.options, mmprojPath: undefined }
+        this.statusDetail = 'mmproj mismatch · loading chat without vision…'
+        this.emit(
+          'log',
+          `[afkllm] mmproj n_embd mismatch (${dropped}); retrying without --mmproj\n`
+        )
+        await this.start({ force: true, skipMmprojRetry: true })
         return
       }
       throw err

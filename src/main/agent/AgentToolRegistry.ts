@@ -49,7 +49,7 @@ import {
   looksLikeLocalServerCommand,
   pathToFileUrl
 } from '../../shared/localPreview'
-import { contentLooksStructurallyComplete } from '../../shared/completeness'
+import { contentLooksStructurallyComplete, contentLooksLikeSourceStub, formatStubOnDiskHint } from '../../shared/completeness'
 import { formatWriteFileRequiredError } from '../../shared/writeFileRequired'
 import { fastApplyEdit } from '../llama/ApplyEditClient'
 import { locateApplyRegion, type ApplyRegion } from '../../shared/fastApply'
@@ -569,8 +569,23 @@ export class AgentToolRegistry {
       /* new file */
     }
 
-    // Block silent full rewrites of large files — the #1 cause of "rewrites everything after compact"
-    if (!append && !overwrite && existing.trim().length > 40) {
+    // Placeholder SVG/CSS from a truncated first write — not FILE_COMPLETE.
+    if (
+      !append &&
+      existed &&
+      existing.trim().length > 0 &&
+      contentLooksLikeSourceStub(existing, relativePath)
+    ) {
+      if (!overwrite) {
+        return {
+          id: '',
+          name: 'write_file',
+          ok: false,
+          content: formatStubOnDiskHint(relativePath, existing.length),
+          error: `STUB_ON_DISK: ${relativePath} — overwrite=true with the FULL file`
+        }
+      }
+    } else if (!append && !overwrite && existing.trim().length > 40) {
       const tail = existing.slice(-350)
       const htmlDone = /\.html?$/i.test(relativePath) && htmlDocumentComplete(existing)
       const sourceDone =

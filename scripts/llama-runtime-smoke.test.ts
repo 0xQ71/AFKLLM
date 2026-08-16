@@ -10,6 +10,7 @@ import {
   type LlamaGhAsset
 } from '../src/shared/llamaRuntimeAssets.ts'
 import { LLAMA_RUNTIME_PACKS } from '../src/shared/llamaRuntime.ts'
+import { streamDeltaText } from '../src/shared/llmDelta.ts'
 
 function asset(name: string, size = 1): LlamaGhAsset {
   return {
@@ -211,6 +212,45 @@ describe('visionReusesChatModel', () => {
         visionPath: 'D:/models/Qwen3-VL-8B-Instruct-Q4_K_M.gguf'
       }),
       false
+    )
+  })
+
+  it('rejects Ornith mmproj for Gemma and matches same-family projectors', async () => {
+    const { scoreMmprojForVision, looksLikeMmprojMismatch, isLikelyVisionGguf } =
+      await import('../src/shared/visionDetect.ts')
+    assert.equal(
+      scoreMmprojForVision(
+        'C:/Models/mmproj-ornith-9b-f16.gguf',
+        'C:/Models/gemma4-v2-Q6_K.gguf'
+      ),
+      -1
+    )
+    assert.ok(
+      scoreMmprojForVision(
+        'C:/Models/mmproj-ornith-9b-f16.gguf',
+        'C:/Models/Ornith-1-9B-MTP-1M-vision-Q4_K_M.gguf'
+      ) > 0
+    )
+    assert.equal(isLikelyVisionGguf('gemma4-v2-Q6_K.gguf'), true)
+    assert.equal(
+      looksLikeMmprojMismatch(
+        'mtmd_init_from_file: error: mismatch between text model (n_embd = 3840) and mmproj (n_embd = 4096) hint: you may be using wrong mmproj'
+      ),
+      true
+    )
+  })
+})
+
+describe('streamDeltaText', () => {
+  it('uses reasoning_content when content is empty', () => {
+    assert.equal(
+      streamDeltaText({ content: '', reasoning_content: 'сначала разберу цель' }),
+      'сначала разберу цель'
+    )
+    assert.equal(streamDeltaText({ content: null, reasoning: 'think' }), 'think')
+    assert.equal(
+      streamDeltaText({ content: '<plan></plan>', reasoning_content: 'hidden' }),
+      '<plan></plan>'
     )
   })
 })

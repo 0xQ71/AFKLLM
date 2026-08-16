@@ -76,6 +76,14 @@ export function formatWriteOnceError(relativePath: string): string {
   )
 }
 
+/** JS landed first — missing HTML ids are expected, not a JS bug. */
+export function formatLandingJsBeforeHtmlHint(): string {
+  return (
+    'LANDING_ORDER: index.html is not on disk yet. Missing #ids / data-i18n in markup are expected. ' +
+    'Do NOT rewrite this JS file to "fix" selectors. Next: styles.css (if missing), then a complete index.html that uses those ids, then README.'
+  )
+}
+
 /** CSS + HTML + JS each have at least one complete write this turn. */
 export function landingBundleReady(completeWritesByPath: Map<string, number>): boolean {
   let html = false

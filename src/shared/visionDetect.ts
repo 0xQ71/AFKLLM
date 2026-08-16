@@ -12,7 +12,8 @@ export function scoreVisionGguf(pathOrName: string): number {
   }
   if (/minicpm[-_.]?v|minicpm.v/.test(n)) return 88
   if (/llava|moondream|internvl|pixtral|idefics/.test(n)) return 70
-  if (/gemma[-_.]?3|gemma3/.test(n)) return 55
+  if (/gemma[-_.]?[34]|gemma[34]/.test(n)) return 55
+  if (/ornith/.test(n) && /vision|vl/.test(n)) return 60
   if (/\bvl\b|vision/.test(n)) return 60
   return -1
 }
@@ -35,6 +36,26 @@ export function isVisionSameAsChat(path?: string | null): boolean {
   return (path ?? '').trim() === VISION_SAME_AS_CHAT
 }
 
+/** Family token for VL weights / mmproj (null = unknown). */
+export function vlWeightFamily(pathOrName: string): string | null {
+  const n = pathOrName.replace(/^.*[/\\]/, '').toLowerCase()
+  if (/qwen3?[-_.]?vl|qwen[-_.]?vl/.test(n)) return 'qwen-vl'
+  if (/minicpm/.test(n)) return 'minicpm'
+  if (/gemma/.test(n)) return 'gemma'
+  if (/ornith/.test(n)) return 'ornith'
+  if (/llava/.test(n)) return 'llava'
+  if (/moondream/.test(n)) return 'moondream'
+  if (/pixtral/.test(n)) return 'pixtral'
+  if (/internvl/.test(n)) return 'internvl'
+  return null
+}
+
+export function looksLikeMmprojMismatch(log: string): boolean {
+  return /mismatch between text model[\s\S]{0,80}mmproj|wrong mmproj|failed to load multimodal/i.test(
+    log
+  )
+}
+
 /**
  * Vision selector is “Same as chat”, or Vision path equals Chat.
  * Load mmproj on the chat server — do not start a second copy.
@@ -52,16 +73,16 @@ export function visionReusesChatModel(opts: {
   return vis === chat
 }
 
-/** Score a *mmproj*.gguf against a vision GGUF in the same folder. */
+/** Score a *mmproj*.gguf against a vision GGUF. -1 = incompatible family. */
 export function scoreMmprojForVision(mmprojPath: string, visionPath: string): number {
   const m = mmprojPath.replace(/^.*[/\\]/, '').toLowerCase()
   const v = visionPath.replace(/^.*[/\\]/, '').toLowerCase()
   if (!/mmproj/.test(m)) return -1
+  const fm = vlWeightFamily(m)
+  const fv = vlWeightFamily(v)
+  if (fm && fv && fm !== fv) return -1
   let score = 10
-  if (/qwen3?vl|qwen3-vl/.test(m) && /qwen3?vl|qwen3-vl/.test(v)) score += 80
-  if (/minicpm/.test(m) && /minicpm/.test(v)) score += 80
-  if (/gemma/.test(m) && /gemma/.test(v)) score += 70
-  if (/llava/.test(m) && /llava/.test(v)) score += 70
+  if (fm && fv && fm === fv) score += 80
   if (/f16|fp16/.test(m)) score += 5
   return score
 }

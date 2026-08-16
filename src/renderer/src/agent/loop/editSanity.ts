@@ -95,7 +95,7 @@ export function formatLandingCssContractHint(css: string): string | null {
     names.map((n) => `.${n}`).join(' ') +
     '. index.html MUST use these class names — do not invent .site-header / .header-nav / .hero-inner if CSS has .navbar / .nav-links / .hero-content. ' +
     'Every inline <svg> needs width and height attributes (e.g. 32) or a CSS rule that sets them. ' +
-    'JS getElementById / #id and data-i18n keys must match the HTML.'
+    'When writing index.html, JS getElementById / #id and data-i18n keys must match that markup.'
   )
 }
 

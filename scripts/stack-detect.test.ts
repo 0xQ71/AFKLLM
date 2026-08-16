@@ -289,6 +289,34 @@ describe('completeness by language', () => {
     assert.equal(contentLooksStructurallyComplete('def add(a, b):\n', 'a.py'), false)
   })
 
+  it('CSS/SVG stubs are incomplete; a real stylesheet is complete', () => {
+    assert.equal(
+      contentLooksStructurallyComplete('/* landing */\n:root { --bg: #000; }\n', 'styles.css'),
+      false
+    )
+    const css =
+      ':root { --bg: #0a0a0f; --fg: #e8e8ef; --accent: #7c3aed; --muted: #9ca3af; --card: rgba(255,255,255,0.04); }\n' +
+      'body { margin: 0; background: var(--bg); color: var(--fg); font-family: system-ui, sans-serif; line-height: 1.6; }\n' +
+      '.navbar { display: flex; gap: 16px; padding: 12px 24px; backdrop-filter: blur(16px); border-bottom: 1px solid rgba(255,255,255,0.06); }\n' +
+      '.hero { min-height: 70vh; padding: 80px 24px; background: radial-gradient(ellipse at top, #1a1030, #0a0a0f); }\n' +
+      '.feature-card { border-radius: 12px; padding: 24px; background: var(--card); }\n'
+    assert.equal(contentLooksStructurallyComplete(css, 'styles.css'), true)
+    assert.equal(
+      contentLooksStructurallyComplete(
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"></svg>',
+        'icon.svg'
+      ),
+      false
+    )
+    assert.equal(
+      contentLooksStructurallyComplete(
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 4h16v16H4z"/><circle cx="12" cy="12" r="3"/></svg>',
+        'icon.svg'
+      ),
+      true
+    )
+  })
+
   it('isLandingJsPath matches js/main.js only', () => {
     assert.equal(isLandingJsPath('js/main.js'), true)
     assert.equal(isLandingJsPath('main.js'), true)

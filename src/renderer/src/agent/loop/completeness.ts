@@ -1,5 +1,9 @@
 export {
   contentLooksStructurallyComplete,
   isLandingJsPath,
-  isSourcePath
+  isSourcePath,
+  cssLooksLikeRealStylesheet,
+  svgLooksLikeRealGraphic,
+  contentLooksLikeSourceStub,
+  formatStubOnDiskHint
 } from '../../../../shared/completeness'

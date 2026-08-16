@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { streamDeltaText } from '../../shared/llmDelta'
 import type {
   LLMCompletionRequest,
   LLMCompletionResult,
@@ -248,6 +249,8 @@ export class LLMQueueManager {
               text?: string
               message?: {
                 content?: string | null
+                reasoning_content?: string | null
+                reasoning?: string | null
                 tool_calls?: LLMCompletionResult['toolCalls']
               }
               finish_reason?: string
@@ -259,7 +262,7 @@ export class LLMQueueManager {
           const choice = data.choices?.[0]
           return {
             id: request.id,
-            text: choice?.text ?? choice?.message?.content ?? '',
+            text: choice?.text || streamDeltaText(choice?.message) || '',
             usage: data.usage ?? usageFromTimings(data.timings),
             timings: data.timings,
             toolCalls: choice?.message?.tool_calls,
@@ -298,6 +301,11 @@ export class LLMQueueManager {
     const decoder = new TextDecoder()
     let buffer = ''
     let text = ''
+    let lastMessage: {
+      content?: string | null
+      reasoning_content?: string | null
+      reasoning?: string | null
+    } | undefined
     let finishReason: string | undefined
     let usage: LLMCompletionResult['usage']
     let timings: LLMCompletionResult['timings']
@@ -327,12 +335,19 @@ export class LLMQueueManager {
             choices?: Array<{
               delta?: {
                 content?: string | null
+                reasoning_content?: string | null
+                reasoning?: string | null
                 tool_calls?: Array<{
                   index: number
                   id?: string
                   type?: string
                   function?: { name?: string; arguments?: string }
                 }>
+              }
+              message?: {
+                content?: string | null
+                reasoning_content?: string | null
+                reasoning?: string | null
               }
               finish_reason?: string | null
             }>
@@ -354,10 +369,12 @@ export class LLMQueueManager {
           if (choice.finish_reason) finishReason = choice.finish_reason
 
           const delta = choice.delta
-          if (delta?.content) {
-            text += delta.content
-            onChunk({ id, token: delta.content })
+          const piece = streamDeltaText(delta)
+          if (piece) {
+            text += piece
+            onChunk({ id, token: piece })
           }
+          if (choice.message) lastMessage = choice.message
 
           if (delta?.tool_calls) {
             for (const tc of delta.tool_calls) {
@@ -388,6 +405,14 @@ export class LLMQueueManager {
         reader.releaseLock()
       } catch {
         /* ignore */
+      }
+    }
+
+    if (!text.trim()) {
+      const salvage = streamDeltaText(lastMessage)
+      if (salvage) {
+        text = salvage
+        onChunk({ id, token: salvage })
       }
     }
 
