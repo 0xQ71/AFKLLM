@@ -155,3 +155,62 @@ describe('llamaSpec MTP auto', () => {
     )
   })
 })
+
+describe('llamaSlotPort', () => {
+  it('parks keep-loaded vision on port+2 and swap vision on the chat port', async () => {
+    const { llamaSlotPort, llamaSlotPortsToDeny } = await import(
+      '../src/shared/llamaSlots.ts'
+    )
+    assert.equal(llamaSlotPort(8080, 'chat', true), 8080)
+    assert.equal(llamaSlotPort(8080, 'apply', true), 8081)
+    assert.equal(llamaSlotPort(8080, 'vision', true), 8082)
+    assert.equal(llamaSlotPort(8080, 'vision', false), 8080)
+    assert.deepEqual(llamaSlotPortsToDeny(8080).sort((a, b) => a - b), [8080, 8081, 8082])
+    const { DEFAULT_SETTINGS } = await import('../src/shared/settings.ts')
+    assert.equal(DEFAULT_SETTINGS.visionKeepLoaded, true)
+  })
+})
+
+describe('visionReusesChatModel', () => {
+  it('reuses chat when Vision is “Same as chat” or the same GGUF path', async () => {
+    const { visionReusesChatModel, VISION_SAME_AS_CHAT } = await import(
+      '../src/shared/visionDetect.ts'
+    )
+    const ornith =
+      'D:/models/Ornith-1-9B-MTP-1M-vision-Q4_K_M.gguf'
+    assert.equal(
+      visionReusesChatModel({ chatPath: ornith, visionPath: VISION_SAME_AS_CHAT }),
+      true
+    )
+    assert.equal(
+      visionReusesChatModel({ chatPath: ornith, visionPath: ornith }),
+      true
+    )
+    assert.equal(
+      visionReusesChatModel({ chatPath: ornith, visionPath: '' }),
+      false
+    )
+    assert.equal(
+      visionReusesChatModel({
+        chatPath: 'D:/models/gemma-4-12b-it-Q4_K_M.gguf',
+        visionPath: VISION_SAME_AS_CHAT
+      }),
+      true
+    )
+    assert.equal(
+      visionReusesChatModel({
+        chatPath: 'D:/models/gemma-4-12b-it-Q4_K_M.gguf',
+        visionPath: '',
+        mmprojPath: ''
+      }),
+      false
+    )
+    assert.equal(
+      visionReusesChatModel({
+        chatPath: ornith,
+        visionPath: 'D:/models/Qwen3-VL-8B-Instruct-Q4_K_M.gguf'
+      }),
+      false
+    )
+  })
+})

@@ -7,31 +7,43 @@ export function isHtmlOnlyStacks(stacks: ProjectStack[]): boolean {
 export function formatSurgicalFollowUpHint(opts: {
   stacks: ProjectStack[]
   i18nFix: boolean
+  themeToggle?: boolean
 }): string {
+  const applyFirst =
+    'Existing HTML/CSS/JS → apply_diff with a short instruction (or search_block ≤ ~80 lines). ' +
+    'FORBIDDEN: write_file overwrite of a whole module (index.html / styles.css / js/main.js).'
   if (opts.i18nFix) {
     return (
       'SURGICAL i18n fix: the landing is already on disk. ' +
       'read_file index.html and js/main.js ONCE. ' +
-      'Fix the existing language switcher with apply_diff — getElementById MUST match the HTML id; ' +
+      'Fix the existing language switcher with apply_diff (instruction or short search_block) — getElementById MUST match the HTML id; ' +
       'every data-i18n key MUST exist in the dict as a STRING. ' +
-      'If the user also asked for a theme toggle, add data-theme + a control with apply_diff. ' +
+      'If the user also asked for a theme toggle, add data-theme + a control with apply_diff instruction. ' +
       'Do NOT rewrite the whole landing, web_search, or create README.md. ' +
       'Preview ONCE after the patch, then STOP with a short summary. Preview is not proof the switcher works.'
+    )
+  }
+  if (opts.themeToggle) {
+    return (
+      'Theme toggle follow-up: files are already on disk. ' +
+      applyFirst +
+      ' Add the light/dark control with apply_diff instruction on the existing HTML/CSS/JS. ' +
+      'Do NOT rewrite js/main.js. Preview ONCE, then STOP with a short summary.'
     )
   }
   if (isHtmlOnlyStacks(opts.stacks)) {
     return (
       'SURGICAL follow-up: existing files are already on disk. ' +
       'Call tools NOW. New small modules → one complete write_file each. ' +
-      'Existing HTML/CSS/JS → apply_diff only (search_block ≤ ~80 lines). ' +
-      'Open preview ONCE with Start-Process (Resolve-Path .\\index.html), then STOP and write a short summary. ' +
+      applyFirst +
+      ' Open preview ONCE with Start-Process (Resolve-Path .\\index.html), then STOP and write a short summary. ' +
       'FORBIDDEN: rewriting the whole page, get_diagnostics on static HTML, opening the page more than once, ' +
       'web_search, inventing README.md, narrating "created files" without tools.'
     )
   }
   return (
     'SURGICAL follow-up: this is a bug/fix on an existing repo. ' +
-    'read_file the failing path ONCE, then apply_diff (or one complete write_file of a SMALL new module). ' +
+    'read_file the failing path ONCE, then apply_diff with instruction (or one complete write_file of a SMALL new module). ' +
     'Then call verify_project ONCE for the DETECTED STACK (or the stack test/build command). ' +
     'Do NOT rewrite the whole module/project. Do NOT invent HTML/i18n unless asked. ' +
     'get_diagnostics is allowed on compiler stacks. Write a short summary and STOP.'
@@ -41,9 +53,10 @@ export function formatSurgicalFollowUpHint(opts: {
 export const AGENT_RULES_V2 = `
 Rules (language-agnostic — follow the DETECTED STACK, not HTML assumptions):
 - Paths MUST be relative to the project root. Never use absolute paths like D:\\...
-- Finish ONE file completely before starting another. INCOMPLETE_WRITE → append=true on the SAME path. Never invent a sibling filename.
+- Finish ONE file completely before starting another. INCOMPLETE_WRITE on a NEW unfinished file → append=true on the SAME path. Never invent a sibling filename. Never overwrite a complete file to "finish" it.
 - Existing vs new files: decide from DISK (list_directory / read_file), never from keywords in the user message.
-  Missing file → write_file. Existing file → apply_diff / apply_patch first. overwrite=true + allow_full_rewrite=true only after two failed patches or an explicit full-rewrite request.
+  Missing file → write_file. Existing HTML/CSS/JS on a small follow-up → apply_diff with a short instruction (or unique search_block). Do NOT write_file overwrite a whole module for a tweak.
+  From-scratch / full rebuild / explicit rewrite of existing complete HTML/CSS/JS → write_file overwrite=true allow_full_rewrite=true with the COMPLETE file. Do NOT retry Apply / SEARCH-REPLACE on a whole stylesheet or module.
 - Bug/fix on an existing repo: apply_diff the failing file. Do not scaffold a new project or rewrite the whole module.
 - Write as you go: the moment a file's content is decided, save it. Never hold edits back to dump them at the end of the turn.
 - Dependencies first: create the file that is depended on (module, header, stylesheet) BEFORE the file that references it, then link them in the same turn.
@@ -52,13 +65,14 @@ Rules (language-agnostic — follow the DETECTED STACK, not HTML assumptions):
 - Do NOT invent extra files the user did not ask for.
 - FORBIDDEN: claiming "done" / "Сделано" / "Готово" when a write/patch/shell failed; planning "if patch fails, rewrite the whole file"; ticking plan rows without a matching successful tool.
 - Unclear repo layout: call explore_subagent (read-only) before large edits.
-- Small files: one full write_file (overwrite=true if it already exists). Large files: apply_patch / modest append chunks until syntactically complete.
+- Small NEW files: one full write_file. Existing HTML/CSS/JS (small follow-up): apply_diff with instruction, not overwrite. Full rebuild: write_file overwrite. Large new files: modest append chunks until syntactically complete.
 - Terminal (Windows): PowerShell in a real PTY. NEVER bash && or ||, /dev/null, Unix pipelines. Prefer ONE command + cwd="subdir". Chain with "; " if needed. Do NOT pass unquoted globs like *.java to native exes.
 - PROCESS_ENDED: user closed a GUI / Ctrl+C — NOT a bug. Do not rewrite or relaunch.
 - TERMINAL_ERROR / exit_code≠0: this is a failure. Read ERROR_FOCUS, fix the stated file/line, re-run the SAME command. Never report tests/build as green unless the latest command for that job returned exit_code=0.
 - verify_project: use mode=build|test|lint|run for the detected stack — ONE call, not a shell scavenger hunt. get_diagnostics for IDE linter/compiler issues on non-HTML stacks.
 - Facts from GitHub/README: web_search once. FORBIDDEN: git clone of the product repo / into /tmp, Get-ChildItem -Recurse, repeated Test-Path, Copy-Item from a clone.
 - If the detected stack is HTML: no build/test; verify_project is a one-shot entry check or Start-Process (Resolve-Path .\\index.html) ONCE. i18n values MUST be strings (never objects/arrays in textContent — that is "[object Object]"). NEVER get_diagnostics on static HTML. NEVER open the LLM API port as the site. Vite/npm run dev → the printed Local: URL.
+  Multi-file landing: ONE complete write_file per path, then STOP. data-i18n tags MUST contain visible default-language text (JS only swaps language — never empty <h1 data-i18n>). CSS class names are a contract. After styles.css is written, index.html MUST use those classes (.navbar / .nav-links / .hero-content — do not invent .site-header). Inline <svg> MUST have width and height. JS getElementById / data-i18n keys MUST match the HTML. After CSS+HTML+JS are on disk, Start-Process once — do not rewrite js/main.js. Do not open preview as "done" while LANDING_CONTRACT / EDIT_SANITY is open.
 - Compiler stacks (Node/Python/Go/Java/Rust/.NET): "done" only after a successful patch AND one verify command with exit_code=0.
 - When the user says "continue" / "продолжи", inspect disk and only create missing pieces.
 - @codebase / @file / @selection are already attached — use them before re-reading unless stale.

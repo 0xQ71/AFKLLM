@@ -21,6 +21,37 @@ export function isLikelyVisionGguf(pathOrName: string): boolean {
   return scoreVisionGguf(pathOrName) >= 0
 }
 
+export function normGgufPath(path: string | undefined | null): string {
+  return (path ?? '').replace(/\\/g, '/').replace(/\/+$/, '').trim().toLowerCase()
+}
+
+/**
+ * Stored in visionModelPath when the user picks “Same as chat” in the Vision
+ * selector. Not a filesystem path — mmproj attaches to the chat llama-server.
+ */
+export const VISION_SAME_AS_CHAT = '__same_as_chat__'
+
+export function isVisionSameAsChat(path?: string | null): boolean {
+  return (path ?? '').trim() === VISION_SAME_AS_CHAT
+}
+
+/**
+ * Vision selector is “Same as chat”, or Vision path equals Chat.
+ * Load mmproj on the chat server — do not start a second copy.
+ */
+export function visionReusesChatModel(opts: {
+  chatPath?: string
+  visionPath?: string
+  mmprojPath?: string
+}): boolean {
+  const chat = normGgufPath(opts.chatPath)
+  if (!chat) return false
+  if (isVisionSameAsChat(opts.visionPath)) return true
+  const vis = normGgufPath(opts.visionPath)
+  if (!vis) return false
+  return vis === chat
+}
+
 /** Score a *mmproj*.gguf against a vision GGUF in the same folder. */
 export function scoreMmprojForVision(mmprojPath: string, visionPath: string): number {
   const m = mmprojPath.replace(/^.*[/\\]/, '').toLowerCase()

@@ -32,7 +32,7 @@ import {
   type TurnFileChange
 } from '../agent/runAgentTurn'
 import { runAgentTurnV2 } from '../agent/loop/runTurn'
-import { parseChecklistUiContent, parseTodoUiContent, liveThinkProse, displayThinkProse, stripThinkTags, isJunkPlanStep, isEllipsisOnly } from '../agent/agentPure'
+import { parseChecklistUiContent, parseTodoUiContent, parseTodoUiFailed, liveThinkProse, displayThinkProse, stripThinkTags, isJunkPlanStep, isEllipsisOnly } from '../agent/agentPure'
 import type { QueueManager } from '../llm/queueManager'
 import type { ChatSession, PersistedChatMessage } from '../../../shared/chats'
 import {
@@ -2169,20 +2169,24 @@ function AgentTodoCard({ content }: { content: string }): React.JSX.Element | nu
     (s) => s.text.trim() && !isEllipsisOnly(s.text) && !isJunkPlanStep(s.text)
   )
   if (!steps.length) return null
+  const failed = parseTodoUiFailed(content)
   const allDone = steps.every((s) => s.status === 'done')
-  const statusLabel = allDone
-    ? t('chat.plan.statusDone')
-    : t('chat.plan.statusActive')
+  const statusLabel = failed
+    ? t('chat.plan.statusFailed')
+    : allDone
+      ? t('chat.plan.statusDone')
+      : t('chat.plan.statusActive')
   return (
     <div className="rounded-xl border border-ink-line/80 bg-ink-900/35 px-3 py-2.5">
       <div className="mb-2 flex items-baseline justify-between gap-2">
         <div className="text-[12px] font-medium text-ink-bright">{t('chat.checklist.title')}</div>
         <div
           className={
-            'text-[11px] ' + (allDone ? 'text-signal' : 'text-ink-mute')
+            'text-[11px] ' +
+            (failed ? 'text-rose-400' : allDone ? 'text-signal' : 'text-ink-mute')
           }
         >
-          {allDone ? `✓ ${statusLabel}` : statusLabel}
+          {failed ? `✗ ${statusLabel}` : allDone ? `✓ ${statusLabel}` : statusLabel}
         </div>
       </div>
       <ul className="space-y-1.5">
@@ -2282,7 +2286,7 @@ function ToolActivityRow({
     parts.target && /^(1 file|\d+ files)$/i.test(parts.target)
       ? localizeActivitySuffix(parts.target, t)
       : parts.target
-  const stat = diffStatFromCodePreview(m.toolName, m.codePreview, m.content)
+  const stat = m.diffStat ?? diffStatFromCodePreview(m.toolName, m.codePreview, m.content)
   const add = stat?.added ?? 0
   const rem = stat?.removed ?? 0
   const showStat = Boolean(formatDiffStat(stat))

@@ -12,6 +12,7 @@ import {
 import type { UiLanguage } from '../../../shared/i18n'
 import type { McpServerConfig, McpServerStatus } from '../../../shared/mcp'
 import { applyDocumentTheme, UI_THEMES } from '../../../shared/theme'
+import { visionReusesChatModel, VISION_SAME_AS_CHAT, isVisionSameAsChat } from '../../../shared/visionDetect'
 import { parseTelemetryLogText } from '../../../shared/telemetry'
 import { applyMonacoTheme } from '../editor/monacoSetup'
 import { useI18n } from '../i18n/I18nProvider'
@@ -122,6 +123,16 @@ export function SettingsView({
     if (key === 'applyModelPath' && typeof value === 'string') {
       setSettings({ ...settings, applyModelPath: value })
       void window.api.settings.save({ applyModelPath: value })
+      return
+    }
+    if (key === 'visionModelPath' && typeof value === 'string') {
+      setSettings({ ...settings, visionModelPath: value })
+      void window.api.settings.save({ visionModelPath: value })
+      return
+    }
+    if (key === 'visionMmprojPath' && typeof value === 'string') {
+      setSettings({ ...settings, visionMmprojPath: value })
+      void window.api.settings.save({ visionMmprojPath: value })
       return
     }
     setSettings({ ...settings, [key]: value })
@@ -733,6 +744,11 @@ function ModelPage({
   onOpenStore: (target?: StoreDownloadTarget) => void
 }): React.JSX.Element {
   const { t } = useI18n()
+  const reuseVision = visionReusesChatModel({
+    chatPath: settings.modelPath,
+    visionPath: settings.visionModelPath,
+    mmprojPath: settings.visionMmprojPath
+  })
   const [sdStatus, setSdStatus] = useState<SdRuntimeStatus | null>(null)
   const [sdBusy, setSdBusy] = useState(false)
   const [sdMessage, setSdMessage] = useState<string | null>(null)
@@ -954,6 +970,99 @@ function ModelPage({
             className={settingsInputClass}
           />
         </Field>
+        <Field
+          label={t('settings.multimodal.visionModel')}
+          hint={
+            reuseVision
+              ? t('settings.multimodal.visionSameAsChatHint')
+              : undefined
+          }
+        >
+          <div className="flex gap-2">
+            <select
+              value={settings.visionModelPath}
+              onChange={(e) => patch('visionModelPath', e.target.value)}
+              className={settingsInputClass + ' font-mono text-xs'}
+            >
+              <option value="">{t('settings.multimodal.none')}</option>
+              <option value={VISION_SAME_AS_CHAT} disabled={!settings.modelPath?.trim()}>
+                {t('settings.multimodal.visionSameAsChat')}
+              </option>
+              {models.map((m) => (
+                <option key={m.path} value={m.path}>
+                  {m.id} ({(m.sizeBytes / 1e9).toFixed(1)} GB)
+                </option>
+              ))}
+              {settings.visionModelPath &&
+                !isVisionSameAsChat(settings.visionModelPath) &&
+                !models.some((m) => m.path === settings.visionModelPath) && (
+                  <option value={settings.visionModelPath}>
+                    {settings.visionModelPath.split(/[/\\]/).pop()}
+                  </option>
+                )}
+            </select>
+            <button
+              type="button"
+              className={settingsBtnClass + ' text-signal border-signal/40'}
+              onClick={() => onOpenStore('vision')}
+            >
+              {t('settings.model.storeShort')}
+            </button>
+            <button
+              type="button"
+              className={settingsBtnClass}
+              onClick={() => {
+                void window.api.workspace.pickModel().then((p) => {
+                  if (p) patch('visionModelPath', p)
+                })
+              }}
+              title={t('settings.model.browseFolder')}
+            >
+              {t('settings.model.browse')}
+            </button>
+          </div>
+        </Field>
+        <Field label={t('settings.multimodal.mmproj')}>
+          <div className="flex gap-2">
+            <input
+              value={settings.visionMmprojPath}
+              onChange={(e) => patch('visionMmprojPath', e.target.value)}
+              placeholder={t('settings.multimodal.mmprojHint')}
+              className={settingsInputClass + ' min-w-0 flex-1 font-mono text-xs'}
+            />
+            <button
+              type="button"
+              className={settingsBtnClass + ' text-signal border-signal/40'}
+              onClick={() => onOpenStore('mmproj')}
+            >
+              {t('settings.model.storeShort')}
+            </button>
+            <button
+              type="button"
+              className={settingsBtnClass}
+              onClick={() => {
+                void window.api.workspace.pickMmproj().then((p) => {
+                  if (p) patch('visionMmprojPath', p)
+                })
+              }}
+            >
+              {t('settings.model.browse')}
+            </button>
+          </div>
+        </Field>
+        <Toggle
+          title={t('settings.model.visionKeep')}
+          description={
+            reuseVision
+              ? t('settings.model.visionKeepReuseHint')
+              : t('settings.model.visionKeepHint')
+          }
+          checked={settings.visionKeepLoaded !== false}
+          onChange={(v) => {
+            patch('visionKeepLoaded', v)
+            void window.api.settings.save({ visionKeepLoaded: v })
+          }}
+        />
         <SettingRow
           title={t('settings.model.status')}
           description={
@@ -1031,6 +1140,37 @@ function ModelPage({
               : (llmStatus?.applyState ?? 'stopped')}
           </span>
         </SettingRow>
+        <SettingRow
+          title={t('settings.model.visionStatus')}
+          description={
+            llmStatus?.visionError && llmStatus.visionState === 'error'
+              ? llmStatus.visionError
+              : reuseVision
+                ? t('settings.model.visionStatusReuse')
+                : !settings.visionModelPath?.trim()
+                  ? t('settings.model.visionStatusHint')
+                  : settings.visionKeepLoaded === false
+                    ? t('settings.model.visionStatusSwap')
+                    : undefined
+          }
+        >
+          <span
+            className={
+              'text-xs ' +
+              (llmStatus?.visionState === 'ready'
+                ? 'text-signal'
+                : llmStatus?.visionState === 'error'
+                  ? 'text-rose-400'
+                  : llmStatus?.visionState === 'starting'
+                    ? 'text-amber-400'
+                    : 'text-ink-mute')
+            }
+          >
+            {!reuseVision && !settings.visionModelPath?.trim()
+              ? '—'
+              : (llmStatus?.visionState ?? 'stopped')}
+          </span>
+        </SettingRow>
         <SettingRow title={t('settings.model.port')}>
           <input
             type="number"
@@ -1062,74 +1202,6 @@ function ModelPage({
       <PageIntro>{t('settings.multimodal.intro')}</PageIntro>
       <p className="mb-2 text-[11px] text-ink-mute">{t('settings.multimodal.agentGateHint')}</p>
       <Well>
-        <Field label={t('settings.multimodal.visionModel')}>
-          <div className="flex gap-2">
-            <select
-              value={settings.visionModelPath}
-              onChange={(e) => patch('visionModelPath', e.target.value)}
-              className={settingsInputClass + ' font-mono text-xs'}
-            >
-              <option value="">{t('settings.multimodal.none')}</option>
-              {models.map((m) => (
-                <option key={m.path} value={m.path}>
-                  {m.id}
-                </option>
-              ))}
-              {settings.visionModelPath &&
-                !models.some((m) => m.path === settings.visionModelPath) && (
-                  <option value={settings.visionModelPath}>
-                    {settings.visionModelPath.split(/[/\\]/).pop()}
-                  </option>
-                )}
-            </select>
-            <button
-              type="button"
-              className={settingsBtnClass + ' text-signal border-signal/40'}
-              onClick={() => onOpenStore('vision')}
-            >
-              {t('settings.model.storeShort')}
-            </button>
-            <button
-              type="button"
-              className={settingsBtnClass}
-              onClick={() => {
-                void window.api.workspace.pickModel().then((p) => {
-                  if (p) patch('visionModelPath', p)
-                })
-              }}
-            >
-              {t('settings.model.browse')}
-            </button>
-          </div>
-        </Field>
-        <Field label={t('settings.multimodal.mmproj')}>
-          <div className="flex gap-2">
-            <input
-              value={settings.visionMmprojPath}
-              onChange={(e) => patch('visionMmprojPath', e.target.value)}
-              placeholder={t('settings.multimodal.mmprojHint')}
-              className={settingsInputClass + ' min-w-0 flex-1 font-mono text-xs'}
-            />
-            <button
-              type="button"
-              className={settingsBtnClass + ' text-signal border-signal/40'}
-              onClick={() => onOpenStore('mmproj')}
-            >
-              {t('settings.model.storeShort')}
-            </button>
-            <button
-              type="button"
-              className={settingsBtnClass}
-              onClick={() => {
-                void window.api.workspace.pickMmproj().then((p) => {
-                  if (p) patch('visionMmprojPath', p)
-                })
-              }}
-            >
-              {t('settings.model.browse')}
-            </button>
-          </div>
-        </Field>
         <Field label={t('settings.multimodal.imageGenModel')}>
           <div className="flex gap-2">
             <input

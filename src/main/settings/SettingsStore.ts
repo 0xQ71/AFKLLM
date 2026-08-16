@@ -18,6 +18,11 @@ import {
 import { isUiTheme, migrateUiTheme } from '../../shared/theme'
 import { isUiLanguage } from '../../shared/i18n'
 import { isLlamaRuntimeSelection } from '../../shared/llamaRuntime'
+import {
+  VISION_SAME_AS_CHAT,
+  isVisionSameAsChat,
+  normGgufPath
+} from '../../shared/visionDetect'
 import { sanitizeMcpServers } from '../../shared/mcp'
 import { scanGgufModels } from '../llama/ModelScanner'
 import {
@@ -278,6 +283,15 @@ function sanitize(input: Record<string, unknown> | AppSettings): AppSettings {
 
   next.visionModelPath = typeof next.visionModelPath === 'string' ? next.visionModelPath : ''
   next.visionMmprojPath = typeof next.visionMmprojPath === 'string' ? next.visionMmprojPath : ''
+  if (
+    next.visionModelPath &&
+    !isVisionSameAsChat(next.visionModelPath) &&
+    next.modelPath &&
+    normGgufPath(next.visionModelPath) === normGgufPath(next.modelPath)
+  ) {
+    next.visionModelPath = VISION_SAME_AS_CHAT
+  }
+  next.visionKeepLoaded = next.visionKeepLoaded !== false
   next.applyModelPath = typeof next.applyModelPath === 'string' ? next.applyModelPath : ''
   // 0 = follow chat ctx; anything positive is clamped to a loadable window.
   {

@@ -19,6 +19,7 @@ import {
   shouldNudgeVerify
 } from './loop/verify'
 import { THREAD_SUMMARY_MSG_ID } from '../../../shared/chats'
+import { visionReusesChatModel } from '../../../shared/visionDetect'
 import {
   DEFAULT_UI_LANGUAGE,
   isUiLanguage,
@@ -36,6 +37,7 @@ import {
   emptyChecklist,
   formatChecklist,
   formatTodoUiContent,
+  todoCardFailed,
   hasThinkBlock,
   normalizeApiMessages,
   parseComposerMentions,
@@ -69,6 +71,7 @@ import {
   todosAllDone,
   pendingPlanWork,
   looksLikeOpenHtmlCommand,
+  isLandingJsPath,
   looksLikeLandingBuildTask,
   evaluateAcceptanceGate,
   fingerprintToolCall,
@@ -92,7 +95,13 @@ import {
   looksLikeI18nFollowUp,
   looksLikeThemeToggleRequest,
   looksLikeExplicitRewrite,
+  allowsComposerFullRewrite,
+  shouldHandoffWriteToApply,
   shouldBlockSurgicalOverwrite,
+  isComposerApplyPath,
+  priorCompleteForWritePath,
+  shouldPersistIncompleteWrite,
+  buildApplyHandoffArgs,
   isSourcePath,
   filterPlanToCurrentRequest,
   parseGlobalRenameIntent,
@@ -110,7 +119,18 @@ import {
 } from './composerActivity'
 import { diffStatFromCodePreview } from '../../../shared/diffStat'
 import { isAfkllmInternalHtmlPath } from '../../../shared/localPreview'
-import { formatEditSanityHint } from './loop/editSanity'
+import { formatEditSanityHint, formatLandingCssContractHint } from './loop/editSanity'
+import { formatI18nCloserWhy, inventedI18nVerifierPath } from './loop/i18nSanity'
+import {
+  formatScratchWriteFileHint,
+  formatWriteFileRequiredError,
+  formatWriteOnceError,
+  isCappedLandingWritePath,
+  landingBundleReady,
+  shouldRefuseLandingRewrite,
+  shouldRequireWriteFileForApply
+} from './loop/landingWriteCap'
+import { AGENT_MAX_TOKENS, maxTokensForAgent } from './loop/ctxBudget'
 
 const RECENT_TURNS_WITH_SUMMARY = 12
 
@@ -193,6 +213,7 @@ export {
   buildChecklistFromHistory,
   formatChecklist,
   formatTodoUiContent,
+  todoCardFailed,
   hasThinkBlock,
   normalizeApiMessages,
   parseComposerMentions,
@@ -262,6 +283,8 @@ export interface ChatMessage {
   stats?: ChatMessageStats
   editReview?: { path: string; status: 'pending' | 'accepted' | 'rejected' }
   activity?: ComposerActivity
+  /** Disk +/- for this tool row (preferred over counting codePreview). */
+  diffStat?: { added: number; removed: number }
 }
 
 export interface ChatFileRef {
@@ -313,16 +336,19 @@ export interface ComposerFileAttachment extends ChatFileRef {
   note?: string
 }
 
-/** Cold-swap to vision, describe images, restore chat. Returns text for chat agent. */
+/** Describe attached images via vision. Keep-loaded uses port+2; else cold-swap. */
 async function describeImagesWithVision(params: {
   queue: QueueManager
   userText: string
   images: Array<{ id: string; path: string; mime: string; name?: string }>
   signal?: AbortSignal
+  keepLoaded: boolean
 }): Promise<string> {
   await window.api.slots.ensure('vision')
   if (params.signal?.aborted) {
-    await window.api.slots.ensure('chat').catch(() => undefined)
+    if (!params.keepLoaded) {
+      await window.api.slots.ensure('chat').catch(() => undefined)
+    }
     throw new Error('aborted')
   }
 
@@ -347,6 +373,18 @@ async function describeImagesWithVision(params: {
     }
   }
 
+  const status = await window.api.llm.status()
+  const visionUrl =
+    params.keepLoaded && status.visionBaseUrl?.trim()
+      ? status.visionBaseUrl.trim()
+      : undefined
+  if (params.keepLoaded && !visionUrl) {
+    throw new Error(
+      status.visionError?.trim() ||
+        'Vision model is not loaded. Press Load in Settings → Model (Keep vision loaded).'
+    )
+  }
+
   try {
     const res = await params.queue.chatStream({
       messages: [
@@ -359,11 +397,14 @@ async function describeImagesWithVision(params: {
       ],
       maxTokens: 768,
       priority: 'NORMAL',
-      signal: params.signal
+      signal: params.signal,
+      ...(visionUrl ? { baseUrl: visionUrl } : {})
     })
     return (res.text ?? '').trim()
   } finally {
-    await window.api.slots.ensure('chat')
+    if (!params.keepLoaded) {
+      await window.api.slots.ensure('chat')
+    }
   }
 }
 
@@ -491,8 +532,6 @@ export function shouldSkipThinkPlanCeremony(
 
 const DEFAULT_MAX_ROUNDS = 64
 const TOOL_RESULT_CHARS = 6_000
-/** 4096 often truncates mid-tool-JSON. */
-const AGENT_MAX_TOKENS = 8192
 /** Cyrillic/code runs denser than English. */
 const CHARS_PER_TOKEN = 3.2
 /**
@@ -827,13 +866,13 @@ function ensureClosingMessage(
 function upsertTodoBubble(
   messages: ChatMessage[],
   steps: AgentTodoStep[],
-  opts?: { afterId?: string }
+  opts?: { afterId?: string; failed?: boolean }
 ): void {
   if (steps.length === 0) return
   const msg: ChatMessage = {
     id: AGENT_TODO_MSG_ID,
     role: 'assistant',
-    content: formatTodoUiContent(steps)
+    content: formatTodoUiContent(steps, { failed: opts?.failed })
   }
   const existing = messages.findIndex((m) => m.id === AGENT_TODO_MSG_ID)
   if (existing >= 0) messages.splice(existing, 1)
@@ -879,7 +918,8 @@ function recordTurnFileChange(
   name: string,
   pathRaw: string | undefined,
   codePreview: string | undefined,
-  args?: Record<string, unknown>
+  args?: Record<string, unknown>,
+  diskStat?: { added: number; removed: number } | null
 ): void {
   if (!pathRaw?.trim()) return
   const path = pathRaw.replace(/\\/g, '/')
@@ -888,6 +928,13 @@ function recordTurnFileChange(
   let deleted = name === 'delete_file'
   if (name === 'delete_file') {
     deleted = true
+    if (diskStat && (diskStat.added > 0 || diskStat.removed > 0)) {
+      added = diskStat.added
+      removed = diskStat.removed
+    }
+  } else if (diskStat && (diskStat.added > 0 || diskStat.removed > 0)) {
+    added = diskStat.added
+    removed = diskStat.removed
   } else {
     const fromPreview = diffStatFromCodePreview(name, codePreview)
     if (fromPreview && (fromPreview.added > 0 || fromPreview.removed > 0)) {
@@ -1167,12 +1214,98 @@ function shouldCompactForOverflow(msgs: ApiMessage[], ctxSize: number): boolean 
 }
 
 /** Drop bulky write/patch payloads from history so we don't compact after every file. */
+function countLinesFromWriteArgs(argsJson: string): number | null {
+  const content = extractJsonStringField(argsJson, 'content')
+  if (!content) return null
+  return content.split(/\r?\n/).length
+}
+
+function writeOnDiskStubArgs(path: string | null, lines: number | null, latest: boolean): string {
+  return JSON.stringify({
+    ...(path ? { relative_path: path } : {}),
+    note: latest
+      ? `FILE_COMPLETE on disk${lines != null ? `, ${lines} lines` : ''} — do not rewrite`
+      : '[earlier write omitted — file is on disk]'
+  })
+}
+
+/** Keep path + FILE_COMPLETE; drop full content so compact does not erase "already on disk". */
+function slimWriteSuccessResult(content: string): string | null {
+  const c = content.trim()
+  if (!/^(Wrote |Appended )|\bFILE_COMPLETE\b/i.test(c)) return null
+  const path =
+    c.match(/bytes to\s+(\S+?)(?:\s|\(|$)/i)?.[1] ||
+    c.match(/"([A-Za-z0-9_./\\-]+\.[a-zA-Z0-9]+)"/)?.[1] ||
+    null
+  const lines = c.match(/lines=(\d+)/i)?.[1]
+  const flags = content
+    .split('\n')
+    .filter((l) =>
+      /I18N_SANITY|EDIT_SANITY|LANDING_CONTRACT|WRITE_ONCE|WRITE_FILE_REQUIRED|INCOMPLETE_WRITE|AGENT_HINT/i.test(
+        l
+      )
+    )
+    .join('\n')
+  const stub =
+    `${(path || 'file').replace(/\\/g, '/')}: FILE_COMPLETE on disk` +
+    (lines ? ` (${lines} lines)` : '') +
+    '. Do not rewrite this file.'
+  return flags ? `${stub}\n${flags}` : stub
+}
+
+function collectOnDiskWritePaths(msgs: ApiMessage[]): string[] {
+  const written = new Set<string>()
+  for (const m of msgs) {
+    if (m.role === 'assistant' && m.tool_calls?.length) {
+      for (const t of m.tool_calls) {
+        if (
+          t.function.name !== 'write_file' &&
+          t.function.name !== 'apply_patch' &&
+          t.function.name !== 'apply_diff'
+        ) {
+          continue
+        }
+        const p = extractJsonStringField(t.function.arguments || '', 'relative_path')
+        if (p) written.add(p.replace(/\\/g, '/'))
+      }
+    }
+    if (m.role === 'tool') {
+      const c = apiContentText(m.content)
+      if (!/Wrote |Appended |FILE_COMPLETE/i.test(c)) continue
+      const pathMatch = c.match(
+        /(?:to|on)\s+"?([A-Za-z0-9_./\\-]+\.[a-zA-Z0-9]+)"?/
+      )
+      if (pathMatch?.[1]) written.add(pathMatch[1].replace(/\\/g, '/'))
+    }
+  }
+  return [...written]
+}
+
 function slimCompletedWriteToolCalls(msgs: ApiMessage[]): void {
+  const lastByPath = new Map<string, { msgI: number; callI: number }>()
+  for (let i = 0; i < msgs.length; i++) {
+    const m = msgs[i]
+    if (m?.role !== 'assistant' || !m.tool_calls?.length) continue
+    m.tool_calls.forEach((t, callI) => {
+      const name = t.function.name
+      if (
+        name !== 'write_file' &&
+        name !== 'apply_patch' &&
+        name !== 'apply_diff' &&
+        name !== 'generate_image'
+      ) {
+        return
+      }
+      const path = extractJsonStringField(t.function.arguments || '', 'relative_path')
+      if (!path) return
+      lastByPath.set(path.replace(/\\/g, '/').toLowerCase(), { msgI: i, callI })
+    })
+  }
   for (let i = 0; i < msgs.length; i++) {
     const m = msgs[i]
     if (m?.role !== 'assistant' || !m.tool_calls?.length) continue
     let changed = false
-    const nextCalls = m.tool_calls.map((t) => {
+    const nextCalls = m.tool_calls.map((t, callI) => {
       const name = t.function.name
       if (
         name !== 'write_file' &&
@@ -1183,17 +1316,17 @@ function slimCompletedWriteToolCalls(msgs: ApiMessage[]): void {
         return t
       }
       const argsJson = t.function.arguments || ''
-      if (argsJson.length < 500) return t
       const path = extractJsonStringField(argsJson, 'relative_path')
+      const key = path ? path.replace(/\\/g, '/').toLowerCase() : ''
+      const last = key ? lastByPath.get(key) : undefined
+      const latest = Boolean(last && last.msgI === i && last.callI === callI)
+      if (argsJson.length < 500 && !latest) return t
       changed = true
       return {
         ...t,
         function: {
           ...t.function,
-          arguments: JSON.stringify({
-            ...(path ? { relative_path: path } : {}),
-            note: '[body omitted — file is on disk]'
-          })
+          arguments: writeOnDiskStubArgs(path, countLinesFromWriteArgs(argsJson), latest)
         }
       }
     })
@@ -1222,6 +1355,8 @@ function slimToolArgs(name: string, argsJson: string): string {
 function slimMessage(m: ApiMessage, opts?: { keepReadsFull?: boolean }): ApiMessage {
   if (m.role === 'tool') {
     const c = apiContentText(m.content)
+    const writeStub = slimWriteSuccessResult(c)
+    if (writeStub) return { ...m, content: writeStub }
     if (c.length <= COMPACT_TOOL_RESULT_MAX) return { ...m, content: c }
     // Squeezing a fresh read down to 480 chars made the model forget the file
     // and read it again — the second loop path. Keep the newest reads usable.
@@ -1262,15 +1397,18 @@ function slimMessage(m: ApiMessage, opts?: { keepReadsFull?: boolean }): ApiMess
   return m
 }
 
-/** Last-resort shrink: system (capped) + single continue user. Always fits 8k. */
+/** Last-resort shrink: keep full system/rules; drop history, not AGENT_RULES. */
 function nuclearFitMessages(msgs: ApiMessage[], ctxSize: number): ApiMessage[] {
   const sys = msgs.find((m) => m.role === 'system')
-  let sysText = stripCompactBlocks(
+  const sysText = stripCompactBlocks(
     stripChecklistBlock(apiContentText(sys?.content ?? ''))
   ).trim()
-  if (sysText.length > COMPACT_SYSTEM_MAX_CHARS) {
-    sysText = sysText.slice(0, COMPACT_SYSTEM_MAX_CHARS) + '\n…[system truncated]'
-  }
+  const onDisk = collectOnDiskWritePaths(msgs)
+  const diskNote =
+    onDisk.length > 0
+      ? `\n\nOn disk FILE_COMPLETE (do not rewrite, do not apply_diff from scratch):\n` +
+        onDisk.map((p) => `- ${p}`).join('\n')
+      : ''
   const lastUser = [...msgs].reverse().find((m) => m.role === 'user')
   let userText = apiContentText(lastUser?.content ?? '')
   if (/\[Document:/i.test(userText) || /\[File:/i.test(userText)) {
@@ -1284,16 +1422,17 @@ function nuclearFitMessages(msgs: ApiMessage[], ctxSize: number): ApiMessage[] {
     userText =
       'Continue the unfinished task. Prefer short tool calls. Do not read binary/image files as text.'
   }
+  userText = (userText + diskNote).trim()
   const out = normalizeApiMessages([
     { role: 'system', content: sysText },
     { role: 'user', content: userText }
   ])
-  // If somehow still huge, truncate system further against budget.
+  // Truncate the user turn only — never slice system/rules.
   const budgetChars = Math.max(2000, (ctxSize > 0 ? ctxSize : 8192) * CHARS_PER_TOKEN * 0.5)
-  if (estimateChars(out) > budgetChars && out[0]) {
-    out[0] = {
-      ...out[0],
-      content: apiContentText(out[0].content).slice(0, Math.floor(budgetChars * 0.6))
+  if (estimateChars(out) > budgetChars && out[1]) {
+    out[1] = {
+      ...out[1],
+      content: apiContentText(out[1].content).slice(0, Math.floor(budgetChars * 0.35))
     }
   }
   return out
@@ -1353,7 +1492,7 @@ async function compactApiMessages(
   const tree = await fetchProjectTreeDigest()
   const fromHeuristic =
     written.size > 0
-      ? `\nAlready touched paths (do NOT recreate; append or apply_patch only):\n` +
+      ? `\nOn disk FILE_COMPLETE (do not recreate; do not apply_diff from scratch):\n` +
         [...written].slice(-40).map((p) => `- ${p}`).join('\n')
       : ''
 
@@ -1384,14 +1523,17 @@ async function compactApiMessages(
   const memoryBody =
     (llmSummary.trim() || digestLines.slice(-30).join('\n') || '(no prior middle turns)').slice(
       0,
-      2_500
+      800
     )
   const digestBlock =
     '\n\n[Context compacted due to context-window pressure]\n' +
     memoryBody +
     checklistBlock +
-    tree.slice(0, 2_000) +
-    '\n\nCRITICAL: Continue from EXISTING files. Small HTML/CSS → write_file overwrite=true with the full file. Large files → apply_patch. Do not invent duplicate filenames. Never read .png/.jpg/.webp/.gif as text.'
+    tree.slice(0, 600) +
+    '\n\nCRITICAL: Paths listed above are already on disk (FILE_COMPLETE). ' +
+    'Next missing landing file → write_file with the COMPLETE file. ' +
+    'Do not apply_diff a new/incomplete module. Do not invent duplicate filenames. ' +
+    'Never read .png/.jpg/.webp/.gif as text.'
 
   // Drop orphan tool rows from tail (must follow an assistant tool_calls)
   let tail = rawTail
@@ -1399,11 +1541,13 @@ async function compactApiMessages(
     tail = tail.slice(1)
   }
 
-  let sysContent =
-    stripCompactBlocks(stripChecklistBlock(apiContentText(sys.content))) + digestBlock
-  if (sysContent.length > COMPACT_SYSTEM_MAX_CHARS) {
-    sysContent = sysContent.slice(0, COMPACT_SYSTEM_MAX_CHARS) + '\n…[compact truncated]'
-  }
+  const sysBase = stripCompactBlocks(stripChecklistBlock(apiContentText(sys.content)))
+  // Cap the digest only — never slice AGENT_RULES / system.
+  const digestOnly =
+    digestBlock.length > COMPACT_SYSTEM_MAX_CHARS
+      ? digestBlock.slice(0, COMPACT_SYSTEM_MAX_CHARS) + '\n…[compact digest truncated]'
+      : digestBlock
+  const sysContent = sysBase + digestOnly
 
   let compacted: ApiMessage[] = [
     {
@@ -2075,8 +2219,59 @@ export async function runAgentTurn(params: {
   let lastCssWrite = ''
   let lastCssWritePath = 'styles.css'
   let i18nSanityFailed = false
+  let lastI18nHint = ''
+  let i18nRecoveryEdits = 0
   let editSanityFailed = false
+  const completeLandingWritesByPath = new Map<string, number>()
+  const landingRecoveryUsedByPath = new Set<string>()
+  let lastSanityFailedPath = ''
   const completeHtmlByPath = new Set<string>()
+
+  const invokeApplyHandoff = async (
+    callId: string,
+    relativePath: string,
+    contentSnippet: string
+  ): Promise<AgentToolResult> => {
+    const result = await window.api.agent.invoke({
+      id: callId,
+      name: 'apply_diff',
+      arguments: buildApplyHandoffArgs({
+        relativePath,
+        userText: params.userText,
+        content: contentSnippet
+      })
+    })
+    const note = result.ok ? ' (write_file handed off to apply_diff)' : ''
+    return {
+      ...result,
+      name: 'apply_diff',
+      content: `${result.content || ''}${note}`.trim()
+    }
+  }
+
+  const bufferCompleteForPath = (relativePath: string): boolean =>
+    priorCompleteForWritePath({
+      relativePath,
+      lastHtml: lastHtmlWrite,
+      lastJs: lastJsWrite,
+      lastCss: lastCssWrite
+    })
+
+  const pathLooksCompleteOnDisk = async (relativePath: string): Promise<boolean> => {
+    if (bufferCompleteForPath(relativePath)) return true
+    const key = loopPathKey(relativePath)
+    if (key && completeHtmlByPath.has(key) && /\.html?$/i.test(relativePath)) return true
+    try {
+      const disk = await window.api.workspace.readFile(relativePath)
+      if (!disk.ok || typeof disk.content !== 'string' || !disk.content.trim()) {
+        return false
+      }
+      return contentLooksStructurallyComplete(disk.content, relativePath)
+    } catch {
+      return false
+    }
+  }
+
   let planFinishNudges = 0
   let sectionFillTried = true
   /** A mutating edit (write_file / apply_diff / apply_patch) succeeded this turn. */
@@ -2097,12 +2292,17 @@ export async function runAgentTurn(params: {
     : params.userText
 
   if (imageRefs.length > 0) {
-    if (!appSettings.visionModelPath?.trim()) {
+    const reuseVision = visionReusesChatModel({
+      chatPath: appSettings.modelPath,
+      visionPath: appSettings.visionModelPath,
+      mmprojPath: appSettings.visionMmprojPath
+    })
+    if (!reuseVision && !appSettings.visionModelPath?.trim()) {
       messages.push({
         id: uid(),
         role: 'assistant',
         content:
-          'Images or scanned document pages are attached, but no vision model is configured. Set Vision model (+ mmproj) in Settings → Multimodal, then retry.'
+          'Images or scanned document pages are attached, but no vision model is configured. If Chat is already a VL GGUF, leave Vision empty and set mmproj. Otherwise pick a Vision GGUF in Settings → Model, then retry.'
       })
       return finishWithTiming(messages)
     }
@@ -2111,7 +2311,8 @@ export async function runAgentTurn(params: {
         queue: params.queue,
         userText: params.userText,
         images: imageRefs,
-        signal: params.signal
+        signal: params.signal,
+        keepLoaded: reuseVision || appSettings.visionKeepLoaded !== false
       })
       if (params.signal?.aborted) return finishStopped()
       if (description.trim()) {
@@ -2237,7 +2438,10 @@ export async function runAgentTurn(params: {
       archiveLiveTodoBubble(messages)
       return
     }
-    upsertTodoBubble(messages, clean, opts)
+    upsertTodoBubble(messages, clean, {
+      ...opts,
+      failed: todoCardFailed({ mutatingEditFailed, mutatingEditOk })
+    })
   }
   let usedWebSearch = false
   /** null until a test command runs */
@@ -2523,13 +2727,23 @@ export async function runAgentTurn(params: {
     const finalProse = streamedBest || (keptLive.length >= 40 ? keptLive : '')
     const thinkMissingNote =
       uiLang === 'ru'
-        ? '↻ Модель не выдала рассуждение — перехожу к плану и tools.'
-        : '↻ Model produced no reasoning — continuing to plan and tools.'
+        ? 'Модель не выдала рассуждение — перехожу к плану и tools.'
+        : 'Model produced no reasoning — continuing to plan and tools.'
     const uiThink = finalProse
       ? formatLiveThinkContent(`<think>\n${finalProse}\n</think>`)
-      : thinkMissingNote
-    const pIdx = messages.findIndex((m) => m.id === preludeId)
-    if (pIdx !== -1) {
+      : formatLiveThinkContent(`<think>\n${thinkMissingNote}\n</think>`)
+    let pIdx = messages.findIndex((m) => m.id === preludeId)
+    if (pIdx === -1) {
+      // Empty think never created a bubble — still show the fold so "Думал:" is visible.
+      messages.push({
+        id: preludeId,
+        role: 'assistant',
+        content: uiThink,
+        streaming: false
+      })
+      pIdx = messages.length - 1
+      params.onUpdate([...messages])
+    } else {
       // Never replace a non-empty live think fold with the "no reasoning" status line.
       const prevThink = liveThinkProse(messages[pIdx]!.content ?? '').trim()
       const nextContent =
@@ -2568,6 +2782,7 @@ export async function runAgentTurn(params: {
             'tool names, code, <think>. Stop after </plan>.'
         : 'PLAN_ONLY (tools still DISABLED). Output ONLY <plan>…</plan> with 3–9 ATOMIC steps from the user request ' +
             'and your prior <think> (what to create/change, in order). ' +
+            'If the user asked CSS/JS/assets before index.html, list steps in that dependency order (folders/assets → CSS → JS → HTML → README → preview). ' +
             'FORBIDDEN: tool names (execute_terminal_command, write_file, Start-Process, read_file), CSS class names as steps, ' +
             'syntax-check shells, «Закрыть», mega-steps, code, <think>. Stop after </plan>.'
     )
@@ -2680,12 +2895,22 @@ export async function runAgentTurn(params: {
     }
     pushUserMessage(
       apiMessages,
-      'Think/plan already recorded. Do NOT output another <think> or <plan>. ' +
-        'Call tools NOW to execute the plan IN ORDER. YOU decide: create missing files with write_file; ' +
-        'edit existing files with apply_diff / apply_patch (complete HTML: never full rewrite for small tweaks). ' +
-        'Do not Start-Process / browser / done-summary until non-browser plan steps are done — ' +
-        'EXCEPT when index.html is already a complete landing on disk and the user wants it opened: then Start-Process first. ' +
-        'If a tool edit fails, say so honestly — never claim "Сделано" / "done" when the change did not apply.'
+      allowsComposerFullRewrite(params.userText)
+        ? 'Think/plan already recorded. Do NOT output another <think> or <plan>. ' +
+            'Call tools NOW to execute the plan IN ORDER. This is a from-scratch / full rebuild: ' +
+            'ONE complete write_file per path (overwrite=true allow_full_rewrite=true only for the first write of that file). ' +
+            'Do NOT rewrite js/main.js or index.html after they are complete. Do NOT call apply_diff / Apply to regenerate a whole CSS/JS/HTML file. ' +
+            'data-i18n tags MUST contain visible default-language text (JS only swaps on toggle — never empty <h1 data-i18n>). ' +
+            'After styles.css exists, index.html MUST reuse its class names; inline SVG needs width/height; JS keys must match HTML data-i18n. ' +
+            'After CSS+HTML+JS exist, Start-Process once and STOP. ' +
+            'Do not Start-Process / browser / done-summary until non-browser plan steps are done. ' +
+            'If a tool edit fails, say so honestly — never claim "Сделано" / "done" when the change did not apply.'
+        : 'Think/plan already recorded. Do NOT output another <think> or <plan>. ' +
+            'Call tools NOW to execute the plan IN ORDER. YOU decide: create missing files with write_file; ' +
+            'edit existing HTML/CSS/JS with apply_diff instruction (or a short search_block) — never write_file overwrite a complete module. ' +
+            'Do not Start-Process / browser / done-summary until non-browser plan steps are done — ' +
+            'EXCEPT when index.html is already a complete landing on disk and the user wants it opened: then Start-Process first. ' +
+            'If a tool edit fails, say so honestly — never claim "Сделано" / "done" when the change did not apply.'
     )
     apiMessages = normalizeApiMessages(apiMessages)
     thinkSatisfied = true
@@ -2706,13 +2931,20 @@ export async function runAgentTurn(params: {
     apiMessages = normalizeApiMessages(apiMessages)
   }
 
-  if (!isPlan && looksLikeSurgicalFollowUp(params.userText)) {
+  if (
+    !isPlan &&
+    (looksLikeSurgicalFollowUp(params.userText) ||
+      looksLikeThemeToggleRequest(params.userText))
+  ) {
     thinkSatisfied = true
     pushUserMessage(
       apiMessages,
       formatSurgicalFollowUpHint({
         stacks,
-        i18nFix: looksLikeI18nFollowUp(params.userText)
+        i18nFix: looksLikeI18nFollowUp(params.userText),
+        themeToggle:
+          looksLikeThemeToggleRequest(params.userText) &&
+          !looksLikeI18nFollowUp(params.userText)
       })
     )
     apiMessages = normalizeApiMessages(apiMessages)
@@ -2724,10 +2956,12 @@ export async function runAgentTurn(params: {
   for (let round = 0; round < maxRounds; round++) {
     if (params.signal?.aborted) return finishStopped()
     if (forceEndTurn) {
-      todoSteps = settlePlanAfterWork(todoSteps, {
-        previewOpened: htmlPreviewOpened,
-        edited: mutatingEditOk
-      })
+      if (!mutatingEditFailed && !editSanityFailed && !i18nSanityFailed) {
+        todoSteps = settlePlanAfterWork(todoSteps, {
+          previewOpened: htmlPreviewOpened,
+          edited: mutatingEditOk
+        })
+      }
       if (todoSteps.length > 0) {
         paintTodo(todoSteps, { afterId: thinkBubbleId ?? undefined })
       }
@@ -2828,9 +3062,12 @@ export async function runAgentTurn(params: {
       ...(isPlan || completedTools > 0 || chatQa
         ? {}
         : { toolChoice: 'required' as const }),
-      maxTokens: appSettings.limitResponseLength
-        ? appSettings.maxTokens
-        : AGENT_MAX_TOKENS,
+      maxTokens: (() => {
+        const room = maxTokensForAgent(ctxSize, estimateTokens(apiMessages))
+        return appSettings.limitResponseLength
+          ? Math.min(appSettings.maxTokens, room)
+          : room
+      })(),
       signal: streamAc.signal,
       onToken: (token) => {
         if (streamAc.signal.aborted) return
@@ -3486,7 +3723,7 @@ export async function runAgentTurn(params: {
       }
 
       for (const [index, call] of toolCalls.entries()) {
-        const name = call.function.name as AgentToolName
+        let name = call.function.name as AgentToolName
         const parsedArgs = parseToolArguments(call.function.arguments || '{}')
         const args = parsedArgs.args
         const resolvedPath =
@@ -3495,17 +3732,18 @@ export async function runAgentTurn(params: {
             : coerceToolRelativePath(args)
         if (resolvedPath) args.relative_path = resolvedPath
 
-        // Unlock full rewrite only for explicit rewrite asks, or non-HTML after patch-fail limit.
-        // Finished HTML landings must never auto-escalate to whole-file overwrite.
+        // Unlock full rewrite for from-scratch / explicit rewrite, or non-HTML after patch-fail limit.
+        // Small surgical follow-ups on finished HTML must never auto-escalate to whole-file overwrite.
         if (name === 'write_file' && resolvedPath) {
           const pk = loopPathKey(resolvedPath)
           const fails = pk ? (patchFailsByPath.get(pk) ?? 0) : 0
           const isHtml = /\.html?$/i.test(resolvedPath)
           if (
-            looksLikeExplicitRewrite(params.userText) ||
+            allowsComposerFullRewrite(params.userText) ||
             (!isHtml && fails >= MAX_PATCH_FAILS_BEFORE_OVERWRITE)
           ) {
             args.allow_full_rewrite = true
+            if (allowsComposerFullRewrite(params.userText)) args.overwrite = true
           }
         }
 
@@ -3749,11 +3987,13 @@ export async function runAgentTurn(params: {
             name,
             ok: false,
             content: '',
-            error: isHtml
+            error: isHtml && !allowsComposerFullRewrite(params.userText)
               ? `PATCH_FAIL_LIMIT: apply_patch/apply_diff already failed ${MAX_PATCH_FAILS_BEFORE_OVERWRITE}+ times on "${filePath}". ` +
                 'STOP calling apply_diff/apply_patch on this path. Write an honest short failure summary for the user (what you tried). Do NOT rewrite the whole file.'
               : `PATCH_FAIL_LIMIT: apply_patch/apply_diff already failed ${MAX_PATCH_FAILS_BEFORE_OVERWRITE}+ times on "${filePath}". ` +
-                'STOP retrying. One write_file overwrite=true with allow_full_rewrite=true if appropriate, or honest failure summary.'
+                (allowsComposerFullRewrite(params.userText)
+                  ? formatScratchWriteFileHint()
+                  : 'STOP retrying. One write_file overwrite=true with allow_full_rewrite=true if appropriate, or honest failure summary.')
           }
         } else if (
           (name === 'apply_diff' || name === 'apply_patch') &&
@@ -3769,6 +4009,24 @@ export async function runAgentTurn(params: {
             error:
               'MISSING_PATH: relative_path is required for apply_diff (e.g. "js/main.js"). ' +
               'Do not call apply_diff without a path.'
+          }
+        } else if (
+          (name === 'apply_diff' || name === 'apply_patch') &&
+          shouldRequireWriteFileForApply({
+            fromScratch: allowsComposerFullRewrite(params.userText),
+            path: filePath || String(args.relative_path ?? ''),
+            completeWritesThisTurn:
+              completeLandingWritesByPath.get(
+                loopPathKey(filePath || String(args.relative_path ?? ''))
+              ) ?? 0
+          })
+        ) {
+          toolResult = {
+            id: call.id,
+            name,
+            ok: false,
+            content: '',
+            error: formatWriteFileRequiredError(filePath || String(args.relative_path ?? ''))
           }
         } else if (
           name === 'apply_diff' &&
@@ -3788,6 +4046,33 @@ export async function runAgentTurn(params: {
               'Do not rewrite this file. If it is already complete: summarize ' +
               '(HTML stack: preview once; compiler stacks: verify_project once). ' +
               'Otherwise one SHORT apply_diff (search_block or a one-line instruction).'
+          }
+        } else if (
+          (name === 'apply_patch' || name === 'apply_diff' || name === 'write_file') &&
+          allowsComposerFullRewrite(params.userText) &&
+          isCappedLandingWritePath(filePath || String(args.relative_path ?? '')) &&
+          shouldRefuseLandingRewrite({
+            path: filePath || String(args.relative_path ?? ''),
+            completeWritesThisTurn:
+              completeLandingWritesByPath.get(
+                loopPathKey(filePath || String(args.relative_path ?? ''))
+              ) ?? 0,
+            recoveryUsedOnPath: landingRecoveryUsedByPath.has(
+              loopPathKey(filePath || String(args.relative_path ?? ''))
+            ),
+            sanityFailedOnThisPath:
+              lastSanityFailedPath ===
+                loopPathKey(filePath || String(args.relative_path ?? '')) &&
+              (editSanityFailed || i18nSanityFailed)
+          }) === 'refuse'
+        ) {
+          toolLoopHits++
+          toolResult = {
+            id: call.id,
+            name,
+            ok: false,
+            content: '',
+            error: formatWriteOnceError(filePath || String(args.relative_path ?? ''))
           }
         } else if (
           (name === 'apply_patch' || name === 'apply_diff') &&
@@ -3906,11 +4191,7 @@ export async function runAgentTurn(params: {
           }
         } else if (
           name === 'write_file' &&
-          shouldBlockSurgicalOverwrite({
-            userText: params.userText,
-            relativePath: String(resolvedPath || filePath || args.relative_path || ''),
-            overwrite: Boolean(args.overwrite) || Boolean(args.allow_full_rewrite)
-          })
+          inventedI18nVerifierPath(pathStr || String(resolvedPath || ''), params.userText)
         ) {
           toolResult = {
             id: call.id,
@@ -3918,8 +4199,47 @@ export async function runAgentTurn(params: {
             ok: false,
             content: '',
             error:
-              'SURGICAL_EDIT: do not overwrite this existing HTML/CSS/JS file. ' +
-              'Use apply_diff with a SHORT search_block. Do NOT rewrite the whole file.'
+              'INVENTED_FILE: do not write tmp/check.js (or check.js) to audit i18n. ' +
+              'Call read_file on index.html and js/main.js. Align data-i18n keys with the JS dict in ONE write_file on js/main.js. Stop — do not loop patches.'
+          }
+        } else if (
+          name === 'write_file' &&
+          pathStr &&
+          shouldHandoffWriteToApply({
+            userText: params.userText,
+            relativePath: pathStr
+          }) &&
+          !Boolean(args.append) &&
+          !Boolean(args.allow_full_rewrite) &&
+          (await pathLooksCompleteOnDisk(pathStr))
+        ) {
+          // Existing complete html/css/js on a small follow-up → Apply locates + inserts.
+          name = 'apply_diff'
+          toolResult = await invokeApplyHandoff(call.id, pathStr, contentStr)
+          syntheticResult = false
+        } else if (
+          name === 'write_file' &&
+          shouldBlockSurgicalOverwrite({
+            userText: params.userText,
+            relativePath: String(resolvedPath || filePath || args.relative_path || ''),
+            overwrite: Boolean(args.overwrite) || Boolean(args.allow_full_rewrite)
+          })
+        ) {
+          const blockPath = String(resolvedPath || filePath || args.relative_path || '')
+          if (blockPath && isComposerApplyPath(blockPath)) {
+            name = 'apply_diff'
+            toolResult = await invokeApplyHandoff(call.id, blockPath, contentStr)
+            syntheticResult = false
+          } else {
+            toolResult = {
+              id: call.id,
+              name,
+              ok: false,
+              content: '',
+              error:
+                'SURGICAL_EDIT: do not overwrite this existing HTML/CSS/JS file. ' +
+                'Use apply_diff with a short instruction. Do NOT rewrite the whole file.'
+            }
           }
         } else if (
           name === 'create_directory' &&
@@ -3969,12 +4289,42 @@ export async function runAgentTurn(params: {
             }
           }
         } else if (name === 'write_file' && codeIncomplete && pathStr && contentStr) {
+          const knownComplete =
+            bufferCompleteForPath(pathStr) || (await pathLooksCompleteOnDisk(pathStr))
+          if (
+            !shouldPersistIncompleteWrite({
+              knownComplete
+            })
+          ) {
+            if (
+              shouldHandoffWriteToApply({
+                userText: params.userText,
+                relativePath: pathStr
+              })
+            ) {
+              name = 'apply_diff'
+              toolResult = await invokeApplyHandoff(call.id, pathStr, contentStr)
+              syntheticResult = false
+            } else {
+              toolResult = {
+                id: call.id,
+                name,
+                ok: false,
+                content: '',
+                error:
+                  `FILE_COMPLETE: "${pathStr}" is already a complete file and this chunk was truncated. ` +
+                  (allowsComposerFullRewrite(params.userText)
+                    ? 'This is a rebuild — next call MUST be write_file overwrite=true allow_full_rewrite=true with the COMPLETE file. Do NOT retry Apply.'
+                    : 'Do NOT rewrite it. Use apply_diff with a short instruction, or send the complete file.')
+              }
+            }
+          } else {
           const appendN = (incompleteAppendsByPath.get(pathKey) ?? 0) + 1
           incompleteAppendsByPath.set(pathKey, appendN)
           const landing = allowsLandingOverwrite(pathStr, contentStr.length)
           const sourceLimit =
             isSourcePath(pathStr) && appendN >= MAX_INCOMPLETE_SOURCE_APPENDS
-          // Landing HTML: persist bytes, then force next step to overwrite with full file.
+          // New / incomplete file: persist bytes, then append.
           const partial = await window.api.agent.invoke({
             id: call.id,
             name,
@@ -3988,8 +4338,8 @@ export async function runAgentTurn(params: {
           if (
             !partial.ok &&
             /FILE_EXISTS/i.test(partial.error ?? partial.content ?? '') &&
-            !completeHtmlByPath.has(pathKey) &&
-            !contentLooksStructurallyComplete(lastHtmlWrite)
+            !bufferCompleteForPath(pathStr) &&
+            !knownComplete
           ) {
             saved = await window.api.agent.invoke({
               id: call.id,
@@ -4032,6 +4382,7 @@ export async function runAgentTurn(params: {
                 `INCOMPLETE_WRITE: continue with write_file append=true on THE SAME path "${pathStr}" after:\n<<<\n${tail}\n>>>`,
               editReview: saved.editReview
             }
+          }
           }
         } else {
           toolResult = await window.api.agent.invoke({
@@ -4087,24 +4438,38 @@ export async function runAgentTurn(params: {
                 }
               }
             } else if (landingRewrite || pathInFlight) {
-              // Already have a complete landing on disk — do not auto-clobber with a
-              // full rewrite (theme toggle / small tweaks) or incomplete content.
               const priorComplete =
-                Boolean(lastHtmlWrite) &&
-                contentLooksStructurallyComplete(lastHtmlWrite!) &&
-                lastHtmlWrite!.length >= 1500
-              const incomingComplete = contentLooksStructurallyComplete(contentStr)
+                bufferCompleteForPath(pathStr) ||
+                (await pathLooksCompleteOnDisk(pathStr))
+              const priorBody = /\.html?$/i.test(pathStr)
+                ? lastHtmlWrite
+                : /\.(jsx?|mjs|cjs)$/i.test(pathStr)
+                  ? lastJsWrite
+                  : /\.css$/i.test(pathStr)
+                    ? lastCssWrite
+                    : ''
+              const incomingComplete = contentLooksStructurallyComplete(contentStr, pathStr)
               const incomingIncomplete =
                 !incomingComplete ||
-                contentStr.length < (lastHtmlWrite?.length ?? 0) * 0.85
+                (priorBody.length > 0 && contentStr.length < priorBody.length * 0.85)
               const patchFails = pathKey
                 ? (patchFailsByPath.get(pathKey) ?? 0)
                 : 0
               const allowFull =
-                looksLikeExplicitRewrite(params.userText) ||
+                allowsComposerFullRewrite(params.userText) ||
                 (patchFails >= MAX_PATCH_FAILS_BEFORE_OVERWRITE &&
                   !/\.html?$/i.test(pathStr))
-              if ((priorComplete || incomingComplete) && !allowFull) {
+              if (
+                priorComplete &&
+                !allowFull &&
+                shouldHandoffWriteToApply({
+                  userText: params.userText,
+                  relativePath: pathStr
+                })
+              ) {
+                name = 'apply_diff'
+                toolResult = await invokeApplyHandoff(call.id, pathStr, contentStr)
+              } else if ((priorComplete || incomingComplete) && !allowFull) {
                 toolResult = {
                   id: call.id,
                   name,
@@ -4112,7 +4477,7 @@ export async function runAgentTurn(params: {
                   content: '',
                   error:
                     `FILE_COMPLETE: "${pathStr}" is already a complete file. Do NOT rewrite it. ` +
-                    'Use apply_diff / apply_patch for the requested change only.'
+                    'Use apply_diff with a short instruction for the requested change only.'
                 }
               } else if (priorComplete && incomingIncomplete && !allowFull) {
                 toolResult = {
@@ -4122,7 +4487,7 @@ export async function runAgentTurn(params: {
                   content: '',
                   error:
                     `FILE_COMPLETE: "${pathStr}" is already a complete file. Do NOT rewrite it. ` +
-                    'Finish remaining plan steps with apply_diff / apply_patch, or summarize.'
+                    'Finish remaining plan steps with apply_diff instruction, or summarize.'
                 }
               } else {
                 // Allowed full rewrite (explicit request or patch-fail limit).
@@ -4144,6 +4509,19 @@ export async function runAgentTurn(params: {
                 }
               }
             }
+          } else if (
+            name === 'write_file' &&
+            !toolResult.ok &&
+            /FILE_COMPLETE|SURGICAL_EDIT/i.test(toolResult.error ?? toolResult.content ?? '') &&
+            pathStr &&
+            shouldHandoffWriteToApply({
+              userText: params.userText,
+              relativePath: pathStr
+            }) &&
+            !Boolean(args.allow_full_rewrite)
+          ) {
+            name = 'apply_diff'
+            toolResult = await invokeApplyHandoff(call.id, pathStr, contentStr)
           } else if (parsedArgs.parseError && toolResult.ok) {
             toolResult = {
               ...toolResult,
@@ -4180,7 +4558,8 @@ export async function runAgentTurn(params: {
         // Track apply_patch / apply_diff failures → unlock overwrite after 2 fails.
         if (
           (name === 'apply_patch' || name === 'apply_diff') &&
-          !toolResult.ok
+          !toolResult.ok &&
+          !/WRITE_ONCE|WRITE_FILE_REQUIRED/i.test(toolResult.error ?? '')
         ) {
           const failPath = (
             toolResult.editReview?.path ||
@@ -4209,7 +4588,11 @@ export async function runAgentTurn(params: {
             patchFailsByPath.set(loopPathKey(failPath), n)
             if (n >= MAX_PATCH_FAILS_BEFORE_OVERWRITE) {
               const isHtml = /\.html?$/i.test(failPath)
-              const hint = isHtml
+              const scratch = allowsComposerFullRewrite(params.userText)
+              const hint = scratch
+                ? `PATCH_FAIL_LIMIT: apply_patch/apply_diff failed ${n} times on "${failPath}". ` +
+                  formatScratchWriteFileHint()
+                : isHtml
                 ? `PATCH_FAIL_LIMIT: apply_patch/apply_diff failed ${n} times on "${failPath}". ` +
                   `STOP rewriting. Try ONE different apply_diff with a shorter unique search_block from the file on disk, ` +
                   `or write an honest failure summary. Do NOT write_file the whole file.`
@@ -4265,7 +4648,8 @@ export async function runAgentTurn(params: {
           }
         } else if (
           !toolResult.ok &&
-          (name === 'write_file' || name === 'apply_diff' || name === 'apply_patch')
+          (name === 'write_file' || name === 'apply_diff' || name === 'apply_patch') &&
+          !/WRITE_ONCE|WRITE_FILE_REQUIRED/i.test(toolResult.error ?? '')
         ) {
           mutatingEditFailed = true
           const failPath =
@@ -4437,12 +4821,63 @@ export async function runAgentTurn(params: {
             cssPath: lastCssWritePath,
             userText: params.userText
           })
+          const capKey = loopPathKey(written)
+          const writesBefore = capKey
+            ? (completeLandingWritesByPath.get(capKey) ?? 0)
+            : 0
+          const wasLandingRecovery =
+            allowsComposerFullRewrite(params.userText) &&
+            Boolean(capKey) &&
+            shouldRefuseLandingRewrite({
+              path: written,
+              completeWritesThisTurn: writesBefore,
+              recoveryUsedOnPath: landingRecoveryUsedByPath.has(capKey),
+              sanityFailedOnThisPath:
+                lastSanityFailedPath === capKey &&
+                (editSanityFailed || i18nSanityFailed)
+            }) === 'allow_recovery'
+          const recoveringI18n =
+            i18nSanityFailed &&
+            isLandingJsPath(written)
+          if (recoveringI18n) i18nRecoveryEdits++
+          if (
+            allowsComposerFullRewrite(params.userText) &&
+            capKey &&
+            isCappedLandingWritePath(written) &&
+            contentLooksStructurallyComplete(body, written)
+          ) {
+            completeLandingWritesByPath.set(capKey, writesBefore + 1)
+            if (wasLandingRecovery) landingRecoveryUsedByPath.add(capKey)
+          }
           if (hint) {
             editSanityFailed = true
-            if (/I18N_SANITY/i.test(hint)) i18nSanityFailed = true
+            lastSanityFailedPath = /no visible fallback|visible fallback/i.test(hint)
+              ? loopPathKey(lastHtmlWritePath || 'index.html')
+              : capKey
+            if (/I18N_SANITY/i.test(hint)) {
+              i18nSanityFailed = true
+              lastI18nHint = hint
+            } else {
+              i18nSanityFailed = false
+              lastI18nHint = ''
+            }
             toolResult = {
               ...toolResult,
               content: `${toolResult.content || ''}\n${hint}`.trim()
+            }
+          } else {
+            editSanityFailed = false
+            i18nSanityFailed = false
+            lastI18nHint = ''
+            if (lastSanityFailedPath === capKey) lastSanityFailedPath = ''
+          }
+          if (/\.css$/i.test(written) && lastCssWrite) {
+            const contract = formatLandingCssContractHint(lastCssWrite)
+            if (contract) {
+              toolResult = {
+                ...toolResult,
+                content: `${toolResult.content || ''}\n${contract}`.trim()
+              }
             }
           }
         }
@@ -4484,7 +4919,7 @@ export async function runAgentTurn(params: {
         }
         if (
           !toolResult.ok ||
-          /TOOL_LOOP|INCOMPLETE_WRITE_LIMIT|FILE_EXISTS|FILE_COMPLETE|PATCH_OK_LIMIT|PATCH_FAIL_LIMIT|SMART_APPLY_FAIL|APPLY_UNAVAILABLE|THINK_REQUIRED|SURGICAL_EDIT|SURGICAL_CSS|I18N_SANITY|EDIT_SANITY/i.test(
+          /TOOL_LOOP|INCOMPLETE_WRITE_LIMIT|FILE_EXISTS|FILE_COMPLETE|PATCH_OK_LIMIT|PATCH_FAIL_LIMIT|SMART_APPLY_FAIL|APPLY_UNAVAILABLE|THINK_REQUIRED|SURGICAL_EDIT|SURGICAL_CSS|I18N_SANITY|EDIT_SANITY|WRITE_ONCE|WRITE_FILE_REQUIRED/i.test(
             toolResult.error ?? toolResult.content ?? ''
           )
         ) {
@@ -4673,7 +5108,7 @@ export async function runAgentTurn(params: {
           const doneActivity = activityForTool(name, activityArgs, {
             streaming: false,
             ok: toolResult.ok,
-            partial: incompleteSaved || softRedirect,
+            partial: incompleteSaved,
             resultContent: content,
             fileCount: exploreFileCount
           })
@@ -4710,7 +5145,8 @@ export async function runAgentTurn(params: {
               ? { path: reviewPath!, status: 'pending' }
               : autoApprove && reviewPath && toolResult.ok
                 ? { path: reviewPath, status: 'accepted' }
-                : messages[idx].editReview
+                : messages[idx].editReview,
+            diffStat: toolResult.diffStat ?? messages[idx].diffStat
           }
 
           if (toolResult.ok && name === 'generate_image' && params.sessionId) {
@@ -4768,11 +5204,19 @@ export async function runAgentTurn(params: {
                   name,
                   paths[pi],
                   pi === 0 ? preview : undefined,
-                  args
+                  args,
+                  toolResult.diffStat
                 )
               }
             } else {
-              recordTurnFileChange(turnFileChanges, name, changePath, preview, args)
+              recordTurnFileChange(
+                turnFileChanges,
+                name,
+                changePath,
+                preview,
+                args,
+                toolResult.diffStat
+              )
             }
           }
         }
@@ -4793,16 +5237,23 @@ export async function runAgentTurn(params: {
       // (Former early-return stopped mixed tasks after the first PNG.)
 
       if (htmlPreviewOpened || mutatingEditOk) {
-        todoSteps = settlePlanAfterWork(todoSteps, {
-          previewOpened: htmlPreviewOpened,
-          edited: mutatingEditOk
-        })
+        if (!mutatingEditFailed && !editSanityFailed && !i18nSanityFailed) {
+          todoSteps = settlePlanAfterWork(todoSteps, {
+            previewOpened: htmlPreviewOpened,
+            edited: mutatingEditOk
+          })
+        }
         if (todoSteps.length > 0) {
           paintTodo(todoSteps, { afterId: thinkBubbleId ?? undefined })
         }
       }
 
-      const workSettled = htmlPreviewOpened && mutatingEditOk
+      const workSettled =
+        htmlPreviewOpened &&
+        mutatingEditOk &&
+        !mutatingEditFailed &&
+        !editSanityFailed &&
+        !i18nSanityFailed
       if (workSettled && !settledStopAsked) {
         settledStopAsked = true
         concludeAsked = true
@@ -4850,40 +5301,69 @@ export async function runAgentTurn(params: {
             apiMessages,
             'Do not repeat the failed call. Use structured tools only; write_file content must be pure source code with no tool markup.'
           )
-        } else if (/I18N_SANITY|EDIT_SANITY/i.test(tc)) {
+        } else if (/WRITE_ONCE/i.test(tc)) {
           appendToolHint(
             apiMessages,
-            /I18N_SANITY/i.test(tc)
-              ? 'I18N_SANITY: rewrite js/main.js so every translation value is a STRING. ' +
-                'Never assign objects/arrays to textContent (that is "[object Object]"). ' +
-                'Use [data-i18n="key"] selectors that exist in index.html. Then preview once — do not claim the switcher works yet.'
-              : 'EDIT_SANITY: the last file is structurally incomplete. Finish THAT path before claiming done. Do not start another file.'
+            'WRITE_ONCE: that file is already complete in this turn. ' +
+              'Write any still-missing path, or Start-Process (Resolve-Path .\\index.html) ONCE, then STOP. ' +
+              'Do not rewrite js/main.js.'
+          )
+        } else if (/WRITE_FILE_REQUIRED/i.test(tc)) {
+          appendToolHint(
+            apiMessages,
+            'WRITE_FILE_REQUIRED: this landing file is new or not complete this turn. ' +
+              formatScratchWriteFileHint()
+          )
+        } else if (/I18N_SANITY|EDIT_SANITY|LANDING_CONTRACT/i.test(tc)) {
+          appendToolHint(
+            apiMessages,
+            /I18N_SANITY/i.test(tc) && !/HTML class names are not in CSS|Inline SVG|stylesheet/i.test(tc)
+              ? /visible fallback|no visible fallback/i.test(tc)
+                ? `${(lastI18nHint || tc).split('\n')[0]} ` +
+                  'Fix index.html ONCE: put visible default-language text inside data-i18n tags. ' +
+                  'Reuse CSS class names. Match JS keys. Then STOP. Do not rewrite js/main.js.'
+                : `${(lastI18nHint || tc).split('\n')[0]} ` +
+                  'Fix js/main.js ONCE (string dict + matching keys), then STOP. ' +
+                  'Do not write tmp/check.js, node -e, or rename HTML keys in a loop. ' +
+                  'Do not claim the language switcher works yet.'
+              : /structurally incomplete/i.test(tc)
+                ? 'EDIT_SANITY: the last file is structurally incomplete. Finish THAT path before claiming done. Do not start another file.'
+                : 'LANDING_CONTRACT: HTML/CSS/JS must be ONE page. Reuse class names already in styles.css ' +
+                  '(do not invent .site-header if CSS has .navbar). Size inline SVG (width/height). ' +
+                  'JS #id and data-i18n keys must match HTML. apply_diff the mismatched file. ' +
+                  'Do NOT Start-Process / claim done until the contract holds.'
           )
         } else if (/INCOMPLETE_WRITE/i.test(tc)) {
           appendToolHint(
             apiMessages,
-            'INCOMPLETE_WRITE: next call MUST be write_file with append=true on the SAME path only. Do not start another file.'
+            'INCOMPLETE_WRITE: if this is a NEW unfinished file, next call MUST be write_file append=true on the SAME path. ' +
+              'If the file was already complete, do NOT overwrite — apply_diff with a short instruction only.'
           )
         } else if (/FILE_COMPLETE/i.test(tc)) {
           appendToolHint(
             apiMessages,
-            'FILE_COMPLETE: that file is already on disk and looks finished. Do NOT write_file / overwrite / rewrite it. ' +
-              'Use apply_diff (replace_all=true for a global rename). Then verify or summarize.'
+            allowsComposerFullRewrite(params.userText)
+              ? 'FILE_COMPLETE: this is a from-scratch / full rebuild. Do NOT retry Apply. ' +
+                'Call write_file overwrite=true allow_full_rewrite=true with the COMPLETE file content for that path.'
+              : 'FILE_COMPLETE: that file is already on disk and looks finished. Do NOT write_file / overwrite / rewrite it. ' +
+                'Call apply_diff with a short instruction (or a unique search_block). Then verify or summarize.'
           )
         } else if (/SMART_APPLY_FAIL|APPLY_UNAVAILABLE/i.test(tc)) {
           appendToolHint(
             apiMessages,
-            'SMART_APPLY_FAIL / APPLY_UNAVAILABLE: do not rewrite the file. ' +
-              'Call apply_diff with an exact search_block (replace_all=true for a global rename).'
+            allowsComposerFullRewrite(params.userText)
+              ? 'SMART_APPLY_FAIL: Apply cannot patch a new or incomplete landing file. ' +
+                formatScratchWriteFileHint()
+              : 'APPLY_UNAVAILABLE / SMART_APPLY_FAIL: the Apply model is not loaded or failed. Do NOT rewrite the file. ' +
+                'Load Apply in Settings, or call apply_diff with an exact short search_block. Never write_file overwrite a complete module.'
           )
         } else if (/FILE_EXISTS/i.test(tc)) {
           appendToolHint(
             apiMessages,
-            /index\.html|<\/html>|landing/i.test(tc) ||
-              (lastHtmlWrite && contentLooksStructurallyComplete(lastHtmlWrite))
-              ? 'FILE_EXISTS on a complete file: do NOT overwrite. Use apply_diff (replace_all=true for a global rename).'
-              : 'FILE_EXISTS: for small files you may write_file overwrite=true with the FULL file. ' +
-                  'For large files use apply_patch/apply_diff.'
+            allowsComposerFullRewrite(params.userText)
+              ? 'FILE_EXISTS: this is a rebuild. Call write_file overwrite=true allow_full_rewrite=true with the COMPLETE file. Do NOT apply_diff a whole module.'
+              : 'FILE_EXISTS: existing HTML/CSS/JS → apply_diff with a short instruction (or search_block). ' +
+                'write_file overwrite only for a NEW small file or an explicit full rewrite.'
           )
         } else if (/INLINE_ASSET/i.test(tc)) {
           appendToolHint(
@@ -4900,8 +5380,8 @@ export async function runAgentTurn(params: {
         } else if (/SURGICAL_EDIT/i.test(tc)) {
           appendToolHint(
             apiMessages,
-            'SURGICAL_EDIT handled: apply_diff was auto-invoked with the user request. ' +
-              'If it failed, do NOT write_file the whole file. Summarize or one more apply_diff with a short instruction only.'
+            'SURGICAL_EDIT: do not dump the whole file. apply_diff with a short instruction only ' +
+              '(no whole-file search_block). Do NOT write_file overwrite.'
           )
         } else if (/OVERWRITE_BLOCKED/i.test(tc)) {
           appendToolHint(
@@ -4983,8 +5463,10 @@ export async function runAgentTurn(params: {
         smartApplyFailHits = 0
         appendToolHint(
           apiMessages,
-          'Apply/patch is stuck on this file. Do NOT write_file / overwrite / rewrite it whole. ' +
-            'One apply_diff with replace_all=true if this is a rename, or a short honest summary of what failed.'
+          allowsComposerFullRewrite(params.userText)
+            ? 'Apply/patch is stuck on this from-scratch landing. ' + formatScratchWriteFileHint()
+            : 'Apply/patch is stuck on this file. Do NOT write_file / overwrite / rewrite it whole. ' +
+              'One apply_diff with replace_all=true if this is a rename, or a short honest summary of what failed.'
         )
         apiMessages = normalizeApiMessages(apiMessages)
       }
@@ -5007,10 +5489,12 @@ export async function runAgentTurn(params: {
         if (!missing && (htmlPreviewOpened || mutatingEditOk)) {
           concludeAsked = true
           settledStopAsked = true
-          todoSteps = settlePlanAfterWork(todoSteps, {
-            previewOpened: htmlPreviewOpened,
-            edited: mutatingEditOk
-          })
+          if (!mutatingEditFailed && !editSanityFailed && !i18nSanityFailed) {
+            todoSteps = settlePlanAfterWork(todoSteps, {
+              previewOpened: htmlPreviewOpened,
+              edited: mutatingEditOk
+            })
+          }
           if (todoSteps.length > 0) {
             paintTodo(todoSteps, { afterId: thinkBubbleId ?? undefined })
           }
@@ -5237,6 +5721,9 @@ export async function runAgentTurn(params: {
         edited: true
       })
     }
+    if (todoSteps.length > 0) {
+      paintTodo(todoSteps, { afterId: thinkBubbleId ?? undefined })
+    }
     const planStillOpen = pendingPlanWork(todoSteps).length > 0
     const falseSuccess =
       claimsEditSuccess &&
@@ -5246,9 +5733,7 @@ export async function runAgentTurn(params: {
         editSanityFailed)
     if (falseSuccess) {
       const why = i18nSanityFailed
-        ? uiLang === 'ru'
-          ? 'i18n всё ещё подставляет объекты в DOM ([object Object]) — значения перевода должны быть строками.'
-          : 'i18n still assigns objects to the DOM ([object Object]) — translation values must be strings.'
+        ? formatI18nCloserWhy(lastI18nHint, uiLang)
         : editSanityFailed
           ? uiLang === 'ru'
             ? 'Последняя запись файла структурно неполная — не рапортуем успех.'
@@ -5430,8 +5915,22 @@ export async function runAgentTurn(params: {
       !mutatingEditFailed &&
       !editSanityFailed
 
+    const i18nNudgeCapHit =
+      i18nSanityFailed && (earlyDoneNudges >= 1 || i18nRecoveryEdits >= 1)
+    const bundleReady = landingBundleReady(completeLandingWritesByPath)
+    const htmlCapKey = loopPathKey(lastHtmlWritePath || 'index.html')
+    const htmlRecoveryOpen =
+      i18nSanityFailed &&
+      /visible fallback|no visible fallback/i.test(lastI18nHint) &&
+      !landingRecoveryUsedByPath.has(htmlCapKey) &&
+      (completeLandingWritesByPath.get(htmlCapKey) ?? 0) >= 1
+    const skipLandingRewriteNudge = bundleReady && !htmlRecoveryOpen
+    const nudgeCap = i18nSanityFailed || htmlRecoveryOpen ? 1 : 3
+
     if (
-      earlyDoneNudges < 3 &&
+      !skipLandingRewriteNudge &&
+      !i18nNudgeCapHit &&
+      earlyDoneNudges < nudgeCap &&
       round < maxRounds - 1 &&
       looksPrematureDone &&
       !surgicalSettled
@@ -5458,7 +5957,10 @@ export async function runAgentTurn(params: {
           reqBlock +
           openPlan +
           (i18nSanityFailed
-            ? 'I18N_SANITY: translation values must be strings; do not claim the language switcher works. Fix js/main.js, then preview once.\n'
+            ? `${(lastI18nHint || 'I18N_SANITY').split('\n')[0]}\n` +
+              (/visible fallback|no visible fallback/i.test(lastI18nHint)
+                ? 'Fix index.html ONCE (visible text in data-i18n tags), then STOP. Do not rewrite js/main.js.\n'
+                : 'Fix js/main.js ONCE, then STOP. Do not write tmp/check.js, node -e, or loop HTML key renames.\n')
             : editSanityFailed
               ? 'EDIT_SANITY: last write is structurally incomplete. Finish that file, then verify. Do not claim done.\n'
               : fixFirst
@@ -5473,8 +5975,8 @@ export async function runAgentTurn(params: {
         messages,
         i18nSanityFailed
           ? uiLang === 'ru'
-            ? '↻ i18n всё ещё пишет объекты в DOM — чиню строки…'
-            : '↻ i18n still assigns objects — fixing string values…'
+            ? `↻ ${formatI18nCloserWhy(lastI18nHint, 'ru')} — одна правка js/main.js…`
+            : `↻ ${formatI18nCloserWhy(lastI18nHint, 'en')} — one js/main.js fix…`
           : editSanityFailed
             ? uiLang === 'ru'
               ? '↻ Файл ещё неполный — не рапортуем успех…'

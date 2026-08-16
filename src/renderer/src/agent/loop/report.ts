@@ -12,7 +12,7 @@ export function honestClosingNote(opts: {
 }): string | null {
   const { lang } = opts
   const ru = lang === 'ru'
-  if (opts.mutatingEditFailed) {
+  if (opts.mutatingEditFailed && !opts.mutatingEditOk) {
     return ru
       ? `Правка не применилась${opts.lastFail ? ` (${opts.lastFail})` : ''}. Задача не выполнена — не рапортуем успех.`
       : `Edit did not apply${opts.lastFail ? ` (${opts.lastFail})` : ''}. Task not completed — not reporting success.`

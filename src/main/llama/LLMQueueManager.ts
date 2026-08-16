@@ -44,6 +44,11 @@ export class LLMQueueManager {
     this.baseUrl = url.replace(/\/$/, '')
   }
 
+  private jobBaseUrl(request: LLMCompletionRequest): string {
+    const override = request.baseUrl?.trim()
+    return (override || this.baseUrl).replace(/\/$/, '')
+  }
+
   setDefaultModel(model: string | null): void {
     this.defaultModel = model
   }
@@ -215,7 +220,7 @@ export class LLMQueueManager {
           throw new DOMException('aborted', 'AbortError')
         }
         try {
-          const response = await fetch(`${this.baseUrl}${request.endpoint}`, {
+          const response = await fetch(`${this.jobBaseUrl(request)}${request.endpoint}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body),

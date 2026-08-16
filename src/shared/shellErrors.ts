@@ -77,6 +77,20 @@ export function productReadmeCloneRefusal(command: string): string | null {
   )
 }
 
+/**
+ * `node -e` with regex character classes breaks in PowerShell (`[` = type literal).
+ * i18n audits belong in read_file, not a one-liner or tmp/check.js.
+ */
+export function powershellNodeEvalRefusal(command: string): string | null {
+  const c = command.trim()
+  if (!c || !/\bnode(?:\.exe)?\s+(-e|--eval)\b/i.test(c)) return null
+  if (!/\[/.test(c) && !/data-i18n|i18n/i.test(c)) return null
+  return (
+    'SHELL_REFUSED: do not audit HTML/JS i18n with node -e. PowerShell treats `[` as a type ' +
+    'and breaks quoted regex. Call read_file on index.html and js/main.js. Do NOT write tmp/check.js.'
+  )
+}
+
 export function extractErrorFocus(text: string): string | null {
   const lines = text.split(/\n/)
   const markers: number[] = []

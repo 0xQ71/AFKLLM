@@ -3,7 +3,7 @@ import type { AppSettings, DiscoveredModel, UiTheme } from '../../../shared/sett
 import type { UiLanguage } from '../../../shared/i18n'
 import type { StoreDownloadTarget } from '../../../shared/hfStore'
 import { applyDocumentTheme, UI_THEMES } from '../../../shared/theme'
-import { isLikelyVisionGguf, scoreVisionGguf } from '../../../shared/visionDetect'
+import { isLikelyVisionGguf, scoreVisionGguf, VISION_SAME_AS_CHAT, isVisionSameAsChat } from '../../../shared/visionDetect'
 import { applyMonacoTheme } from '../editor/monacoSetup'
 import { useI18n } from '../i18n/I18nProvider'
 import { ModelStorePanel } from './ModelStorePanel'
@@ -64,14 +64,17 @@ export function OnboardingWizard({
     } else if (list.length > 0 && (!s.modelPath || !list.some((m) => m.path === s.modelPath))) {
       next = { ...next, modelPath: list[0]!.path }
     }
-    // Suggest best VL GGUF when vision path empty (optional — user can clear).
     if (!next.visionModelPath?.trim()) {
-      const ranked = [...list]
-        .map((m) => ({ m, score: scoreVisionGguf(m.path) }))
-        .filter((x) => x.score >= 0)
-        .sort((a, b) => b.score - a.score)
-      if (ranked[0]) {
-        next = { ...next, visionModelPath: ranked[0].m.path }
+      if (isLikelyVisionGguf(next.modelPath || '')) {
+        next = { ...next, visionModelPath: VISION_SAME_AS_CHAT }
+      } else {
+        const ranked = [...list]
+          .map((m) => ({ m, score: scoreVisionGguf(m.path) }))
+          .filter((x) => x.score >= 0)
+          .sort((a, b) => b.score - a.score)
+        if (ranked[0]) {
+          next = { ...next, visionModelPath: ranked[0].m.path }
+        }
       }
     }
     setSettings(next)
@@ -382,12 +385,16 @@ export function OnboardingWizard({
                     disabled={busy}
                   >
                     <option value="">{t('onboarding.models.visionSkip')}</option>
+                    <option value={VISION_SAME_AS_CHAT} disabled={!settings.modelPath?.trim()}>
+                      {t('settings.multimodal.visionSameAsChat')}
+                    </option>
                     {(visionModels.length > 0 ? visionModels : models).map((m) => (
                       <option key={m.path} value={m.path}>
                         {m.id} ({(m.sizeBytes / 1e9).toFixed(1)} GB)
                       </option>
                     ))}
                     {settings.visionModelPath &&
+                      !isVisionSameAsChat(settings.visionModelPath) &&
                       !models.some((m) => m.path === settings.visionModelPath) && (
                         <option value={settings.visionModelPath}>
                           {settings.visionModelPath.split(/[/\\]/).pop()}

@@ -89,6 +89,7 @@ const en = {
   'chat.checklist.shell': 'Shell',
   'chat.plan.statusDone': 'Done',
   'chat.plan.statusActive': 'In progress',
+  'chat.plan.statusFailed': 'Failed',
   'chat.auto': 'Auto',
   'chat.ask': 'Ask',
   'chat.think': 'Think',
@@ -124,7 +125,7 @@ const en = {
   'onboarding.models.openImageStore': 'Open image Store',
   'onboarding.models.visionTitle': 'Vision model (optional)',
   'onboarding.models.visionBody':
-    'Used when you attach a photo: chat unloads → vision describes → chat reloads. Leave empty to skip; you can set it later in Settings → Model.',
+    'If Chat is already a VL GGUF, pick “Same as chat” (one process + mmproj). Otherwise choose a separate vision GGUF; it loads with Chat when you press Load.',
   'onboarding.models.visionGguf': 'Vision GGUF',
   'onboarding.models.visionSkip': 'Skip — set later in Settings',
   'onboarding.models.visionClear': 'Clear',
@@ -302,13 +303,25 @@ const en = {
   'settings.model.loading': 'Cancel load…',
   'settings.model.applyStatus': 'Apply status',
   'settings.model.applyStatusHint': 'Set an apply GGUF above — Load starts it with chat in the same VRAM',
+  'settings.model.visionKeep': 'Keep vision loaded',
+  'settings.model.visionKeepHint':
+    'On: Load starts vision with chat + apply (port+2) and leaves it in VRAM. Off: swap in on attach, unload after the description. Reload after changing.',
+  'settings.model.visionKeepReuseHint':
+    'Chat is already the VL GGUF — mmproj is attached to that one llama-server. A second copy is not started.',
+  'settings.model.visionStatus': 'Vision status',
+  'settings.model.visionStatusHint': 'Set a vision GGUF above — Load starts it with chat when Keep vision loaded is on',
+  'settings.model.visionStatusSwap': 'Unload-after-use: vision is swapped in only when you attach a photo',
+  'settings.model.visionStatusReuse': 'Same GGUF as Chat + mmproj — one process, no port+2 copy',
   'settings.model.store': '── Model store (Hugging Face) ──',
   'settings.model.storeShort': 'Store',
 
   'settings.multimodal.intro':
-    'Exclusive slots: only one of chat / vision / image-gen is live. Others are killed and live on disk — never parked in RAM. Reloaded from disk when needed.',
+    'Image generation still exclusive: chat/apply/vision unload while sd-cli runs. Vision GGUF lives under Model (with Chat and Apply).',
   'settings.multimodal.visionModel': 'Vision model (.gguf)',
   'settings.multimodal.none': 'Not set',
+  'settings.multimodal.visionSameAsChat': 'Same as chat',
+  'settings.multimodal.visionSameAsChatHint':
+    'Uses the Chat GGUF + mmproj in one llama-server. Does not load a second copy.',
   'settings.multimodal.mmproj': 'Vision mmproj (.gguf)',
   'settings.multimodal.mmprojHint': 'Empty = auto-pick *mmproj* next to the vision model',
   'settings.multimodal.imageGenModel': 'Image gen model (diffusion)',
@@ -637,6 +650,11 @@ const en = {
   'status.phrase.visionReady': 'Vision model ready',
   'status.phrase.fromDisk': 'loaded from disk',
   'status.detail.chatReadyDisk': 'Chat model ready (loaded from disk)',
+  'status.detail.chatApplyReady': 'Chat + Apply ready (coresident in VRAM)',
+  'status.detail.chatApplyVisionReady': 'Chat + Apply + Vision ready (coresident in VRAM)',
+  'status.detail.chatVisionReady': 'Chat + Vision ready',
+  'status.detail.loadingApplyVram': 'Loading apply model into VRAM…',
+  'status.detail.loadingVisionVram': 'Loading vision model into VRAM…',
   'status.detail.visionReadyDisk': 'Vision model ready (loaded from disk)',
   'status.detail.unloadedDisk': 'Model unloaded to disk',
   'status.detail.vramFreeImage': 'Model on disk · VRAM free for image generation',
@@ -822,6 +840,7 @@ const ru: Record<MessageKey, string> = {
   'chat.checklist.shell': 'Терминал',
   'chat.plan.statusDone': 'Готово',
   'chat.plan.statusActive': 'В работе',
+  'chat.plan.statusFailed': 'Ошибка',
   'chat.auto': 'Авто',
   'chat.ask': 'Спрашивать',
   'chat.think': 'Думать',
@@ -857,7 +876,7 @@ const ru: Record<MessageKey, string> = {
   'onboarding.models.openImageStore': 'Открыть Store изображений',
   'onboarding.models.visionTitle': 'Vision-модель (необязательно)',
   'onboarding.models.visionBody':
-    'Нужна при attach фото: chat выгружается → vision описывает → chat снова грузится. Можно пропустить и указать позже в Настройки → Модель.',
+    'Если Chat уже VL GGUF — выберите «Та же что и Chat» (один процесс + mmproj). Иначе укажите отдельный vision GGUF; он поднимется вместе с Chat по Load.',
   'onboarding.models.visionGguf': 'Vision GGUF',
   'onboarding.models.visionSkip': 'Пропустить — позже в Настройках',
   'onboarding.models.visionClear': 'Очистить',
@@ -1038,13 +1057,26 @@ const ru: Record<MessageKey, string> = {
   'settings.model.applyStatus': 'Статус Apply',
   'settings.model.applyStatusHint':
     'Выберите apply GGUF выше — Загрузить поднимет её вместе с chat в тот же VRAM',
+  'settings.model.visionKeep': 'Держать vision в памяти',
+  'settings.model.visionKeepHint':
+    'Вкл: Load поднимает vision вместе с chat + apply (порт+2) и оставляет в VRAM. Выкл: подмена при attach фото, выгрузка после описания. После смены — Load снова.',
+  'settings.model.visionKeepReuseHint':
+    'Chat уже VL GGUF — mmproj вешается на тот же llama-server. Вторая копия не стартует.',
+  'settings.model.visionStatus': 'Статус Vision',
+  'settings.model.visionStatusHint':
+    'Выберите vision GGUF выше — при «держать в памяти» Load поднимет её вместе с chat',
+  'settings.model.visionStatusSwap': 'Выгрузка после использования: vision подменяется только при attach фото',
+  'settings.model.visionStatusReuse': 'Тот же GGUF что Chat + mmproj — один процесс, без копии на порт+2',
   'settings.model.store': '── Магазин моделей (Hugging Face) ──',
   'settings.model.storeShort': 'Магазин',
 
   'settings.multimodal.intro':
-    'Эксклюзивные слоты: живёт только один из chat / vision / image-gen. Остальные убиваются и остаются на диске — в RAM не паркуем. При необходимости грузим снова с диска.',
+    'Генерация картинок по-прежнему эксклюзивна: chat/apply/vision выгружаются, пока работает sd-cli. Vision GGUF — в разделе Модель (рядом с Chat и Apply).',
   'settings.multimodal.visionModel': 'Vision-модель (.gguf)',
   'settings.multimodal.none': 'Не задано',
+  'settings.multimodal.visionSameAsChat': 'Та же что и Chat',
+  'settings.multimodal.visionSameAsChatHint':
+    'Chat GGUF + mmproj на одном llama-server. Вторая копия не грузится.',
   'settings.multimodal.mmproj': 'Vision mmproj (.gguf)',
   'settings.multimodal.mmprojHint': 'Пусто = авто *mmproj* рядом с vision-моделью',
   'settings.multimodal.imageGenModel': 'Модель генерации (diffusion)',
@@ -1373,6 +1405,11 @@ const ru: Record<MessageKey, string> = {
   'status.phrase.visionReady': 'Vision-модель готова',
   'status.phrase.fromDisk': 'загружена с диска',
   'status.detail.chatReadyDisk': 'Чат-модель готова (загружена с диска)',
+  'status.detail.chatApplyReady': 'Chat + Apply готовы (вместе в VRAM)',
+  'status.detail.chatApplyVisionReady': 'Chat + Apply + Vision готовы (вместе в VRAM)',
+  'status.detail.chatVisionReady': 'Chat + Vision готовы',
+  'status.detail.loadingApplyVram': 'Загрузка apply-модели в VRAM…',
+  'status.detail.loadingVisionVram': 'Загрузка vision-модели в VRAM…',
   'status.detail.visionReadyDisk': 'Vision-модель готова (загружена с диска)',
   'status.detail.unloadedDisk': 'Модель выгружена на диск',
   'status.detail.vramFreeImage': 'Модель на диске · VRAM свободна для генерации изображений',

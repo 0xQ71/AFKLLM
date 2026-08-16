@@ -6,6 +6,7 @@ import {
   isUserInterruptExit,
   looksLikeGuiLaunchCommand,
   productReadmeCloneRefusal,
+  powershellNodeEvalRefusal,
   recursiveListingRefusal
 } from '../src/shared/shellErrors'
 import {
@@ -114,11 +115,60 @@ describe('product README clone refusal', () => {
       /SHELL_REFUSED/
     )
     assert.match(
+      productReadmeCloneRefusal(
+        'git clone https://github.com/0xQ71/AFKLLM.git /tmp/afkllm 2>&1 | Select-'
+      ) ?? '',
+      /SHELL_REFUSED/
+    )
+    assert.match(
       productReadmeCloneRefusal('git clone https://github.com/foo/bar.git /tmp/bar') ?? '',
       /SHELL_REFUSED/
     )
     assert.equal(productReadmeCloneRefusal('git clone https://github.com/foo/bar.git'), null)
     assert.equal(productReadmeCloneRefusal('git status'), null)
+  })
+})
+
+describe('powershell node -e refusal', () => {
+  it('blocks node -e regex character classes and i18n audits', () => {
+    const fromLog =
+      'node -e "const html=fs.readFileSync(\'index.html\',\'utf8\'); html.match(/data-i18n=\\"([^\\"]+)\\"/)"'
+    assert.match(powershellNodeEvalRefusal(fromLog) ?? '', /SHELL_REFUSED/)
+    assert.match(
+      powershellNodeEvalRefusal('node --eval "document.querySelectorAll(\'[data-i18n]\')"') ?? '',
+      /SHELL_REFUSED/
+    )
+    assert.equal(powershellNodeEvalRefusal('node -e "console.log(1)"'), null)
+    assert.equal(powershellNodeEvalRefusal('npm test'), null)
+  })
+
+  it('registry refuses the log clone and node -e before spawn', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'afkllm-shell-refuse-'))
+    try {
+      const reg = new AgentToolRegistry({ projectRoot: root })
+      const clone = await reg.invoke({
+        id: '1',
+        name: 'execute_terminal_command',
+        arguments: {
+          command: 'git clone https://github.com/0xQ71/AFKLLM.git /tmp/afkllm 2>&1 | Select-'
+        }
+      })
+      assert.equal(clone.ok, false)
+      assert.match(clone.error ?? '', /SHELL_REFUSED/)
+      const nodeE = await reg.invoke({
+        id: '2',
+        name: 'execute_terminal_command',
+        arguments: {
+          command:
+            'node -e "const html=require(\'fs\').readFileSync(\'index.html\',\'utf8\'); html.match(/data-i18n=\\"([^\\"]+)\\"/)"'
+        }
+      })
+      assert.equal(nodeE.ok, false)
+      assert.match(nodeE.error ?? '', /SHELL_REFUSED/)
+      assert.match(nodeE.error ?? '', /tmp\/check\.js/)
+    } finally {
+      await fs.rm(root, { recursive: true, force: true })
+    }
   })
 })
 

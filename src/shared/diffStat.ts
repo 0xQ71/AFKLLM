@@ -14,6 +14,34 @@ export function formatDiffStat(stat: DiffStat | null | undefined): string | null
   return parts.join(' ')
 }
 
+function splitContentLines(text: string): string[] {
+  if (!text) return []
+  const parts = text.replace(/\r\n/g, '\n').split('\n')
+  if (parts.length > 0 && parts[parts.length - 1] === '') parts.pop()
+  return parts
+}
+
+/**
+ * +/- from actual before/after file bodies (multiset of lines).
+ * Used so the UI never reports the model's dump as if it landed on disk.
+ */
+export function diffStatFromBeforeAfter(before: string, after: string): DiffStat {
+  const a = splitContentLines(before)
+  const b = splitContentLines(after)
+  if (a.length === 0 && b.length === 0) return { added: 0, removed: 0 }
+  const left = new Map<string, number>()
+  for (const line of a) left.set(line, (left.get(line) ?? 0) + 1)
+  let common = 0
+  for (const line of b) {
+    const n = left.get(line) ?? 0
+    if (n > 0) {
+      common++
+      left.set(line, n - 1)
+    }
+  }
+  return { added: b.length - common, removed: a.length - common }
+}
+
 /** Count +/- from apply_patch body or unified-ish preview. */
 export function diffStatFromPatchText(text: string): DiffStat {
   let added = 0

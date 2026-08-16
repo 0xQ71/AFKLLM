@@ -23,6 +23,7 @@ import {
   looksLikeShellFileMutation,
   powershellOperatorMisuse,
   productReadmeCloneRefusal,
+  powershellNodeEvalRefusal,
   recursiveListingRefusal
 } from '../../shared/shellErrors'
 import {
@@ -31,6 +32,7 @@ import {
   SMALL_FILE_OVERWRITE_CHARS,
   truncationGuardMessage
 } from '../../shared/writeThresholds'
+import { diffStatFromBeforeAfter } from '../../shared/diffStat'
 import {
   commandForMode,
   DEFAULT_IGNORE_DIRS,
@@ -48,6 +50,7 @@ import {
   pathToFileUrl
 } from '../../shared/localPreview'
 import { contentLooksStructurallyComplete } from '../../shared/completeness'
+import { formatWriteFileRequiredError } from '../../shared/writeFileRequired'
 import { fastApplyEdit } from '../llama/ApplyEditClient'
 import { locateApplyRegion, type ApplyRegion } from '../../shared/fastApply'
 
@@ -689,11 +692,11 @@ export class AgentToolRegistry {
       /\.html?$/i.test(relativePath) || /<!DOCTYPE\s+html|<html[\s>]/i.test(writtenBody)
         ? ` lines=${lineCount} closes_with_</body>=${closesBody ? 'yes' : 'no'} closes_with_</html>=${closesHtml ? 'yes' : 'no'}.` +
           (closesHtml
-            ? ' FILE_COMPLETE — do not rewrite just to "finish the tail".'
+            ? ' File looks finished — do not rewrite. Next missing file or STOP.'
             : ' If incomplete, append=true on the SAME path (do not invent a new file).')
         : ` lines=${lineCount}.` +
           (sourceComplete
-            ? ' FILE_COMPLETE — do not rewrite just to "finish the tail".'
+            ? ' File looks finished — do not rewrite. Next missing file or STOP.'
             : ' If incomplete, append=true on the SAME path (do not invent a new file).')
     return {
       id: '',
@@ -703,7 +706,8 @@ export class AgentToolRegistry {
         `${append ? 'Appended' : 'Wrote'} ${content.length} bytes to ${relativePath} (file now ${total} bytes).` +
         htmlHint +
         ' Finish this file before starting another.',
-      editReview: { path: pathKey, status: 'pending' }
+      editReview: { path: pathKey, status: 'pending' },
+      diffStat: diffStatFromBeforeAfter(existing, writtenBody)
     }
   }
 
@@ -726,7 +730,8 @@ export class AgentToolRegistry {
       id: '',
       name: 'delete_file',
       ok: true,
-      content: `Deleted ${relativePath}`
+      content: `Deleted ${relativePath}`,
+      diffStat: diffStatFromBeforeAfter(previous, '')
     }
   }
 
@@ -829,7 +834,9 @@ export class AgentToolRegistry {
         name: 'apply_diff',
         ok: false,
         content: '',
-        error: `${relativePath}: file not found. list_directory / read_file the real path, then apply_diff on that file.`
+        error: /\.(html?|css|js|mjs|cjs|md)$/i.test(relativePath)
+          ? formatWriteFileRequiredError(relativePath, 'file not found.')
+          : `${relativePath}: file not found. list_directory / read_file the real path, then apply_diff on that file.`
       }
     }
 
@@ -889,7 +896,8 @@ export class AgentToolRegistry {
           name: 'apply_diff',
           ok: true,
           content: `Applied diff to ${effectivePath}${applied.normalized ? ' (normalized newlines)' : ''}${countNote}${redirNote}`,
-          editReview: { path: pathKey, status: 'pending' }
+          editReview: { path: pathKey, status: 'pending' },
+          diffStat: diffStatFromBeforeAfter(original, applied.content)
         }
       }
       if (/replace_all=true|matched \d+ times/i.test(applied.error)) {
@@ -1001,7 +1009,8 @@ export class AgentToolRegistry {
       name: opts.toolName,
       ok: true,
       content: `Applied via apply model (${result.applied} block(s)) to ${opts.relativePath}${opts.retargetNote ?? ''}`,
-      editReview: { path: pathKey, status: 'pending' }
+      editReview: { path: pathKey, status: 'pending' },
+      diffStat: diffStatFromBeforeAfter(opts.original, result.content)
     }
   }
 
@@ -1052,6 +1061,8 @@ export class AgentToolRegistry {
     const changed: Array<{ path: string; action: string }> = []
     const errors: string[] = []
     let firstReviewPath: string | null = null
+    let patchAdded = 0
+    let patchRemoved = 0
     let lastFailedUpdate: {
       path: string
       abs: string
@@ -1087,6 +1098,9 @@ export class AgentToolRegistry {
           await fs.mkdir(dirname(abs), { recursive: true })
           await fs.writeFile(abs, content, 'utf8')
           this.notifyChange(pathKey)
+          const addStat = diffStatFromBeforeAfter(previous, content)
+          patchAdded += addStat.added
+          patchRemoved += addStat.removed
           changed.push({ path: pathKey, action: 'add' })
           if (!firstReviewPath) firstReviewPath = pathKey
           continue
@@ -1105,6 +1119,9 @@ export class AgentToolRegistry {
           this.rememberEdit(pathKey, true, previous)
           await fs.unlink(abs)
           this.notifyChange(pathKey)
+          const delStat = diffStatFromBeforeAfter(previous, '')
+          patchAdded += delStat.added
+          patchRemoved += delStat.removed
           changed.push({ path: pathKey, action: 'delete' })
           if (!firstReviewPath) firstReviewPath = pathKey
           continue
@@ -1116,7 +1133,7 @@ export class AgentToolRegistry {
         try {
           original = await fs.readFile(abs, 'utf8')
         } catch {
-          errors.push(`${pathKey}: file not found`)
+            errors.push(formatWriteFileRequiredError(pathKey, 'file not found'))
           continue
         }
         const applied = applyHunksToText(original, op.hunks ?? [])
@@ -1138,6 +1155,9 @@ export class AgentToolRegistry {
         this.rememberEdit(updatePath, true, original)
         await fs.writeFile(updateAbs, applied.content, 'utf8')
         this.notifyChange(updatePath)
+        const updStat = diffStatFromBeforeAfter(original, applied.content)
+        patchAdded += updStat.added
+        patchRemoved += updStat.removed
         changed.push({ path: updatePath, action: 'update' })
         if (!firstReviewPath) firstReviewPath = updatePath
       } catch (err) {
@@ -1193,7 +1213,11 @@ export class AgentToolRegistry {
       error: errors.length > 0 ? errors[0] : undefined,
       editReview: firstReviewPath
         ? { path: firstReviewPath, status: 'pending' }
-        : undefined
+        : undefined,
+      diffStat:
+        patchAdded > 0 || patchRemoved > 0
+          ? { added: patchAdded, removed: patchRemoved }
+          : undefined
     }
   }
 
@@ -1356,6 +1380,18 @@ export class AgentToolRegistry {
         ok: false,
         content: '',
         error: cloneRefuse
+      }
+    }
+
+    const nodeEvalRefuse =
+      powershellNodeEvalRefusal(command) ?? powershellNodeEvalRefusal(rawCommand)
+    if (nodeEvalRefuse) {
+      return {
+        id: '',
+        name: 'execute_terminal_command',
+        ok: false,
+        content: '',
+        error: nodeEvalRefuse
       }
     }
 

@@ -8,7 +8,11 @@ export function localizeStatusDetail(detail: string | null | undefined, t: TFn):
   const d = detail.trim()
 
   const exact: Record<string, MessageKey> = {
-    'Chat model ready (loaded from disk)': 'status.detail.chatReadyDisk',
+    'Chat + Apply ready (coresident in VRAM)': 'status.detail.chatApplyReady',
+    'Chat + Apply + Vision ready (coresident in VRAM)': 'status.detail.chatApplyVisionReady',
+    'Chat model ready + Vision ready': 'status.detail.chatVisionReady',
+    'Loading apply model into VRAM…': 'status.detail.loadingApplyVram',
+    'Loading vision model into VRAM…': 'status.detail.loadingVisionVram',
     'Vision model ready (loaded from disk)': 'status.detail.visionReadyDisk',
     'Model unloaded to disk': 'status.detail.unloadedDisk',
     'Model on disk · VRAM free for image generation': 'status.detail.vramFreeImage',

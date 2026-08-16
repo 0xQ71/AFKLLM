@@ -155,8 +155,36 @@ export function parseChecklistUiContent(content: string): AgentChecklist | null 
   }
 }
 
-export function formatTodoUiContent(steps: AgentTodoStep[]): string {
-  return JSON.stringify({ kind: 'agent-todo', steps })
+export function formatTodoUiContent(
+  steps: AgentTodoStep[],
+  opts?: { failed?: boolean }
+): string {
+  return JSON.stringify({
+    kind: 'agent-todo',
+    steps,
+    ...(opts?.failed ? { failed: true } : {})
+  })
+}
+
+/**
+ * Plan card ✗ is not sticky: a later successful write/apply clears it.
+ * Red header only when an edit failed and this turn never landed a write/apply.
+ */
+export function todoCardFailed(opts: {
+  mutatingEditFailed: boolean
+  mutatingEditOk: boolean
+}): boolean {
+  return opts.mutatingEditFailed && !opts.mutatingEditOk
+}
+
+/** Plan card header: edits failed even if every row is checked. */
+export function parseTodoUiFailed(content: string): boolean {
+  try {
+    const o = JSON.parse(content) as Record<string, unknown>
+    return o.kind === 'agent-todo' && o.failed === true
+  } catch {
+    return false
+  }
 }
 
 export function parseTodoUiContent(content: string): AgentTodoStep[] | null {
@@ -781,6 +809,48 @@ export type CoercePlanOptions = {
 }
 
 /**
+ * Landing file order the user asked for (CSS/JS/assets before index.html).
+ * Reorders the plan card only — does not block the agent from calling tools in another order.
+ */
+export function landingPlanDependencyRank(text: string): number {
+  const t = text.toLowerCase()
+  if (isBrowserPlanStep(text)) return 60
+  if (/readme/i.test(t)) return 50
+  const mentionsHtml = /\.html?\b|index\.html|написать\s+.*html|write\s+.*html|собрать\s+все\s+секц|все\s+секции/i.test(
+    t
+  )
+  const mentionsCss = /\.css\b|styles\.css|типографик|dark\s+theme|адаптив/i.test(t)
+  const mentionsJs = /\.js\b|main\.js|javascript/i.test(t)
+  if (mentionsHtml && !mentionsCss && !mentionsJs) return 40
+  if (mentionsJs && !mentionsCss && !mentionsHtml) return 30
+  if (mentionsCss && !mentionsHtml) return 20
+  if (/svg|иконк|icon/i.test(t) && !/структур|папк|folder|mkdir|каталог/i.test(t)) return 15
+  if (
+    /структур|папк|folder|mkdir|каталог|директор|assets\/|css\/|js\//i.test(t) &&
+    !mentionsHtml &&
+    !mentionsCss &&
+    !mentionsJs
+  ) {
+    return 10
+  }
+  return 45
+}
+
+export function sortPlanByUserDependencies(
+  steps: AgentTodoStep[],
+  userText: string
+): AgentTodoStep[] {
+  if (!steps.length) return steps
+  if (!looksLikeLandingBuildTask(userText) && !looksLikeFromScratchTask(userText)) {
+    return steps
+  }
+  return steps
+    .map((s, i) => ({ s, i, rank: landingPlanDependencyRank(s.text) }))
+    .sort((a, b) => (a.rank !== b.rank ? a.rank - b.rank : a.i - b.i))
+    .map(({ s }) => s)
+}
+
+/**
  * Keep plan grounded in the model's own steps.
  * Empty / tool-name / status-noise rows are dropped; nothing is invented.
  */
@@ -796,7 +866,11 @@ export function coerceProductPlan(
   }
   if (!cleaned.length) return []
   const cap = opts?.surgical ? 4 : 10
-  return cleaned.slice(0, cap).map((s, i) => ({
+  let sliced = cleaned.slice(0, cap)
+  if (opts?.userText) {
+    sliced = sortPlanByUserDependencies(sliced, opts.userText)
+  }
+  return sliced.map((s, i) => ({
     ...s,
     id: `s${i + 1}`,
     status: (i === 0 ? 'in_progress' : 'pending') as AgentTodoStep['status']
@@ -1334,6 +1408,11 @@ export function looksLikeExplicitRewrite(userText: string): boolean {
   )
 }
 
+/** Paths where follow-up edits go through apply_diff → Apply, not write_file overwrite. */
+export function isComposerApplyPath(relativePath: string): boolean {
+  return /\.(html?|css|jsx?|mjs|cjs)$/i.test((relativePath ?? '').replace(/\\/g, '/'))
+}
+
 /** Surgical follow-up must not overwrite an existing HTML/CSS/JS module. */
 export function shouldBlockSurgicalOverwrite(opts: {
   userText: string
@@ -1343,7 +1422,95 @@ export function shouldBlockSurgicalOverwrite(opts: {
   if (!opts.overwrite) return false
   if (looksLikeExplicitRewrite(opts.userText)) return false
   if (!looksLikeSurgicalFollowUp(opts.userText)) return false
-  return /\.(html?|css|jsx?|mjs|cjs)$/i.test(opts.relativePath.replace(/\\/g, '/'))
+  return isComposerApplyPath(opts.relativePath)
+}
+
+/**
+ * Completeness of THIS path only — never judge JS by last HTML write.
+ */
+export function priorCompleteForWritePath(opts: {
+  relativePath: string
+  lastHtml: string
+  lastJs: string
+  lastCss: string
+}): boolean {
+  const p = (opts.relativePath ?? '').replace(/\\/g, '/')
+  if (/\.html?$/i.test(p)) return contentLooksStructurallyComplete(opts.lastHtml, p)
+  if (/\.(jsx?|mjs|cjs)$/i.test(p)) return contentLooksStructurallyComplete(opts.lastJs, p)
+  if (/\.css$/i.test(p)) return contentLooksStructurallyComplete(opts.lastCss, p)
+  return false
+}
+
+/**
+ * Chat write_file of an existing complete html/css/js should become apply_diff.
+ * First-turn from-scratch and explicit rewrites stay write_file.
+ */
+export function shouldHandoffWriteToApply(opts: {
+  userText: string
+  relativePath: string
+}): boolean {
+  const p = opts.relativePath ?? ''
+  if (!isComposerApplyPath(p)) return false
+  const t = opts.userText ?? ''
+  if (allowsComposerFullRewrite(t)) return false
+  if (looksLikeThemeToggleRequest(t)) return true
+  if (looksLikeI18nFollowUp(t)) return true
+  if (looksLikeSurgicalFollowUp(t)) return true
+  if (t.trim().length <= 500 && looksLikeFileEditRequest(t)) return true
+  return false
+}
+
+/** Rebuild / explicit rewrite — write_file overwrite, never Apply ping-pong. */
+export function allowsComposerFullRewrite(userText: string): boolean {
+  return looksLikeExplicitRewrite(userText) || looksLikeFromScratchTask(userText)
+}
+
+/** Persist truncated write_file only for new / incomplete files — never clobber a complete one. */
+export function shouldPersistIncompleteWrite(opts: { knownComplete: boolean }): boolean {
+  return !opts.knownComplete
+}
+
+const APPLY_HANDOFF_SNIPPET_MAX = 1_200
+
+function snippetForApplyHandoff(content: string): string | undefined {
+  const t = (content ?? '').trim()
+  if (!t || t.length > APPLY_HANDOFF_SNIPPET_MAX) return undefined
+  if (/^<!DOCTYPE|^<html[\s>]/i.test(t) && t.length > 400) return undefined
+  if ((t.match(/\bfunction\b|\bconst\b|\blet\b/g) ?? []).length >= 8) return undefined
+  return t
+}
+
+/** Short instruction for Apply — never dump a whole file into the prompt. */
+export function formatApplyHandoffInstruction(opts: {
+  userText: string
+  relativePath: string
+  snippet?: string
+}): string {
+  const user = (opts.userText ?? '').trim().slice(0, 400)
+  const path = opts.relativePath || 'this file'
+  const snip = snippetForApplyHandoff(opts.snippet ?? '')
+  const parts = [
+    user || `Edit ${path} as requested.`,
+    `Edit this file only (${path}); do not rewrite the whole file.`
+  ]
+  if (snip) parts.push(`Suggested fragment:\n${snip}`)
+  return parts.join('\n')
+}
+
+/** apply_diff arguments for a write_file → Apply handoff. */
+export function buildApplyHandoffArgs(opts: {
+  relativePath: string
+  userText: string
+  content?: string
+}): Record<string, unknown> {
+  return {
+    relative_path: opts.relativePath,
+    instruction: formatApplyHandoffInstruction({
+      userText: opts.userText,
+      relativePath: opts.relativePath,
+      snippet: opts.content
+    })
+  }
 }
 
 /** search_block that is most of an already-complete file = full rewrite. */

@@ -8,6 +8,8 @@ import { LlamaProcessManager } from './llama/LlamaProcessManager'
 import type { LlamaProcessOptions } from './llama/LlamaProcessManager'
 import { llamaRuntime } from './llama/LlamaRuntimeManager'
 import { ModelSlotOrchestrator } from './llama/ModelSlotOrchestrator'
+import { llamaSlotPort, llamaSlotPortsToDeny } from '../shared/llamaSlots'
+import { visionReusesChatModel, isVisionSameAsChat } from '../shared/visionDetect'
 import { findMmprojForModel, scanGgufModels, scanMmprojFiles, scanWeightFiles } from './llama/ModelScanner'
 import type { StoreDownloadTarget } from '../shared/hfStore'
 import { isImageGenStoreTarget, isStoreDownloadTarget } from '../shared/hfStore'
@@ -91,6 +93,8 @@ let isQuitting = false
 let llama: LlamaProcessManager | null = null
 /** Coresident apply llama-server (port+1); only while chat slot is active. */
 let applyLlama: LlamaProcessManager | null = null
+/** Coresident vision llama-server (port+2) when visionKeepLoaded. */
+let visionLlama: LlamaProcessManager | null = null
 let slotOrch: ModelSlotOrchestrator | null = null
 let tools: AgentToolRegistry | null = null
 let settingsStore: SettingsStore | null = null
@@ -307,8 +311,46 @@ function runtimeStatus(): LlmRuntimeStatus {
     applyState = 'starting'
   }
 
-  const applyPort = (Number(settings?.port) || 8080) + 1
+  const applyPort = llamaSlotPort(Number(settings?.port) || 8080, 'apply', false)
   const applyHost = settings?.host || '127.0.0.1'
+  const keepVision = settings?.visionKeepLoaded !== false
+  const reuseVision = settings
+    ? visionReusesChatModel({
+        chatPath: settings.modelPath,
+        visionPath: settings.visionModelPath,
+        mmprojPath: settings.visionMmprojPath
+      })
+    : false
+  const visionPath = settings?.visionModelPath?.trim() || ''
+  const visionErr = slotOrch?.getVisionError() ?? visionLlama?.error
+  let visionState: LlmRuntimeStatus['visionState'] = 'stopped'
+  if (reuseVision && llama?.currentState === 'ready') {
+    visionState = llama.mmprojPath ? 'ready' : 'error'
+  } else if (
+    reuseVision &&
+    (llama?.currentState === 'starting' || slot?.phase === 'switching')
+  ) {
+    visionState = 'starting'
+  } else if (!visionPath) {
+    visionState = 'stopped'
+  } else if (visionLlama?.currentState === 'ready') {
+    visionState = 'ready'
+  } else if (visionLlama?.currentState === 'starting') {
+    visionState = 'starting'
+  } else if (visionErr || visionLlama?.currentState === 'error') {
+    visionState = 'error'
+  } else if (
+    slot?.slot === 'vision' &&
+    slot.phase === 'ready' &&
+    llama?.currentState === 'ready'
+  ) {
+    visionState = 'ready'
+  } else if (
+    (slot?.slot === 'chat' || slot?.slot === 'vision') &&
+    slot.phase === 'switching'
+  ) {
+    visionState = keepVision ? 'starting' : visionState
+  }
 
   return {
     state: llama?.currentState ?? 'stopped',
@@ -321,16 +363,28 @@ function runtimeStatus(): LlmRuntimeStatus {
     applyState,
     applyModelPath: applyPath || null,
     applyBaseUrl: applyLlama?.baseUrl ?? (applyPath ? `http://${applyHost}:${applyPort}` : null),
-    applyError: applyErr
+    applyError: applyErr,
+    visionState,
+    visionModelPath: (reuseVision ? settings?.modelPath : visionPath) || null,
+    visionBaseUrl:
+      reuseVision && llama?.currentState === 'ready' && llama.mmprojPath
+        ? llama.baseUrl
+        : visionLlama?.currentState === 'ready'
+          ? visionLlama.baseUrl
+          : visionState === 'ready' && slot?.slot === 'vision'
+            ? llama?.baseUrl ?? null
+            : null,
+    visionError:
+      reuseVision && llama?.currentState === 'ready' && !llama.mmprojPath
+        ? 'Chat is the VL model — set mmproj (or place *mmproj*.gguf next to the GGUF).'
+        : visionErr
   }
 }
 
 function applyQueueSettings(settings: AppSettings): void {
   getLLMQueue(settings.baseUrl, 'local')
   const port = Number(settings.port) || 8080
-  terminals.setDenyPreviewPorts(
-    [port, port + 1, 8080].filter((p, i, a) => a.indexOf(p) === i)
-  )
+  terminals.setDenyPreviewPorts(llamaSlotPortsToDeny(port))
 }
 
 function settingsToLlamaOpts(
@@ -344,20 +398,25 @@ function settingsToLlamaOpts(
     : llamaRuntime.resolveStatus(undefined, settings.llamaRuntimeVariant).binaryPath ||
       undefined
   const port = Number(settings.port) || 8080
+  const keepVision = settings.visionKeepLoaded !== false
   let modelPath = settings.modelPath
-  let portOut = port
+  let portOut = llamaSlotPort(port, slot, keepVision)
   let ctxSize = settings.ctxSize
   if (slot === 'vision') {
-    modelPath = settings.visionModelPath
+    if (isVisionSameAsChat(settings.visionModelPath)) {
+      modelPath = settings.modelPath
+      portOut = llamaSlotPort(port, 'chat', keepVision)
+    } else {
+      modelPath = settings.visionModelPath
+    }
   } else if (slot === 'apply') {
     modelPath = settings.applyModelPath
-    portOut = port + 1
     ctxSize = applyCtxSizeFor(settings)
   }
   return {
     binaryPath: resolved,
     modelPath,
-    ...(slot === 'vision' && mmprojPath ? { mmprojPath } : {}),
+    ...(mmprojPath ? { mmprojPath } : {}),
     host: settings.host,
     port: portOut,
     nGpuLayers: settings.nGpuLayers,
@@ -403,10 +462,36 @@ function initSlotOrchestrator(): void {
     setApplyLlama: (mgr) => {
       applyLlama = mgr
     },
+    getVisionLlama: () => visionLlama,
+    setVisionLlama: (mgr) => {
+      visionLlama = mgr
+    },
+    keepVisionLoaded: () => settingsStore?.get().visionKeepLoaded !== false,
+    visionReusesChat: () => {
+      const s = settingsStore?.get()
+      if (!s) return false
+      return visionReusesChatModel({
+        chatPath: s.modelPath,
+        visionPath: s.visionModelPath,
+        mmprojPath: s.visionMmprojPath
+      })
+    },
     createLlama: (opts) => new LlamaProcessManager(opts),
     optsFor: async (slot) => {
       const settings = settingsStore!.get()
+      const reuse = visionReusesChatModel({
+        chatPath: settings.modelPath,
+        visionPath: settings.visionModelPath,
+        mmprojPath: settings.visionMmprojPath
+      })
       if (slot === 'vision') {
+        if (reuse) {
+          const mm = await findMmprojForModel(
+            settings.modelPath,
+            settings.visionMmprojPath
+          )
+          return settingsToLlamaOpts(settings, 'chat', mm)
+        }
         const mm = await findMmprojForModel(
           settings.visionModelPath,
           settings.visionMmprojPath
@@ -415,6 +500,13 @@ function initSlotOrchestrator(): void {
       }
       if (slot === 'apply') {
         return settingsToLlamaOpts(settings, 'apply')
+      }
+      if (reuse) {
+        const mm = await findMmprojForModel(
+          settings.modelPath,
+          settings.visionMmprojPath
+        )
+        return settingsToLlamaOpts(settings, 'chat', mm)
       }
       return settingsToLlamaOpts(settings, 'chat')
     },
@@ -547,12 +639,23 @@ function registerIpc(): void {
       baseUrl: `http://${patch.host ?? cur.host}:${patch.port ?? cur.port}`
     })
     const slot = slotOrch?.getStatus().slot
-    if (slot === 'vision') {
+    const reuse = visionReusesChatModel({
+      chatPath: next.modelPath,
+      visionPath: next.visionModelPath,
+      mmprojPath: next.visionMmprojPath
+    })
+    const chatMm = reuse
+      ? await findMmprojForModel(next.modelPath, next.visionMmprojPath)
+      : null
+    llama?.updateOptions(settingsToLlamaOpts(next, 'chat', chatMm))
+    applyLlama?.updateOptions(settingsToLlamaOpts(next, 'apply'))
+    if (!reuse && next.visionKeepLoaded !== false) {
+      const mm = await findMmprojForModel(next.visionModelPath, next.visionMmprojPath)
+      visionLlama?.updateOptions(settingsToLlamaOpts(next, 'vision', mm))
+    }
+    if (!reuse && slot === 'vision' && next.visionKeepLoaded === false) {
       const mm = await findMmprojForModel(next.visionModelPath, next.visionMmprojPath)
       llama?.updateOptions(settingsToLlamaOpts(next, 'vision', mm))
-    } else {
-      llama?.updateOptions(settingsToLlamaOpts(next, 'chat'))
-      applyLlama?.updateOptions(settingsToLlamaOpts(next, 'apply'))
     }
     applyQueueSettings(next)
     if (mcpManager) {
@@ -975,7 +1078,9 @@ function registerIpc(): void {
         getLLMQueue().cancelAll('model_unloaded')
         await llama?.stop()
         await applyLlama?.stop()
+        await visionLlama?.stop()
         applyLlama = null
+        visionLlama = null
       }
     } catch (err) {
       bootError = err instanceof Error ? err.message : String(err)
@@ -2110,6 +2215,7 @@ app.on('before-quit', () => {
   void mcpManager?.dispose()
   void llama?.stop()
   void applyLlama?.stop()
+  void visionLlama?.stop()
   getLLMQueue().cancelAll('app_quit')
 })
 

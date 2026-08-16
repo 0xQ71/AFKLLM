@@ -201,10 +201,18 @@ export interface AppSettings {
   /** Last version that showed the changelog modal; empty skips until an upgrade */
   lastSeenVersion: string
 
-  /** Separate VL GGUF for image attach (cold-swapped with chat) */
+  /**
+   * Separate VL GGUF for image attach, empty = not set,
+   * or VISION_SAME_AS_CHAT to reuse the chat GGUF + mmproj.
+   */
   visionModelPath: string
   /** Projector for visionModelPath; empty = auto sibling *mmproj*.gguf */
   visionMmprojPath: string
+  /**
+   * When true (default): load vision with chat + apply on Load (port+2) and keep it.
+   * When false: cold-swap chat↔vision on attach, then unload vision after use.
+   */
+  visionKeepLoaded: boolean
   /**
    * Fast-apply / Morph-style edit GGUF — loaded coresident with chat on Load
    * (second llama-server on port+1, same VRAM; no cold-swap).
@@ -351,6 +359,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
 
   visionModelPath: '',
   visionMmprojPath: '',
+  visionKeepLoaded: true,
   applyModelPath: '',
   applyCtxSize: 0,
   imageGenModelPath: '',
@@ -398,6 +407,11 @@ export interface LlmRuntimeStatus {
   applyModelPath?: string | null
   applyBaseUrl?: string | null
   applyError?: string
+  /** Coresident vision llama-server (port+2) when visionKeepLoaded */
+  visionState?: 'stopped' | 'starting' | 'ready' | 'error'
+  visionModelPath?: string | null
+  visionBaseUrl?: string | null
+  visionError?: string
 }
 
 export function samplingFromSettings(s: AppSettings): Record<string, unknown> {

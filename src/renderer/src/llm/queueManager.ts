@@ -214,6 +214,8 @@ export class QueueManager {
     signal?: AbortSignal
     onToken?: (token: string) => void
     onToolDelta?: (delta: NonNullable<LLMStreamChunk['toolCallDelta']>) => void
+    /** Coresident vision server; omit to use the chat llama-server. */
+    baseUrl?: string
   }): Promise<LLMCompletionResult> {
     if (params.signal?.aborted) {
       return {
@@ -245,6 +247,7 @@ export class QueueManager {
         priority: params.priority ?? 'NORMAL',
         endpoint: '/v1/chat/completions',
         timeoutMs: 0, // Stop / cancelAll still abort
+        ...(params.baseUrl ? { baseUrl: params.baseUrl } : {}),
         body: this.mergeBody({
           messages: params.messages,
           tools: params.tools,

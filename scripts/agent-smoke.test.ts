@@ -28,6 +28,8 @@ import {
   advanceTodosOnTool,
   formatTodoUiContent,
   parseTodoUiContent,
+  parseTodoUiFailed,
+  todoCardFailed,
   thinkBodyLooksLikeCodeDump,
   thinkLooksLikeChecklist,
   sanitizeThinkProse,
@@ -63,7 +65,15 @@ import {
   looksLikeI18nFollowUp,
   looksLikeThemeToggleRequest,
   looksLikeExplicitRewrite,
+  looksLikeFromScratchTask,
+  allowsComposerFullRewrite,
   shouldBlockSurgicalOverwrite,
+  shouldHandoffWriteToApply,
+  shouldPersistIncompleteWrite,
+  priorCompleteForWritePath,
+  formatApplyHandoffInstruction,
+  buildApplyHandoffArgs,
+  isComposerApplyPath,
   isLandingJsPath,
   isSourcePath,
   filterPlanToCurrentRequest,
@@ -117,11 +127,22 @@ import {
 import { honestClosingNote } from '../src/renderer/src/agent/loop/report'
 import {
   formatI18nSanityHint,
+  formatI18nCloserWhy,
+  htmlHasEmptyI18nShells,
   htmlJsI18nMismatch,
   htmlI18nKeysMissingFromJs,
+  inventedI18nVerifierPath,
   jsI18nDictLooksBroken
 } from '../src/renderer/src/agent/loop/i18nSanity'
-import { formatEditSanityHint, navLooksUnstyled, htmlJsHasThemeControl } from '../src/renderer/src/agent/loop/editSanity'
+import {
+  formatWriteFileRequiredError,
+  formatWriteOnceError,
+  landingBundleReady,
+  shouldRefuseLandingRewrite,
+  shouldRequireWriteFileForApply
+} from '../src/renderer/src/agent/loop/landingWriteCap'
+import { maxTokensForAgent } from '../src/renderer/src/agent/loop/ctxBudget'
+import { formatEditSanityHint, navLooksUnstyled, htmlJsHasThemeControl, htmlCssLayoutMismatch, inlineSvgLooksUnsized, formatLandingCssContractHint } from '../src/renderer/src/agent/loop/editSanity'
 import { formatSurgicalFollowUpHint, isHtmlOnlyStacks } from '../src/renderer/src/agent/loop/prompts'
 import { truncationGuardMessage, isWholeFileSearchBlock } from '../src/shared/writeThresholds'
 import { evidenceSupportsStep, evidenceFromTool, recordEvidence } from '../src/renderer/src/agent/loop/evidence'
@@ -869,6 +890,10 @@ describe('agent todo plan', () => {
     assert.equal(looksLikeThemeToggleRequest(user2), true)
     assert.equal(looksLikeExplicitRewrite(user2), false)
     assert.equal(
+      shouldHandoffWriteToApply({ userText: user2, relativePath: 'js/main.js' }),
+      true
+    )
+    assert.equal(
       shouldBlockSurgicalOverwrite({
         userText: user2,
         relativePath: 'index.html',
@@ -1525,6 +1550,7 @@ describe('AgentToolRegistry edit review', () => {
       })
       assert.equal(res.ok, false)
       assert.match(res.error ?? '', /file not found/i)
+      assert.match(res.error ?? '', /WRITE_FILE_REQUIRED/)
       const html = await fs.readFile(path.join(root, 'index.html'), 'utf8')
       assert.match(html, /background: #fff; color: #000/)
       await assert.rejects(() => fs.access(path.join(root, 'styles.css')))
@@ -1548,6 +1574,28 @@ describe('AgentToolRegistry edit review', () => {
       })
       assert.equal(res.ok, false)
       assert.match(res.error ?? '', /file not found/i)
+      assert.match(res.error ?? '', /WRITE_FILE_REQUIRED/)
+    } finally {
+      await fs.rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('apply_diff on missing js/main.js returns WRITE_FILE_REQUIRED', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'afkllm-missing-js-'))
+    try {
+      const reg = new AgentToolRegistry({ projectRoot: root })
+      const res = await reg.invoke({
+        id: '1',
+        name: 'apply_diff',
+        arguments: {
+          relative_path: 'js/main.js',
+          search_block: 'console.log(1)',
+          replace_block: 'console.log(2)'
+        }
+      })
+      assert.equal(res.ok, false)
+      assert.match(res.error ?? '', /WRITE_FILE_REQUIRED/)
+      assert.match(res.error ?? '', /js\/main\.js/)
     } finally {
       await fs.rm(root, { recursive: true, force: true })
     }
@@ -1746,6 +1794,46 @@ describe('AgentToolRegistry edit review', () => {
       })
       assert.equal(explicit.ok, true, explicit.error ?? explicit.content)
       assert.match(await fs.readFile(path.join(root, rel), 'utf8'), /return 2/)
+    } finally {
+      await fs.rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('truncated overwrite of complete JS does not change disk', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'afkllm-complete-js-'))
+    try {
+      const reg = new AgentToolRegistry({ projectRoot: root })
+      const rel = 'js/main.js'
+      await fs.mkdir(path.join(root, 'js'), { recursive: true })
+      const done =
+        '(function () {\n  const state = { theme: "light" };\n' +
+        '  function init() { document.body.dataset.theme = state.theme; }\n' +
+        '  init();\n})();\n' +
+        '// keep\n'.repeat(800)
+      await fs.writeFile(path.join(root, rel), done, 'utf8')
+      const truncated = await reg.invoke({
+        id: '1',
+        name: 'write_file',
+        arguments: {
+          relative_path: rel,
+          content: 'function themeToggle() {\n',
+          overwrite: true
+        }
+      })
+      assert.equal(truncated.ok, false)
+      assert.match(truncated.error ?? '', /FILE_COMPLETE/)
+      assert.equal(await fs.readFile(path.join(root, rel), 'utf8'), done)
+      const created = await reg.invoke({
+        id: '2',
+        name: 'write_file',
+        arguments: {
+          relative_path: 'js/new.js',
+          content:
+            '(function () {\n  const ok = true;\n  function init() { return ok; }\n  init();\n})();\n'
+        }
+      })
+      assert.equal(created.ok, true, created.error ?? created.content)
+      assert.doesNotMatch(created.content, /FILE_COMPLETE/)
     } finally {
       await fs.rm(root, { recursive: true, force: true })
     }
@@ -2321,6 +2409,8 @@ describe('i18n sanity', () => {
     const hint = formatI18nSanityHint({ js: brokenJs })
     assert.ok(hint)
     assert.match(hint!, /I18N_SANITY/)
+    assert.match(hint!, /object Object/)
+    assert.match(formatI18nCloserWhy(hint!, 'ru'), /объект/)
     const okJs =
       "const t = { ru: { hero: 'Привет' }, en: { hero: 'Hello' } };\n" +
       "document.querySelector('[data-i18n=\"hero\"]').textContent = t[lang].hero;\n"
@@ -2342,6 +2432,156 @@ describe('i18n sanity', () => {
     assert.equal(htmlJsI18nMismatch(landingHtml, landingJs), true)
     assert.equal(htmlI18nKeysMissingFromJs(landingHtml, landingJs), true)
     assert.match(formatI18nSanityHint({ html: landingHtml, js: landingJs }) ?? '', /I18N_SANITY/)
+  })
+
+  it('flags empty data-i18n shells that hide the page', () => {
+    const emptyHtml =
+      '<h1 data-i18n="hero.title"></h1><p data-i18n="hero.subtitle"></p>' +
+      '<h3 data-i18n="feature1.title"></h3><p data-i18n="feature1.desc"></p>' +
+      '<a data-i18n="hero.cta1">Download for Windows</a>'
+    assert.equal(htmlHasEmptyI18nShells(emptyHtml), true)
+    const hint = formatI18nSanityHint({ html: emptyHtml })
+    assert.ok(hint)
+    assert.match(hint!, /I18N_SANITY/)
+    assert.match(hint!, /visible fallback/)
+    assert.match(formatI18nCloserWhy(hint!, 'ru'), /пустые data-i18n/)
+  })
+
+  it('treats unquoted identifier keys as present', () => {
+    const html =
+      '<p data-i18n="heroSubtitle">x</p><a data-i18n="ctaDownload">y</a>' +
+      '<h2 data-i18n="featuresTitle">z</h2>'
+    const js =
+      "const i18n = { ru: { heroSubtitle: 'a', ctaDownload: 'b', featuresTitle: 'c' }, en: { heroSubtitle: 'a', ctaDownload: 'b', featuresTitle: 'c' } };\n" +
+      "el.textContent = dict[key];\n"
+    assert.equal(htmlI18nKeysMissingFromJs(html, js), false)
+    assert.equal(jsI18nDictLooksBroken(js), false)
+    assert.equal(formatI18nSanityHint({ html, js }), null)
+  })
+
+  it('accepts the frozen landing-afkllm html+js pair', async () => {
+    const dir = path.join(process.cwd(), 'scripts', 'fixtures', 'landing-afkllm')
+    const html = await fs.readFile(path.join(dir, 'index.html'), 'utf8')
+    const js = await fs.readFile(path.join(dir, 'js', 'main.js'), 'utf8')
+    assert.match(html, /data-i18n="heroSubtitle"/)
+    assert.match(html, /data-lang="ru"/)
+    assert.match(js, /heroSubtitle:\s*'/)
+    assert.match(js, /const i18n = \{/)
+    assert.equal(jsI18nDictLooksBroken(js), false)
+    assert.equal(htmlI18nKeysMissingFromJs(html, js), false)
+    assert.equal(htmlHasEmptyI18nShells(html), false)
+    assert.equal(formatI18nSanityHint({ html, js }), null)
+  })
+
+  it('refuses invented tmp/check.js unless the user asked', () => {
+    const landing = 'Сделай профессиональный лендинг для AFKLLM'
+    assert.equal(inventedI18nVerifierPath('tmp/check.js', landing), true)
+    assert.equal(inventedI18nVerifierPath('check.js', landing), true)
+    assert.equal(inventedI18nVerifierPath('js/main.js', landing), false)
+    assert.equal(inventedI18nVerifierPath('tmp/check.js', 'напиши tmp/check.js для аудита ключей'), false)
+  })
+})
+
+describe('landing WRITE_ONCE cap', () => {
+  it('allows the first complete write and refuses a second js/main.js rewrite', () => {
+    assert.equal(
+      shouldRefuseLandingRewrite({
+        path: 'js/main.js',
+        completeWritesThisTurn: 0,
+        recoveryUsedOnPath: false,
+        sanityFailedOnThisPath: false
+      }),
+      'ok'
+    )
+    assert.equal(
+      shouldRefuseLandingRewrite({
+        path: 'js/main.js',
+        completeWritesThisTurn: 1,
+        recoveryUsedOnPath: false,
+        sanityFailedOnThisPath: false
+      }),
+      'refuse'
+    )
+    assert.match(formatWriteOnceError('js/main.js'), /WRITE_ONCE/)
+  })
+
+  it('allows one recovery only on the path that failed sanity', () => {
+    assert.equal(
+      shouldRefuseLandingRewrite({
+        path: 'index.html',
+        completeWritesThisTurn: 1,
+        recoveryUsedOnPath: false,
+        sanityFailedOnThisPath: true
+      }),
+      'allow_recovery'
+    )
+    assert.equal(
+      shouldRefuseLandingRewrite({
+        path: 'index.html',
+        completeWritesThisTurn: 1,
+        recoveryUsedOnPath: true,
+        sanityFailedOnThisPath: true
+      }),
+      'refuse'
+    )
+    assert.equal(
+      shouldRefuseLandingRewrite({
+        path: 'js/main.js',
+        completeWritesThisTurn: 1,
+        recoveryUsedOnPath: false,
+        sanityFailedOnThisPath: false
+      }),
+      'refuse'
+    )
+  })
+
+  it('landingBundleReady when css+html+js each have a write', () => {
+    const m = new Map<string, number>([
+      ['styles.css', 1],
+      ['index.html', 1],
+      ['js/main.js', 1]
+    ])
+    assert.equal(landingBundleReady(m), true)
+    assert.equal(landingBundleReady(new Map([['styles.css', 1]])), false)
+  })
+})
+
+describe('Gemma 8k harness', () => {
+  it('maxTokensForAgent uses leftover ctx, not another 8192', () => {
+    const n = maxTokensForAgent(8192, 5500)
+    assert.equal(n, 8192 - 5500 - 256)
+    assert.ok(n < 8192)
+    assert.ok(n <= 4096)
+    assert.equal(maxTokensForAgent(8192, 8000), 256)
+    assert.equal(maxTokensForAgent(32768, 4000), 4096)
+  })
+
+  it('from-scratch apply_diff on missing js/main.js requires write_file', () => {
+    assert.equal(
+      shouldRequireWriteFileForApply({
+        fromScratch: true,
+        path: 'js/main.js',
+        completeWritesThisTurn: 0
+      }),
+      true
+    )
+    assert.match(formatWriteFileRequiredError('js/main.js'), /WRITE_FILE_REQUIRED/)
+    assert.equal(
+      shouldRequireWriteFileForApply({
+        fromScratch: true,
+        path: 'js/main.js',
+        completeWritesThisTurn: 1
+      }),
+      false
+    )
+    assert.equal(
+      shouldRequireWriteFileForApply({
+        fromScratch: false,
+        path: 'js/main.js',
+        completeWritesThisTurn: 0
+      }),
+      false
+    )
   })
 })
 
@@ -2402,6 +2642,23 @@ describe('edit sanity + html-only stacks', () => {
     })
     assert.match(htmlHint, /preview ONCE/i)
     assert.match(htmlHint, /get_diagnostics on static HTML/)
+    assert.match(htmlHint, /instruction/)
+    assert.doesNotMatch(htmlHint, /write_file overwrite=true with the FULL/)
+    const themeHint = formatSurgicalFollowUpHint({
+      stacks: [
+        {
+          id: 'html',
+          label: 'HTML',
+          markers: ['index.html'],
+          sourceGlobs: [],
+          ignoreDirs: []
+        }
+      ],
+      i18nFix: false,
+      themeToggle: true
+    })
+    assert.match(themeHint, /apply_diff with a short instruction/)
+    assert.match(themeHint, /Do NOT rewrite js\/main\.js/)
     const landingHtml =
       '<!DOCTYPE html><html><head><link rel="stylesheet" href="styles.css"></head>' +
       '<body><nav><ul class="nav-links"><li>x</li></ul></nav></body></html>'
@@ -2438,6 +2695,47 @@ describe('edit sanity + html-only stacks', () => {
         'document.documentElement.dataset.theme = "light"'
       )
     )
+    const splitHtml =
+      '<!DOCTYPE html><html><head><link rel="stylesheet" href="styles.css"></head>' +
+      '<body><header class="site-header"><a class="brand">' +
+      '<svg class="brand-icon" viewBox="0 0 32 32"></svg></a>' +
+      '<nav class="header-nav"><a class="nav-link">Features</a></nav>' +
+      '<button id="langToggle" class="lang-btn">EN</button></header>' +
+      '<section class="hero"><div class="hero-inner"><h1 class="hero-title">AFKLLM</h1></div></section>' +
+      '</body></html>'
+    const splitCss =
+      '.navbar { display:flex } .nav-links { display:flex; list-style:none } ' +
+      '.hero { min-height:80vh } .hero-content { z-index:1 } .hero-buttons { display:flex } ' +
+      '.nav-logo { font-weight:800 }\n'
+    assert.equal(htmlCssLayoutMismatch(splitHtml, splitCss), true)
+    assert.equal(inlineSvgLooksUnsized(splitHtml, splitCss), true)
+    const splitHint =
+      formatEditSanityHint({
+        path: 'index.html',
+        content: splitHtml,
+        html: splitHtml,
+        css: splitCss,
+        cssPath: 'styles.css'
+      }) ?? ''
+    assert.match(splitHint, /EDIT_SANITY/)
+    assert.match(splitHint, /class names are not in CSS/)
+    assert.match(splitHint, /svg/)
+    const alignedHtml =
+      '<!DOCTYPE html><html><head><link rel="stylesheet" href="styles.css"></head>' +
+      '<body><nav class="navbar"><ul class="nav-links"><li><a>x</a></li></ul></nav>' +
+      '<section class="hero"><div class="hero-content"><h1>AFKLLM</h1>' +
+      '<div class="hero-buttons"><a class="btn-primary">Download</a></div></div></section>' +
+      '</body></html>'
+    const alignedCss =
+      '.navbar { display:flex } .nav-links { display:flex; list-style:none } ' +
+      '.hero { min-height:80vh } .hero-content { z-index:1 } .hero-buttons { display:flex } ' +
+      '.btn-primary { background:#6c63ff }\n'
+    assert.equal(htmlCssLayoutMismatch(alignedHtml, alignedCss), false)
+    assert.equal(inlineSvgLooksUnsized(alignedHtml, alignedCss), false)
+    const contract = formatLandingCssContractHint(alignedCss)
+    assert.ok(contract)
+    assert.match(contract!, /LANDING_CONTRACT/)
+    assert.match(contract!, /\.navbar/)
   })
 })
 
@@ -2459,6 +2757,222 @@ describe('product README git clone refusal', () => {
     } finally {
       await fs.rm(root, { recursive: true, force: true })
     }
+  })
+})
+
+describe('composer apply handoff', () => {
+  const themeAsk = 'Добавь переключатель темы лендинга (белый/темный)'
+  const fromScratch =
+    'Сделай полноценный профессиональный многофайловый лендинг продукта AFKLLM. '.repeat(8) +
+    'Язык лендинга: русский + английский переключатель. С нуля.'
+
+  it('theme follow-up on existing js/main.js hands off to apply_diff instruction', () => {
+    assert.equal(looksLikeThemeToggleRequest(themeAsk), true)
+    assert.equal(looksLikeExplicitRewrite(themeAsk), false)
+    assert.equal(
+      shouldHandoffWriteToApply({ userText: themeAsk, relativePath: 'js/main.js' }),
+      true
+    )
+    assert.equal(isComposerApplyPath('js/main.js'), true)
+    const args = buildApplyHandoffArgs({
+      relativePath: 'js/main.js',
+      userText: themeAsk,
+      content: 'function themeToggle() { document.body.dataset.theme = "dark"; }\n'
+    })
+    assert.equal(args.relative_path, 'js/main.js')
+    assert.match(String(args.instruction), /переключатель темы/)
+    assert.match(String(args.instruction), /Edit this file only/)
+    assert.doesNotMatch(String(args.instruction), /FILE_COMPLETE/)
+  })
+
+  it('from-scratch landing brief does not hand off write_file of new modules', () => {
+    assert.equal(looksLikeFromScratchTask(fromScratch), true)
+    assert.equal(allowsComposerFullRewrite(fromScratch), true)
+    assert.equal(
+      shouldHandoffWriteToApply({ userText: fromScratch, relativePath: 'js/main.js' }),
+      false
+    )
+    assert.equal(
+      shouldHandoffWriteToApply({ userText: fromScratch, relativePath: 'index.html' }),
+      false
+    )
+    assert.equal(
+      shouldHandoffWriteToApply({ userText: fromScratch, relativePath: 'css/styles.css' }),
+      false
+    )
+    assert.equal(
+      shouldBlockSurgicalOverwrite({
+        userText: fromScratch,
+        relativePath: 'css/styles.css',
+        overwrite: true
+      }),
+      false
+    )
+  })
+
+  it('long landing rebuild without «с нуля» still skips Apply handoff', () => {
+    const user =
+      'Сделай полноценный профессиональный многофайловый лендинг продукта AFKLLM. ' +
+      'Герой, фичи, как это работает, CTA, футер. Факты только из GitHub README. ' +
+      'Структура: index.html, styles.css, js/main.js, assets/. ' +
+      'Пиши файлы по ходу и в порядке зависимостей: сначала CSS/JS/assets, потом index.html со ссылками. ' +
+      'После сборки открой index.html в браузере. Язык: русский + английский переключатель. ' +
+      'Современный dark landing, выразительная типографика, адаптив desktop+mobile.'
+    assert.ok(user.length > 400)
+    assert.equal(looksLikeFromScratchTask(user), true)
+    assert.equal(
+      shouldHandoffWriteToApply({ userText: user, relativePath: 'css/styles.css' }),
+      false
+    )
+  })
+
+  it('landing plan lists CSS/JS/assets before index.html when the user asked dependency order', () => {
+    const user =
+      'Сделай полноценный профессиональный многофайловый лендинг продукта AFKLLM. ' +
+      'Пиши файлы по ходу и в порядке зависимостей: сначала CSS/JS/assets, потом index.html. ' +
+      'Hero, Features, How it works, CTA, Footer. Dark theme, адаптив, README.'
+    const coerced = coerceProductPlan(
+      [
+        {
+          id: '1',
+          text: 'Написать index.html — собрать все секции: Hero, Features, How it works, Why local, Download, Footer.',
+          status: 'pending'
+        },
+        {
+          id: '2',
+          text: 'Создать структуру проекта: assets/, css/, js/.',
+          status: 'pending'
+        },
+        {
+          id: '3',
+          text: 'Написать styles.css — dark theme, типографика, анимации, адаптив.',
+          status: 'pending'
+        },
+        {
+          id: '4',
+          text: 'Написать js/main.js — переключатель языков, плавная прокрутка.',
+          status: 'pending'
+        },
+        {
+          id: '5',
+          text: 'Создать SVG-иконки в assets/ для визуализации фич.',
+          status: 'pending'
+        },
+        {
+          id: '6',
+          text: 'Создать README.md лендинга с инструкциями.',
+          status: 'pending'
+        },
+        {
+          id: '7',
+          text: 'Открыть index.html в браузере для проверки.',
+          status: 'pending'
+        }
+      ],
+      { userText: user }
+    )
+    const idx = (re: RegExp) => coerced.findIndex((s) => re.test(s.text))
+    const structure = idx(/структуру проекта/)
+    const css = idx(/styles\.css/)
+    const js = idx(/main\.js/)
+    const html = idx(/index\.html — собрать/)
+    const preview = idx(/браузер/)
+    assert.ok(structure >= 0 && css >= 0 && js >= 0 && html >= 0 && preview >= 0)
+    assert.ok(structure < css)
+    assert.ok(css < js)
+    assert.ok(js < html)
+    assert.ok(html < preview)
+    assert.equal(coerced[0]!.status, 'in_progress')
+  })
+
+  it('plan card JSON can mark the header failed without unchecking rows', () => {
+    const raw = formatTodoUiContent(
+      [{ id: 's1', text: 'Написать styles.css', status: 'done' }],
+      { failed: true }
+    )
+    assert.equal(parseTodoUiFailed(raw), true)
+    assert.equal(parseTodoUiContent(raw)?.[0]?.status, 'done')
+    assert.equal(parseTodoUiFailed(formatTodoUiContent([{ id: 's1', text: 'x', status: 'done' }])), false)
+  })
+
+  it('plan card failed flag clears after a later successful edit', () => {
+    const steps = [{ id: 's1', text: 'Написать styles.css', status: 'done' as const }]
+    assert.equal(todoCardFailed({ mutatingEditFailed: true, mutatingEditOk: false }), true)
+    assert.equal(todoCardFailed({ mutatingEditFailed: true, mutatingEditOk: true }), false)
+    assert.equal(todoCardFailed({ mutatingEditFailed: false, mutatingEditOk: true }), false)
+    const afterFail = formatTodoUiContent(steps, {
+      failed: todoCardFailed({ mutatingEditFailed: true, mutatingEditOk: false })
+    })
+    assert.equal(parseTodoUiFailed(afterFail), true)
+    const afterOk = formatTodoUiContent(steps, {
+      failed: todoCardFailed({ mutatingEditFailed: true, mutatingEditOk: true })
+    })
+    assert.equal(parseTodoUiFailed(afterOk), false)
+  })
+
+  it('does not dump a whole module into the Apply instruction', () => {
+    const dump =
+      '(function () {\n' +
+      '  const a = 1;\n  function foo() { return a; }\n  const b = 2;\n  function bar() { return b; }\n'.repeat(
+        80
+      ) +
+      '})();\n'
+    const instruction = formatApplyHandoffInstruction({
+      userText: themeAsk,
+      relativePath: 'js/main.js',
+      snippet: dump
+    })
+    assert.ok(instruction.length < dump.length)
+    assert.doesNotMatch(instruction, /Suggested fragment/)
+  })
+
+  it('complete HTML buffer does not mark js/main.js complete', () => {
+    const html =
+      '<!DOCTYPE html><html><head><title>x</title></head><body><p>hi</p></body></html>\n'
+    assert.equal(
+      priorCompleteForWritePath({
+        relativePath: 'js/main.js',
+        lastHtml: html,
+        lastJs: '',
+        lastCss: ''
+      }),
+      false
+    )
+    assert.equal(
+      priorCompleteForWritePath({
+        relativePath: 'index.html',
+        lastHtml: html,
+        lastJs: '',
+        lastCss: ''
+      }),
+      true
+    )
+    const js =
+      '(function () {\n  const x = 1;\n  function init() { return x; }\n  init();\n})();\n'
+    assert.equal(
+      priorCompleteForWritePath({
+        relativePath: 'js/main.js',
+        lastHtml: html,
+        lastJs: js,
+        lastCss: ''
+      }),
+      true
+    )
+  })
+
+  it('does not persist truncated writes onto a complete file', () => {
+    assert.equal(shouldPersistIncompleteWrite({ knownComplete: true }), false)
+    assert.equal(shouldPersistIncompleteWrite({ knownComplete: false }), true)
+  })
+
+  it('isWholeFileSearchBlock still rejects apply_diff of the whole file', () => {
+    const html =
+      '<!DOCTYPE html><html><head><title>AFKLLM</title></head><body>' +
+      '<p>' +
+      'section '.repeat(200) +
+      '</p></body></html>\n'
+    assert.equal(isWholeFileSearchBlock(html.length, html.length), true)
+    assert.equal(isWholeFileSearchBlock(40, html.length), false)
   })
 })
 

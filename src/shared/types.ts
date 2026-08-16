@@ -10,6 +10,8 @@ export interface LLMCompletionRequest {
   body: Record<string, unknown>
   /** Soft timeout in ms (default 30_000). Use 0 for no timeout. */
   timeoutMs?: number
+  /** Override llama-server URL (coresident vision on port+2). Default = chat. */
+  baseUrl?: string
 }
 
 export interface LLMStreamChunk {
@@ -103,6 +105,8 @@ export interface AgentToolResult {
   editReview?: AgentEditReview
   /** Relative workspace path for tools that create/touch a file (e.g. generate_image) */
   filePath?: string
+  /** Honest disk +/- vs the file before this tool wrote (not the model's dump). */
+  diffStat?: { added: number; removed: number }
 }
 
 export interface FimContext {
