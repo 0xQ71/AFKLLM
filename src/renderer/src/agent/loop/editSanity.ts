@@ -1,5 +1,5 @@
 import { contentLooksStructurallyComplete } from '../../../../shared/completeness'
-import { looksLikeThemeToggleRequest } from '../agentPure'
+import { looksLikeThemeToggleRequest, looksLikeNoCardDumpRequest } from '../agentPure'
 import { formatI18nSanityHint, I18N_SANITY_PREFIX } from './i18nSanity'
 
 export const EDIT_SANITY_PREFIX = 'EDIT_SANITY:'
@@ -29,12 +29,21 @@ export function extractHtmlClassTokens(html: string): string[] {
 
 export function extractCssClassNames(css: string, max = 40): string[] {
   const names: string[] = []
-  const re = /\.([a-zA-Z_][\w-]*)/g
-  let m: RegExpExecArray | null
-  while ((m = re.exec(css))) {
-    const n = m[1] ?? ''
-    if (n && !names.includes(n)) names.push(n)
-    if (names.length >= max) break
+  const stripped = (css ?? '')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/url\s*\([^)]*\)/gi, 'url()')
+  const blockRe = /([^{}]+)\{/g
+  let block: RegExpExecArray | null
+  while ((block = blockRe.exec(stripped))) {
+    const sel = block[1] ?? ''
+    const classRe = /\.([a-zA-Z_][\w-]*)/g
+    let m: RegExpExecArray | null
+    while ((m = classRe.exec(sel))) {
+      const n = m[1] ?? ''
+      if (!n || /^(svg|png|jpe?g|gif|webp|ico|js|mjs|cjs|css|html)$/i.test(n)) continue
+      if (!names.includes(n)) names.push(n)
+      if (names.length >= max) return names
+    }
   }
   return names
 }
@@ -59,6 +68,15 @@ export function missingHtmlLayoutClassesInCss(html: string, css: string): string
 
 export function htmlCssLayoutMismatch(html: string, css: string): boolean {
   return missingHtmlLayoutClassesInCss(html, css).length >= 4
+}
+
+export function countLandingCardClasses(html: string): number {
+  return (html.match(/class\s*=\s*["'][^"']*\b(?:feature-card|why-card)\b[^"']*["']/gi) ?? [])
+    .length
+}
+
+export function htmlLooksLikeCardDump(html: string): boolean {
+  return countLandingCardClasses(html) >= 4
 }
 
 /** Header/logo SVG without width/height and without a CSS size — fills the viewport. */
@@ -187,6 +205,15 @@ export function formatEditSanityHint(opts: {
     parts.push(
       `${EDIT_SANITY_PREFIX} the user asked for a light/dark theme toggle, but HTML/JS has no ` +
         'data-theme / theme control. Add it with apply_diff — do not claim the task is done.'
+    )
+  }
+
+  if (looksLikeNoCardDumpRequest(opts.userText ?? '') && htmlLooksLikeCardDump(html)) {
+    parts.push(
+      `${EDIT_SANITY_PREFIX} the user forbade an AI card grid, but index.html has ` +
+        `${countLandingCardClasses(html)} feature-card/why-card blocks. ` +
+        'Rebuild Features as a layout (split, list, or two columns) — not a stack of identical cards. ' +
+        'Do NOT Start-Process / claim the landing looks professional yet.'
     )
   }
 

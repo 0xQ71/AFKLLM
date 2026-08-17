@@ -59,7 +59,7 @@ export function registerMonacoLspProviders(
             model.getValue()
           )
           if (!res.ok || !res.contents?.trim()) return null
-          // Cursor-style: type signature as code fence, then prose docs.
+          // Type signature as a code fence, then prose docs.
           const [signature, ...docParts] = res.contents.split(/\n\n+/)
           const blocks: Monaco.IMarkdownString[] = [
             { value: '```ts\n' + signature.trim() + '\n```' }

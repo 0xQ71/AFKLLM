@@ -137,7 +137,7 @@ export function jsI18nDictLooksBroken(js: string): boolean {
 export function jsAssignsNonStringToDom(js: string): boolean {
   if (!js.trim()) return false
   if (
-    /\.(?:textContent|innerHTML|innerText)\s*=\s*(?:item|feat|feature|card|obj|entry|node|value)\b/i.test(
+    /\.(?:textContent|innerHTML|innerText)\s*=\s*(?:item|feat|feature|card|obj|entry|node)\b/i.test(
       js
     )
   ) {
@@ -147,6 +147,60 @@ export function jsAssignsNonStringToDom(js: string): boolean {
     return true
   }
   return false
+}
+
+/** `t[key].split(...).filter` destroys translations (keeps one word). */
+export function jsI18nUsesDestructiveSplit(js: string): boolean {
+  if (!js.trim()) return false
+  if (/t\[key\]\.split\s*\(/i.test(js)) return true
+  if (
+    /\.split\s*\(\s*['"] ['"]\s*\)\s*\.filter/i.test(js) &&
+    /data-i18n|i18n|setLang|translations/i.test(js)
+  ) {
+    return true
+  }
+  return false
+}
+
+/**
+ * Which landing files to recover after an I18N_SANITY hint.
+ * JS dict / textContent / split bugs must not be blamed on the HTML write.
+ */
+export function i18nSanityTargetPaths(
+  hint: string,
+  opts?: { htmlPath?: string; jsPath?: string; written?: string }
+): string[] {
+  const html = loopish(opts?.htmlPath || 'index.html')
+  const js = loopish(opts?.jsPath || 'js/main.js')
+  const written = loopish(opts?.written || '')
+  const out: string[] = []
+  const add = (p: string): void => {
+    if (p && !out.includes(p)) out.push(p)
+  }
+  if (
+    /visible fallback|no visible fallback|empty data-i18n|Fix index\.html|no such id|Put that id/i.test(
+      hint
+    )
+  ) {
+    add(html)
+  }
+  if (
+    /objects\/arrays|object Object|textContent|Fix js\/main\.js|STRING|split translation|do not split|t\[key\]\.split/i.test(
+      hint
+    )
+  ) {
+    add(js)
+  }
+  if (/keys missing/i.test(hint)) {
+    add(js)
+    add(html)
+  }
+  if (!out.length && written) add(written)
+  return out
+}
+
+function loopish(p: string): string {
+  return p.replace(/\\/g, '/').replace(/^\.\//, '').trim().toLowerCase()
 }
 
 /** How many data-i18n elements have no visible fallback text. */
@@ -197,6 +251,12 @@ export function formatI18nSanityHint(opts: { html?: string; js?: string }): stri
         'Each translation must be a STRING. Nested ru/en maps of strings are OK. Fix js/main.js once — do not write tmp/check.js.'
     )
   }
+  if (jsI18nUsesDestructiveSplit(js)) {
+    parts.push(
+      `${I18N_SANITY_PREFIX} do not split/filter translation strings. Use el.textContent = t[key]. ` +
+        'apply_diff that line or one write_file overwrite on js/main.js. Do not write tmp/check.js.'
+    )
+  }
   const missingKeys = missingI18nKeysInJs(html, js)
   const htmlKeys = extractDataI18nKeys(html)
   const foundKeys = htmlKeys.filter((k) => jsHasI18nKey(js, k)).length
@@ -244,6 +304,11 @@ export function formatI18nCloserWhy(hint: string, uiLang: 'ru' | 'en'): string {
     return uiLang === 'ru'
       ? 'i18n всё ещё подставляет объекты в DOM ([object Object]) — значения перевода должны быть строками.'
       : 'i18n still assigns objects to the DOM ([object Object]) — translation values must be strings.'
+  }
+  if (/do not split|split\/filter|split translation/i.test(h)) {
+    return uiLang === 'ru'
+      ? 'i18n режет строки через split/filter — нужен textContent = t[key].'
+      : 'i18n splits translation strings — use textContent = t[key].'
   }
   if (/keys missing/i.test(h)) {
     return uiLang === 'ru'

@@ -2106,11 +2106,9 @@ function ThinkThroughBody({
   })
   const thinkParts = parts.filter((p) => p.kind === 'think' && p.text.trim())
   const textParts = parts.filter((p) => p.kind === 'text' && p.text.trim())
-  // One fold only — if multiple think blocks leaked in, keep the longest.
+  // Keep every think block — do not drop a shorter first fold.
   const mergedThink =
-    thinkParts.length > 0
-      ? thinkParts.map((p) => p.text).sort((a, b) => b.length - a.length)[0]!
-      : stableLive
+    thinkParts.length > 0 ? thinkParts.map((p) => p.text).join('\n\n') : stableLive
   const showThinkFold =
     hasThinkTags &&
     (Boolean(mergedThink.trim()) || Boolean(stableLive.trim()) || Boolean(streaming))
@@ -2220,7 +2218,7 @@ function AgentTodoCard({ content }: { content: string }): React.JSX.Element | nu
 }
 
 function AgentChecklistCard({ content }: { content: string }): React.JSX.Element | null {
-  // Legacy progress dump — keep minimal, do not look like Cursor plan.
+  // Legacy progress dump — keep minimal, do not look like a second plan card.
   const { t } = useI18n()
   const cl = parseChecklistUiContent(content)
   if (!cl) return null

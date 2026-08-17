@@ -26,7 +26,7 @@ export function setupMonaco(): typeof monaco {
 
   loader.config({ monaco })
 
-  // Enable Cursor-like TS/JS hover + syntax markers from Monaco's ts.worker.
+  // Enable TS/JS hover + syntax markers from Monaco's ts.worker.
   const tsDefaults = monaco.languages.typescript.typescriptDefaults
   const jsDefaults = monaco.languages.typescript.javascriptDefaults
   const compilerOptions: monaco.languages.typescript.CompilerOptions = {

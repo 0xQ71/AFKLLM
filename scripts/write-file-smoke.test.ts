@@ -65,4 +65,36 @@ describe('write_file smoke', () => {
     assert.match(r.error ?? '', /FILE_COMPLETE/)
     assert.equal(await fs.readFile(path.join(root, 'js', 'main.js'), 'utf8'), done)
   })
+
+  it('refuses write_file without content and compact FILE_COMPLETE stubs', async () => {
+    const missing = await tools.invoke({
+      id: 'empty-1',
+      name: 'write_file',
+      arguments: { relative_path: 'index.html' }
+    })
+    assert.equal(missing.ok, false)
+    assert.match(missing.error ?? '', /EMPTY_WRITE/)
+    await fs.writeFile(path.join(root, 'keep.txt'), 'keep-me\n', 'utf8')
+    const stub = await tools.invoke({
+      id: 'empty-2',
+      name: 'write_file',
+      arguments: {
+        relative_path: 'keep.txt',
+        content: 'FILE_COMPLETE on disk, 12 lines — do not rewrite'
+      }
+    })
+    assert.equal(stub.ok, false)
+    assert.match(stub.error ?? '', /EMPTY_WRITE/)
+    assert.equal(await fs.readFile(path.join(root, 'keep.txt'), 'utf8'), 'keep-me\n')
+    const omitted = await tools.invoke({
+      id: 'empty-3',
+      name: 'write_file',
+      arguments: {
+        relative_path: 'styles.css',
+        content: '[omitted — file on disk, 400 chars]'
+      }
+    })
+    assert.equal(omitted.ok, false)
+    assert.match(omitted.error ?? '', /EMPTY_WRITE/)
+  })
 })

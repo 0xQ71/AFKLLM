@@ -58,49 +58,17 @@ export function recursiveListingRefusal(command: string): string | null {
 }
 
 /**
- * Cloning the advertised product repo (or any git clone into /tmp) just to copy
- * README facts — use web_search / workspace README instead.
+ * PowerShell aliases `curl` → Invoke-WebRequest, which breaks Unix pipelines
+ * (`curl | jq` prompts for Uri). Drop the alias so `curl` is curl.exe.
  */
-export function productReadmeCloneRefusal(command: string): string | null {
-  const c = command.trim()
-  if (!c || !/\bgit\s+clone\b/i.test(c)) return null
-  const clonesProduct =
-    /github\.com[/:]0xq71\/afkllm/i.test(c) || /git@github\.com:0xq71\/afkllm/i.test(c)
-  const clonesToTmp =
-    /(?:^|[\s"'=])(?:\/tmp|\\tmp)(?:[/\\s"']|$)/i.test(c) ||
-    /\s(?:\/tmp|\\tmp)(?:[/\\s"']|$)/i.test(c)
-  if (!clonesProduct && !clonesToTmp) return null
-  return (
-    'SHELL_REFUSED: do not git clone the product repo (or clone into /tmp) just to read README. ' +
-    'Use facts already in the user message, or read_file the workspace README. write_file landing files NOW. ' +
-    'Never Copy-Item from a clone.'
-  )
-}
+export const POWERSHELL_UNALIAS_CURL =
+  'Remove-Item alias:curl -Force -ErrorAction SilentlyContinue'
 
-/** curl/iwr of the advertised product README — same scavenger hunt as git clone. */
-export function productReadmeFetchRefusal(command: string): string | null {
-  const c = command.trim()
-  if (!c) return null
-  if (!/\b(curl\.exe|curl|wget|Invoke-WebRequest|Invoke-RestMethod)\b/i.test(c)) return null
-  if (!/github\.com\/0xq71\/afkllm|raw\.githubusercontent\.com\/0xq71\/afkllm/i.test(c)) {
-    return null
-  }
-  return (
-    'SHELL_REFUSED: do not curl/wget the product GitHub README. ' +
-    'Facts are in the user message. write_file styles.css / js/main.js / index.html NOW.'
-  )
-}
-
-/** curl.exe does not take -UseBasicParsing (that is Invoke-WebRequest). */
-export function curlIwrFlagRefusal(command: string): string | null {
-  const c = command.trim()
-  if (!c || !/\bcurl(\.exe)?\b/i.test(c)) return null
-  if (!/-UseBasicParsing\b/i.test(c)) return null
-  return (
-    'SHELL_SYNTAX: -UseBasicParsing is an Invoke-WebRequest flag, not curl.exe. ' +
-    'Do not fetch GitHub. write_file the landing files from the facts in the user message.'
-  )
-}
+/** Init for the visible agent PTY (`powershell.exe -NoProfile -Command`). */
+export const POWERSHELL_AGENT_PTY_INIT =
+  'Remove-Module PSReadLine -ErrorAction SilentlyContinue; ' +
+  `${POWERSHELL_UNALIAS_CURL}; ` +
+  '[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)'
 
 /**
  * `node -e` with regex character classes breaks in PowerShell (`[` = type literal).

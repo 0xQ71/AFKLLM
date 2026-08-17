@@ -10,7 +10,7 @@ export interface PersistedChatImage {
   name?: string
 }
 
-/** Cursor-style file chip on a user message (any dropped/attached file). */
+/** File chip on a user message (any dropped/attached file). */
 export interface PersistedChatFile {
   id: string
   path: string

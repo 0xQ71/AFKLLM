@@ -4,7 +4,7 @@ import { runAgentTurn } from '../runAgentTurn'
 export type { ChatMessage }
 
 /**
- * Cursor-like agent loop (v2): same streaming/tool engine as runAgentTurn,
+ * Agent loop (v2): same streaming/tool engine as runAgentTurn,
  * with language-agnostic prompts, evidence-gated plan ticks, and no landing shortcuts.
  * ChatPanel should call this when settings.agentLoopV2 is on (default).
  */

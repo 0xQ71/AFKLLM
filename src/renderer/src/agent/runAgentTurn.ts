@@ -76,10 +76,13 @@ import {
   looksLikeOpenHtmlCommand,
   isLandingJsPath,
   looksLikeLandingBuildTask,
-  landingBriefAlreadyHasFacts,
+  looksLikeEmptyOrStubWriteContent,
+  formatEmptyWriteError,
   evaluateAcceptanceGate,
   fingerprintToolCall,
   looksLikeToolMarkupLeak,
+  salvageLeakedToolCalls,
+  stripLeakedToolMarkup,
   coerceToolRelativePath,
   resolveWriteFilePath,
   inferWritePathFromContent,
@@ -126,16 +129,14 @@ import {
 } from './composerActivity'
 import { diffStatFromCodePreview } from '../../../shared/diffStat'
 import { isAfkllmInternalHtmlPath } from '../../../shared/localPreview'
-import { formatEditSanityHint, formatLandingCssContractHint } from './loop/editSanity'
+import { stubWriteFileArgs } from './loop/compactWrites'
 import { formatI18nCloserWhy, inventedI18nVerifierPath } from './loop/i18nSanity'
 import {
   formatScratchWriteFileHint,
   formatWriteFileRequiredError,
-  formatWriteOnceError,
   formatLandingJsBeforeHtmlHint,
   isCappedLandingWritePath,
   landingBundleReady,
-  shouldRefuseLandingRewrite,
   shouldRequireWriteFileForApply
 } from './loop/landingWriteCap'
 import { AGENT_MAX_TOKENS, maxTokensForAgent } from './loop/ctxBudget'
@@ -286,7 +287,7 @@ export interface ChatMessage {
   codePreview?: string
   filePath?: string
   images?: Array<{ id: string; path: string; mime: string; name?: string }>
-  /** Cursor-style file pills on the user bubble (any attached file). */
+  /** File pills on the user bubble (any attached file). */
   files?: ChatFileRef[]
   stats?: ChatMessageStats
   editReview?: { path: string; status: 'pending' | 'accepted' | 'rejected' }
@@ -505,7 +506,7 @@ export function looksLikeOpenLandingOnly(text: string): boolean {
 }
 
 /**
- * Cursor-style: skip forced think→plan ONLY for ultra-short confirms
+ * Skip forced think→plan ONLY for ultra-short confirms
  * («ок», «продолжи»). Feature requests (theme toggle, etc.) always get think.
  * Never use keywords like «исправ/белый» — only message shape.
  */
@@ -560,7 +561,7 @@ const MAX_IDENTICAL_TOOL_CALLS = 2
 /** Repeated read_file of the SAME range — allow a few, with a turn-wide budget. */
 const MAX_READS_PER_PATH = 6
 const MAX_READS_TURN_BUDGET = 8
-/** Soft recovery threshold — after this, stop looping (Cursor does not retry forever). */
+/** Soft recovery threshold — after this, stop looping. */
 const MAX_TOOL_LOOP_HITS = 2
 /** Successful apply_patch/apply_diff on one path before forcing finish. */
 const MAX_PATCH_OK_PER_PATH = 4
@@ -873,7 +874,7 @@ function ensureClosingMessage(
   messages.push({ id, role: 'assistant', content, streaming: false })
 }
 
-/** Live Cursor-style plan card (model-authored <plan>). Place AFTER think, not before. */
+/** Live plan card (model-authored <plan>). Place AFTER think, not before. */
 function upsertTodoBubble(
   messages: ChatMessage[],
   steps: AgentTodoStep[],
@@ -1231,19 +1232,19 @@ function countLinesFromWriteArgs(argsJson: string): number | null {
   return content.split(/\r?\n/).length
 }
 
-function writeOnDiskStubArgs(path: string | null, lines: number | null, latest: boolean): string {
-  return JSON.stringify({
-    ...(path ? { relative_path: path } : {}),
-    note: latest
-      ? `FILE_COMPLETE on disk${lines != null ? `, ${lines} lines` : ''} — do not rewrite`
-      : '[earlier write omitted — file is on disk]'
+function writeOnDiskStubArgs(path: string | null, lines: number | null, latest: boolean, omittedChars = 0): string {
+  return stubWriteFileArgs({
+    relativePath: path,
+    lineCount: lines,
+    latest,
+    omittedChars
   })
 }
 
-/** Keep path + FILE_COMPLETE; drop full content so compact does not erase "already on disk". */
+/** Keep path + wrote OK; drop full content. Do not put FILE_COMPLETE into args-shaped stubs. */
 function slimWriteSuccessResult(content: string): string | null {
   const c = content.trim()
-  if (!/^(Wrote |Appended )|\bFILE_COMPLETE\b/i.test(c)) return null
+  if (!/^(Wrote |Appended )/i.test(c)) return null
   const path =
     c.match(/bytes to\s+(\S+?)(?:\s|\(|$)/i)?.[1] ||
     c.match(/"([A-Za-z0-9_./\\-]+\.[a-zA-Z0-9]+)"/)?.[1] ||
@@ -1252,15 +1253,15 @@ function slimWriteSuccessResult(content: string): string | null {
   const flags = content
     .split('\n')
     .filter((l) =>
-      /I18N_SANITY|EDIT_SANITY|LANDING_CONTRACT|WRITE_ONCE|WRITE_FILE_REQUIRED|INCOMPLETE_WRITE|AGENT_HINT/i.test(
+      /I18N_SANITY|EDIT_SANITY|LANDING_CONTRACT|WRITE_ONCE|WRITE_FILE_REQUIRED|INCOMPLETE_WRITE|EMPTY_WRITE|AGENT_HINT/i.test(
         l
       )
     )
     .join('\n')
   const stub =
-    `${(path || 'file').replace(/\\/g, '/')}: FILE_COMPLETE on disk` +
+    `${(path || 'file').replace(/\\/g, '/')}: wrote OK` +
     (lines ? ` (${lines} lines)` : '') +
-    '. Do not rewrite this file.'
+    '. Body omitted from history.'
   return flags ? `${stub}\n${flags}` : stub
 }
 
@@ -1337,7 +1338,12 @@ function slimCompletedWriteToolCalls(msgs: ApiMessage[]): void {
         ...t,
         function: {
           ...t.function,
-          arguments: writeOnDiskStubArgs(path, countLinesFromWriteArgs(argsJson), latest)
+          arguments: writeOnDiskStubArgs(
+            path,
+            countLinesFromWriteArgs(argsJson),
+            latest,
+            argsJson.length
+          )
         }
       }
     })
@@ -1351,10 +1357,10 @@ function slimToolArgs(name: string, argsJson: string): string {
   const path = extractJsonStringField(argsJson, 'relative_path')
   const cmd = extractJsonStringField(argsJson, 'command')
   if (path) {
-    return JSON.stringify({
-      relative_path: path,
-      content: `[omitted ${argsJson.length} chars — file on disk]`,
-      note: 'use read_file if you need contents'
+    return stubWriteFileArgs({
+      relativePath: path,
+      omittedChars: argsJson.length,
+      latest: true
     })
   }
   if (cmd) {
@@ -2045,10 +2051,6 @@ function attachStatsToLastVisible(
     if (!m || m.id === 'welcome') continue
     if (isAgentTodoMessageId(m.id) || m.id === AGENT_CHECKLIST_MSG_ID) continue
     if (m.streaming) continue
-    // Don't hang tool-round token stats on the think fold.
-    if (hasThinkBlock(m.content) && !stripPlanBlock(m.content).replace(/<\s*\/?\s*(?:think|thinking)\s*>/gi, '').trim()) {
-      continue
-    }
     if (!m.content?.trim() && !m.codePreview && !m.toolName) continue
     const prev = m.stats
     messages[i] = {
@@ -2088,7 +2090,7 @@ export async function runAgentTurn(params: {
   attachments?: FileAttachment[]
   images?: ImageAttachment[]
   documents?: DocumentAttachment[]
-  /** Cursor-style file pills on the user bubble */
+  /** File pills on the user bubble */
   files?: ChatFileRef[]
   onUpdate: (messages: ChatMessage[]) => void
   onStats?: (stats: ChatMessageStats) => void
@@ -2235,7 +2237,6 @@ export async function runAgentTurn(params: {
   let editSanityFailed = false
   const completeLandingWritesByPath = new Map<string, number>()
   const landingRecoveryUsedByPath = new Set<string>()
-  let lastSanityFailedPath = ''
   const completeHtmlByPath = new Set<string>()
 
   const invokeApplyHandoff = async (
@@ -2619,22 +2620,6 @@ export async function runAgentTurn(params: {
       return name !== 'web_search'
     })
   }
-  if (landingBriefAlreadyHasFacts(params.userText)) {
-    agentTools = agentTools.filter((tool) => {
-      const name =
-        tool &&
-        typeof tool === 'object' &&
-        'function' in tool &&
-        tool.function &&
-        typeof tool.function === 'object' &&
-        'name' in tool.function
-          ? String((tool.function as { name?: unknown }).name ?? '')
-          : tool && typeof tool === 'object' && 'name' in tool
-            ? String((tool as { name?: unknown }).name ?? '')
-            : ''
-      return name !== 'web_search' && name !== 'explore_subagent'
-    })
-  }
 
   // Think ON: THINK-ONLY completion first (stream every token), then a separate PLAN completion.
   if (thinkThrough) {
@@ -2765,7 +2750,7 @@ export async function runAgentTurn(params: {
         'FORBIDDEN: <plan>, todos, code, tools, HTML.\n' +
         'Stop right after </think>.'
       : 'THINK_ONLY (tools DISABLED). Output ONLY a <think>…</think> block — nothing after it.\n' +
-        'Write first-person reasoning in the USER\'s language (like Cursor / DeepSeek DeepThink):\n' +
+        'Write first-person reasoning in the USER\'s language (like DeepSeek DeepThink):\n' +
         '- 8–14 sentences (~160–320 words). Stream immediately — do not stay silent then dump.\n' +
         '- Cover: goal, hard constraints (what is FORBIDDEN), structure / file order, visuals, risks, how you verify.\n' +
         '- Tie points to THIS user message — no filler; one continuous thought, not a stub.\n' +
@@ -3006,9 +2991,9 @@ export async function runAgentTurn(params: {
       allowsComposerFullRewrite(params.userText)
         ? 'Think/plan already recorded. Do NOT output another <think> or <plan>. ' +
             'Call tools NOW to execute the plan IN ORDER. This is a from-scratch / full rebuild: ' +
-            'ONE complete write_file per path (overwrite=true allow_full_rewrite=true). Leftover files from a failed turn may be overwritten with the FULL professional file. ' +
-            'If the user already listed product facts and GitHub URLs, do NOT explore_subagent, web_search, or curl GitHub — write CSS/JS/assets then HTML. ' +
-            'Do NOT rewrite js/main.js or index.html after they are complete. Do NOT call apply_diff / Apply to regenerate a whole CSS/JS/HTML file. ' +
+            'write_file overwrite=true allow_full_rewrite=true with the COMPLETE file for each path. Leftover files from a failed turn may be overwritten with the FULL professional file. ' +
+            'If the user already listed product facts, prefer writing CSS/JS/assets then HTML; search or fetch only if a required URL is missing. ' +
+            'Do NOT call apply_diff / Apply to regenerate a whole CSS/JS/HTML file that is not on disk yet. ' +
             'data-i18n tags MUST contain visible default-language text (JS only swaps on toggle — never empty <h1 data-i18n>). ' +
             'After styles.css exists, index.html MUST reuse its class names; inline SVG needs width/height; JS keys must match HTML data-i18n. ' +
             'After CSS+HTML+JS exist, Start-Process once and STOP. ' +
@@ -3207,21 +3192,6 @@ export async function runAgentTurn(params: {
           return
         }
         const nextContent = base + token
-        // One DeepThink only — after prelude, never grow a second think fold in this bubble.
-        if (
-          thinkThrough &&
-          thinkSatisfied &&
-          (/<\s*(?:think|thinking)\b/i.test(nextContent) || hasThinkBlock(nextContent))
-        ) {
-          messages[idx] = {
-            ...messages[idx],
-            content:
-              uiLang === 'ru' ? '↻ Выполняю план…' : '↻ Executing the plan…',
-            streaming: true
-          }
-          params.onUpdate([...messages])
-          return
-        }
         // Stuck repeating the same paragraph with no tool draft — cut early.
         if (
           !isPlan &&
@@ -3470,8 +3440,8 @@ export async function runAgentTurn(params: {
           streaming: false,
           stats: mergedStats
         }
-        // One DeepThink only — prelude bubble stays frozen; strip late <think> from this message.
-        // Never splice away a real closing summary (promote think-only salvage if needed).
+        // Keep each generation's think visible. Only rewrite the bubble when
+        // this round is the closing summary (one closing card).
         if (thinkThrough && thinkSatisfied) {
           const rawBubble = messages[sIdx].content ?? ''
           if (isClosingMessageId(messages[sIdx].id)) {
@@ -3481,41 +3451,26 @@ export async function runAgentTurn(params: {
             const salvaged =
               stripped.trim() ||
               stripPlanBlock(promoteThinkOnlyAnswer(result.text || rawBubble)).trim()
-            if (salvaged) {
-              if (concludeAsked || looksLikeClosingSummary(salvaged)) {
-                lastClosingText = salvaged
-                const closeId = closingMessageId(userMessageId)
-                for (let i = messages.length - 1; i >= 0; i--) {
-                  if (i === sIdx) continue
-                  if (messages[i]?.id === closeId) messages.splice(i, 1)
-                  else if (
-                    /^↻\s*(Пишу заключение|Writing closing)/i.test(
-                      messages[i]?.content ?? ''
-                    )
-                  ) {
-                    messages.splice(i, 1)
-                  }
-                }
-                messages[sIdx] = {
-                  ...messages[sIdx]!,
-                  id: closeId,
-                  content: salvaged,
-                  streaming: false
-                }
-              } else {
-                messages[sIdx] = {
-                  ...messages[sIdx],
-                  content: salvaged
+            if (salvaged && (concludeAsked || looksLikeClosingSummary(salvaged))) {
+              lastClosingText = salvaged
+              const closeId = closingMessageId(userMessageId)
+              for (let i = messages.length - 1; i >= 0; i--) {
+                if (i === sIdx) continue
+                if (messages[i]?.id === closeId) messages.splice(i, 1)
+                else if (
+                  /^↻\s*(Пишу заключение|Writing closing)/i.test(
+                    messages[i]?.content ?? ''
+                  )
+                ) {
+                  messages.splice(i, 1)
                 }
               }
-            } else if (
-              !messages[sIdx].codePreview &&
-              !concludeAsked &&
-              !/^↻ /.test(rawBubble.trim()) &&
-              !isClosingMessageId(messages[sIdx].id)
-            ) {
-              // Drop empty "Пишу по плану…" shells only — never a closing card.
-              messages.splice(sIdx, 1)
+              messages[sIdx] = {
+                ...messages[sIdx]!,
+                id: closeId,
+                content: salvaged,
+                streaming: false
+              }
             }
           }
         }
@@ -3728,7 +3683,25 @@ export async function runAgentTurn(params: {
       continue
     }
 
-    const toolCalls = result.toolCalls
+    let toolCalls = result.toolCalls
+    if (!toolCalls?.length && looksLikeToolMarkupLeak(result.text ?? '')) {
+      const salvaged = salvageLeakedToolCalls(result.text ?? '')
+      if (salvaged.length) {
+        toolCalls = salvaged
+        result.toolCalls = salvaged
+        result.text = stripLeakedToolMarkup(result.text ?? '')
+        const si = messages.findIndex((m) => m.id === streamId)
+        if (si !== -1) {
+          const cleaned = sanitizeStreamAssistantText(result.text)
+          messages[si] = {
+            ...messages[si]!,
+            content: cleaned || messages[si]!.content,
+            streaming: false
+          }
+          params.onUpdate([...messages])
+        }
+      }
+    }
     logAgentToolEvent('round result', {
       round,
       toolCalls: toolCalls?.length ?? 0,
@@ -3754,28 +3727,40 @@ export async function runAgentTurn(params: {
         (looksLikeFinishMissingLandingFiles(params.userText) ||
           looksLikeLandingBuildTask(params.userText) ||
           allowsComposerFullRewrite(params.userText))
+      const coreLandingReady = htmlReady && cssReady && jsReady
       messages.push({
         id: uid(),
         role: 'assistant',
         content:
-          markupRepairAttempts > MAX_MARKUP_REPAIR_ATTEMPTS && !keepGoingForLanding
+          markupRepairAttempts > MAX_MARKUP_REPAIR_ATTEMPTS &&
+          !keepGoingForLanding &&
+          !coreLandingReady
             ? '⚠ Model leaked tool-call syntax into plain text. Stopping to avoid a write loop.'
             : '⚠ Detected leaked tool-call syntax in the reply (not a real tool call). Asking the model to use structured tools…'
       })
       params.onUpdate([...messages])
       if (markupRepairAttempts > MAX_MARKUP_REPAIR_ATTEMPTS) {
-        if (!keepGoingForLanding || markupRepairAttempts > MAX_MARKUP_REPAIR_ATTEMPTS + 3) {
-          return finishWithTiming(messages)
+        if (keepGoingForLanding && markupRepairAttempts <= MAX_MARKUP_REPAIR_ATTEMPTS + 3) {
+          const missing = !cssReady ? 'styles.css' : !htmlReady ? 'index.html' : 'js/main.js'
+          pushUserMessage(
+            apiMessages,
+            `Landing files are still missing. Call write_file NOW with relative_path="${missing}", ` +
+              'overwrite=true, and the FULL file in the JSON content argument. ' +
+              'Do not paste <tool_call> or call:write_file as plain text.'
+          )
+          apiMessages = normalizeApiMessages(apiMessages)
+          continue
         }
-        const missing = !cssReady ? 'styles.css' : !htmlReady ? 'index.html' : 'js/main.js'
-        pushUserMessage(
-          apiMessages,
-          `Landing files are still missing. Call write_file NOW with relative_path="${missing}", ` +
-            'overwrite=true, and the FULL file in the JSON content argument. ' +
-            'Do not paste <tool_call> or call:write_file as plain text.'
-        )
-        apiMessages = normalizeApiMessages(apiMessages)
-        continue
+        if (coreLandingReady && markupRepairAttempts <= MAX_MARKUP_REPAIR_ATTEMPTS + 2) {
+          pushUserMessage(
+            apiMessages,
+            'Core landing files are on disk. Call write_file for README.md (how to open) or ' +
+              'Start-Process (Resolve-Path .\\index.html) ONCE. Use structured tools, not <tool_call> XML.'
+          )
+          apiMessages = normalizeApiMessages(apiMessages)
+          continue
+        }
+        return finishWithTiming(messages)
       }
       pushUserMessage(
         apiMessages,
@@ -4147,33 +4132,6 @@ export async function runAgentTurn(params: {
               'Otherwise one SHORT apply_diff (search_block or a one-line instruction).'
           }
         } else if (
-          (name === 'apply_patch' || name === 'apply_diff' || name === 'write_file') &&
-          allowsComposerFullRewrite(params.userText) &&
-          isCappedLandingWritePath(filePath || String(args.relative_path ?? '')) &&
-          shouldRefuseLandingRewrite({
-            path: filePath || String(args.relative_path ?? ''),
-            completeWritesThisTurn:
-              completeLandingWritesByPath.get(
-                loopPathKey(filePath || String(args.relative_path ?? ''))
-              ) ?? 0,
-            recoveryUsedOnPath: landingRecoveryUsedByPath.has(
-              loopPathKey(filePath || String(args.relative_path ?? ''))
-            ),
-            sanityFailedOnThisPath:
-              lastSanityFailedPath ===
-                loopPathKey(filePath || String(args.relative_path ?? '')) &&
-              (editSanityFailed || i18nSanityFailed)
-          }) === 'refuse'
-        ) {
-          toolLoopHits++
-          toolResult = {
-            id: call.id,
-            name,
-            ok: false,
-            content: '',
-            error: formatWriteOnceError(filePath || String(args.relative_path ?? ''))
-          }
-        } else if (
           (name === 'apply_patch' || name === 'apply_diff') &&
           pathKeyForLoop &&
           (patchOkByPath.get(pathKeyForLoop) ?? 0) >= MAX_PATCH_OK_PER_PATH
@@ -4206,20 +4164,6 @@ export async function runAgentTurn(params: {
               name,
               arguments: args
             })
-          }
-        } else if (
-          (name === 'explore_subagent' || name === 'web_search') &&
-          landingBriefAlreadyHasFacts(params.userText)
-        ) {
-          toolResult = {
-            id: call.id,
-            name,
-            ok: false,
-            content: '',
-            error:
-              name === 'web_search'
-                ? 'SKIP_WEB_SEARCH: product facts and GitHub URLs are already in the user message. write_file styles.css overwrite=true NOW. Do not curl GitHub.'
-                : 'SKIP_EXPLORE: product facts and GitHub URLs are already in the user message. write_file styles.css overwrite=true NOW. Do not curl GitHub.'
           }
         } else if (name === 'explore_subagent') {
           const explore = await runExploreSubagent({
@@ -4301,6 +4245,20 @@ export async function runAgentTurn(params: {
             error:
               'MISSING_PATH: relative_path is required BEFORE content ' +
               '(e.g. relative_path="index.html"). Do not stream a whole file without a path.'
+          }
+        } else if (
+          name === 'write_file' &&
+          looksLikeEmptyOrStubWriteContent(
+            'content' in args ? args.content : undefined,
+            pathStr || String(resolvedPath || '')
+          )
+        ) {
+          toolResult = {
+            id: call.id,
+            name,
+            ok: false,
+            content: '',
+            error: formatEmptyWriteError(pathStr || String(resolvedPath || 'file'))
           }
         } else if (
           name === 'write_file' &&
@@ -4913,18 +4871,6 @@ export async function runAgentTurn(params: {
               /* ignore */
             }
           }
-          let css = lastCssWrite
-          if (!css) {
-            try {
-              const disk = await window.api.workspace.readFile(lastCssWritePath || 'styles.css')
-              if (disk.ok && typeof disk.content === 'string') {
-                css = disk.content
-                lastCssWrite = disk.content
-              }
-            } catch {
-              /* ignore */
-            }
-          }
           const body =
             (typeof args.content === 'string' && args.content) ||
             (/\.html?$/i.test(written) ? lastHtmlWrite : '') ||
@@ -4932,34 +4878,10 @@ export async function runAgentTurn(params: {
             (/\.css$/i.test(written) ? lastCssWrite : '') ||
             lastJsWrite ||
             lastHtmlWrite
-          const hint = formatEditSanityHint({
-            path: written,
-            content: body,
-            html,
-            js: lastJsWrite,
-            css,
-            cssPath: lastCssWritePath,
-            userText: params.userText
-          })
           const capKey = loopPathKey(written)
           const writesBefore = capKey
             ? (completeLandingWritesByPath.get(capKey) ?? 0)
             : 0
-          const wasLandingRecovery =
-            allowsComposerFullRewrite(params.userText) &&
-            Boolean(capKey) &&
-            shouldRefuseLandingRewrite({
-              path: written,
-              completeWritesThisTurn: writesBefore,
-              recoveryUsedOnPath: landingRecoveryUsedByPath.has(capKey),
-              sanityFailedOnThisPath:
-                lastSanityFailedPath === capKey &&
-                (editSanityFailed || i18nSanityFailed)
-            }) === 'allow_recovery'
-          const recoveringI18n =
-            i18nSanityFailed &&
-            isLandingJsPath(written)
-          if (recoveringI18n) i18nRecoveryEdits++
           if (
             allowsComposerFullRewrite(params.userText) &&
             capKey &&
@@ -4967,38 +4889,6 @@ export async function runAgentTurn(params: {
             contentLooksStructurallyComplete(body, written)
           ) {
             completeLandingWritesByPath.set(capKey, writesBefore + 1)
-            if (wasLandingRecovery) landingRecoveryUsedByPath.add(capKey)
-          }
-          if (hint) {
-            editSanityFailed = true
-            lastSanityFailedPath = /no visible fallback|visible fallback/i.test(hint)
-              ? loopPathKey(lastHtmlWritePath || 'index.html')
-              : capKey
-            if (/I18N_SANITY/i.test(hint)) {
-              i18nSanityFailed = true
-              lastI18nHint = hint
-            } else {
-              i18nSanityFailed = false
-              lastI18nHint = ''
-            }
-            toolResult = {
-              ...toolResult,
-              content: `${toolResult.content || ''}\n${hint}`.trim()
-            }
-          } else {
-            editSanityFailed = false
-            i18nSanityFailed = false
-            lastI18nHint = ''
-            if (lastSanityFailedPath === capKey) lastSanityFailedPath = ''
-          }
-          if (/\.css$/i.test(written) && lastCssWrite) {
-            const contract = formatLandingCssContractHint(lastCssWrite)
-            if (contract) {
-              toolResult = {
-                ...toolResult,
-                content: `${toolResult.content || ''}\n${contract}`.trim()
-              }
-            }
           }
           if (
             /\.(js|mjs|cjs)$/i.test(written) &&
@@ -5048,7 +4938,7 @@ export async function runAgentTurn(params: {
         }
         if (
           !toolResult.ok ||
-          /TOOL_LOOP|INCOMPLETE_WRITE_LIMIT|FILE_EXISTS|FILE_COMPLETE|STUB_ON_DISK|PATCH_OK_LIMIT|PATCH_FAIL_LIMIT|SMART_APPLY_FAIL|APPLY_UNAVAILABLE|THINK_REQUIRED|SURGICAL_EDIT|SURGICAL_CSS|I18N_SANITY|EDIT_SANITY|WRITE_ONCE|WRITE_FILE_REQUIRED/i.test(
+          /TOOL_LOOP|INCOMPLETE_WRITE_LIMIT|FILE_EXISTS|FILE_COMPLETE|STUB_ON_DISK|EMPTY_WRITE|PATCH_OK_LIMIT|PATCH_FAIL_LIMIT|SMART_APPLY_FAIL|APPLY_UNAVAILABLE|THINK_REQUIRED|SURGICAL_EDIT|SURGICAL_CSS|I18N_SANITY|EDIT_SANITY|WRITE_ONCE|WRITE_FILE_REQUIRED/i.test(
             toolResult.error ?? toolResult.content ?? ''
           )
         ) {
@@ -5192,7 +5082,7 @@ export async function runAgentTurn(params: {
             !/INCOMPLETE_WRITE_LIMIT/i.test(content)
           const softRedirect =
             !toolResult.ok &&
-            /FILE_COMPLETE|FILE_EXISTS|STUB_ON_DISK|OVERWRITE_BLOCKED|INLINE_ASSET|SURGICAL_EDIT|SURGICAL_CSS/i.test(
+            /FILE_COMPLETE|FILE_EXISTS|STUB_ON_DISK|EMPTY_WRITE|OVERWRITE_BLOCKED|INLINE_ASSET|SURGICAL_EDIT|SURGICAL_CSS/i.test(
               toolResult.error ?? toolResult.content ?? content
             )
           const reviewPath =
@@ -5430,13 +5320,6 @@ export async function runAgentTurn(params: {
             apiMessages,
             'Do not repeat the failed call. Use structured tools only; write_file content must be pure source code with no tool markup.'
           )
-        } else if (/WRITE_ONCE/i.test(tc)) {
-          appendToolHint(
-            apiMessages,
-            'WRITE_ONCE: that file is already complete in this turn. ' +
-              'Missing HTML ids are expected until index.html exists. ' +
-              'Write any still-missing path (styles.css / index.html / README.md). Do not rewrite js/main.js.'
-          )
         } else if (/WRITE_FILE_REQUIRED/i.test(tc)) {
           appendToolHint(
             apiMessages,
@@ -5467,6 +5350,12 @@ export async function runAgentTurn(params: {
             apiMessages,
             'INCOMPLETE_WRITE: if this is a NEW unfinished file, next call MUST be write_file append=true on the SAME path. ' +
               'If the file was already complete, do NOT overwrite — apply_diff with a short instruction only.'
+          )
+        } else if (/EMPTY_WRITE/i.test(tc)) {
+          appendToolHint(
+            apiMessages,
+            'EMPTY_WRITE: relative_path alone is not a write. Call write_file with the FULL file in content. ' +
+              'Do not copy compact stubs (note / FILE_COMPLETE on disk / [omitted]).'
           )
         } else if (/STUB_ON_DISK/i.test(tc)) {
           appendToolHint(
@@ -5606,7 +5495,7 @@ export async function runAgentTurn(params: {
         apiMessages = normalizeApiMessages(apiMessages)
       }
 
-      // Repeated identical tools: Cursor stops. Do not reset the counter and wander.
+      // Repeated identical tools: stop. Do not reset the counter and wander.
       if (toolLoopHits >= MAX_TOOL_LOOP_HITS || missingPathHits >= MAX_MISSING_PATH_HITS) {
         const missing = missingPathHits >= MAX_MISSING_PATH_HITS
         const alreadyWarned = loopRecoveryWarned

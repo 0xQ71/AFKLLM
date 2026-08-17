@@ -5,11 +5,10 @@ import {
   extractErrorFocus,
   isUserInterruptExit,
   looksLikeGuiLaunchCommand,
-  productReadmeCloneRefusal,
-  productReadmeFetchRefusal,
-  curlIwrFlagRefusal,
   powershellNodeEvalRefusal,
-  recursiveListingRefusal
+  recursiveListingRefusal,
+  POWERSHELL_UNALIAS_CURL,
+  POWERSHELL_AGENT_PTY_INIT
 } from '../src/shared/shellErrors'
 import {
   userAskedVerify,
@@ -108,55 +107,10 @@ describe('recursive listing refusal', () => {
   })
 })
 
-describe('product README clone refusal', () => {
-  it('blocks cloning AFKLLM or cloning into /tmp', () => {
-    assert.match(
-      productReadmeCloneRefusal(
-        'git clone https://github.com/0xQ71/AFKLLM.git /tmp/afkllm-repo'
-      ) ?? '',
-      /SHELL_REFUSED/
-    )
-    assert.match(
-      productReadmeCloneRefusal(
-        'git clone https://github.com/0xQ71/AFKLLM.git /tmp/afkllm 2>&1 | Select-'
-      ) ?? '',
-      /SHELL_REFUSED/
-    )
-    assert.match(
-      productReadmeCloneRefusal('git clone https://github.com/foo/bar.git /tmp/bar') ?? '',
-      /SHELL_REFUSED/
-    )
-    assert.equal(productReadmeCloneRefusal('git clone https://github.com/foo/bar.git'), null)
-    assert.equal(productReadmeCloneRefusal('git status'), null)
-  })
-})
-
-describe('product README fetch refusal', () => {
-  it('blocks curl/wget of AFKLLM GitHub README', () => {
-    assert.match(
-      productReadmeFetchRefusal(
-        'curl.exe -sL "https://raw.githubusercontent.com/0xQ71/AFKLLM/main/README.md"'
-      ) ?? '',
-      /SHELL_REFUSED/
-    )
-    assert.match(
-      productReadmeFetchRefusal('curl -sL https://github.com/0xQ71/AFKLLM') ?? '',
-      /SHELL_REFUSED/
-    )
-    assert.equal(
-      productReadmeFetchRefusal('curl -sL https://github.com/foo/bar/raw/main/README.md'),
-      null
-    )
-    assert.equal(productReadmeFetchRefusal('git status'), null)
-  })
-
-  it('blocks curl.exe -UseBasicParsing', () => {
-    assert.match(
-      curlIwrFlagRefusal('curl.exe -sL -UseBasicParsing https://example.com') ?? '',
-      /SHELL_SYNTAX/
-    )
-    assert.equal(curlIwrFlagRefusal('curl.exe -sL https://example.com'), null)
-    assert.equal(curlIwrFlagRefusal('Invoke-WebRequest -UseBasicParsing https://example.com'), null)
+describe('PowerShell curl alias', () => {
+  it('unaliases curl so pipelines use curl.exe instead of Invoke-WebRequest', () => {
+    assert.match(POWERSHELL_UNALIAS_CURL, /Remove-Item alias:curl/)
+    assert.match(POWERSHELL_AGENT_PTY_INIT, /alias:curl/)
   })
 })
 
@@ -173,19 +127,10 @@ describe('powershell node -e refusal', () => {
     assert.equal(powershellNodeEvalRefusal('npm test'), null)
   })
 
-  it('registry refuses the log clone and node -e before spawn', async () => {
+  it('registry refuses node -e i18n audits before spawn', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'afkllm-shell-refuse-'))
     try {
       const reg = new AgentToolRegistry({ projectRoot: root })
-      const clone = await reg.invoke({
-        id: '1',
-        name: 'execute_terminal_command',
-        arguments: {
-          command: 'git clone https://github.com/0xQ71/AFKLLM.git /tmp/afkllm 2>&1 | Select-'
-        }
-      })
-      assert.equal(clone.ok, false)
-      assert.match(clone.error ?? '', /SHELL_REFUSED/)
       const nodeE = await reg.invoke({
         id: '2',
         name: 'execute_terminal_command',
@@ -444,6 +389,29 @@ describe('evidence-gated plan', () => {
     )
     assert.equal(evidenceSupportsStep('Create index.html — full landing page', jsLog), false)
     assert.equal(evidenceSupportsStep('Исправить EN/RU переключатель', jsLog), true)
+  })
+
+  it('create_directory does not tick a write-SVG plan row', () => {
+    const mkdir = recordEvidence(
+      [],
+      evidenceFromTool({ name: 'create_directory', ok: true, path: 'assets' })!
+    )
+    assert.equal(
+      evidenceSupportsStep(
+        'Создать папку assets/ и написать inline SVG: hero.svg',
+        mkdir
+      ),
+      false
+    )
+    assert.equal(evidenceSupportsStep('Создать папку assets/', mkdir), true)
+    const wrote = recordEvidence(
+      [],
+      evidenceFromTool({ name: 'write_file', ok: true, path: 'assets/hero.svg' })!
+    )
+    assert.equal(
+      evidenceSupportsStep('Написать assets/hero.svg — фон с градиентом', wrote),
+      true
+    )
   })
 })
 

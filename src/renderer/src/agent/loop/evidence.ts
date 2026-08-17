@@ -1,5 +1,6 @@
 export type EvidenceKind =
   | 'write_ok'
+  | 'mkdir_ok'
   | 'patch_ok'
   | 'shell_ok'
   | 'shell_fail'
@@ -65,7 +66,10 @@ export function evidenceFromTool(opts: {
       exitCode: exit
     }
   }
-  if (name === 'create_directory' || name === 'delete_file' || name === 'generate_image') {
+  if (name === 'create_directory') {
+    return { kind: ok ? 'mkdir_ok' : 'shell_fail', tool: name, ok, path }
+  }
+  if (name === 'delete_file' || name === 'generate_image') {
     return { kind: ok ? 'write_ok' : 'shell_fail', tool: name, ok, path }
   }
   return null
@@ -88,6 +92,7 @@ export function evidenceSupportsStep(stepText: string, log: StepEvidence[]): boo
     (e) => e.ok && (e.kind === 'shell_ok' || e.kind === 'verify_ok' || e.kind === 'preview_ok')
   )
   const okSearch = log.filter((e) => e.ok && e.kind === 'search_ok')
+  const okMkdir = log.filter((e) => e.ok && e.kind === 'mkdir_ok')
 
   if (/web_search|поиск|search\s+the\s+web|искать\s+в\s+интернет|погод|weather/i.test(t)) {
     return okSearch.length > 0
@@ -107,6 +112,15 @@ export function evidenceSupportsStep(stepText: string, log: StepEvidence[]): boo
   if (/открыть|превью|preview|browser|браузер|start-process/i.test(t)) {
     return okShell.some((e) => e.kind === 'preview_ok')
   }
+  const namedFile = t.match(
+    /[\w./\\-]+\.(html?|css|js|ts|tsx|jsx|py|java|cs|go|rs|c|cpp|h|kt|json|xml|toml|md|svg)/i
+  )
+  if (
+    /папк|folder|mkdir|каталог|директор/i.test(t) &&
+    !namedFile
+  ) {
+    return okMkdir.length > 0
+  }
   if (okWrites.length === 0) return false
 
   const pathHit = okWrites.some((e) => {
@@ -117,9 +131,6 @@ export function evidenceSupportsStep(stepText: string, log: StepEvidence[]): boo
   })
   if (pathHit) return true
 
-  const namedFile = t.match(
-    /[\w./\\-]+\.(html?|css|js|ts|tsx|jsx|py|java|cs|go|rs|c|cpp|h|kt|json|xml|toml|md)/i
-  )
   if (namedFile) {
     const want = namedFile[0]!.replace(/\\/g, '/').toLowerCase()
     return okWrites.some((e) =>

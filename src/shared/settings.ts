@@ -218,7 +218,7 @@ export interface AppSettings {
   agentImageGenEnabled: boolean
 
   /**
-   * Cursor-like honest agent loop (language-agnostic prompts, evidence-gated plan).
+   * Honest agent loop (language-agnostic prompts, evidence-gated plan).
    * Default true. Set false only to force the legacy turn path.
    */
   agentLoopV2: boolean

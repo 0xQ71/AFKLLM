@@ -15,7 +15,10 @@ export { looksLikeOpenHtmlCommand, isLandingJsPath, isSourcePath, cssLooksLikeRe
 export {
   svgLooksLikeRealGraphic,
   contentLooksLikeSourceStub,
-  formatStubOnDiskHint
+  formatStubOnDiskHint,
+  looksLikeEmptyOrStubWriteContent,
+  formatEmptyWriteError,
+  isLandingWritePath
 } from '../../../shared/completeness'
 
 export type ChatRole = 'system' | 'user' | 'assistant' | 'tool'
@@ -56,7 +59,7 @@ export function apiContentText(content: ApiMessage['content']): string {
 }
 
 export const AGENT_CHECKLIST_MSG_ID = 'agent-checklist'
-/** Cursor-style todo plan authored by the model via <plan>…</plan>. */
+/** Todo plan authored by the model via <plan>…</plan>. */
 export const AGENT_TODO_MSG_ID = 'agent-todo'
 
 /** Live plan card id, or an archived prior-turn plan (`agent-todo-<ts>`). */
@@ -256,7 +259,13 @@ export function findCodeLeakIndex(text: string): number {
     /<write_file\b/i,
     /call:write_file/i,
     /<\/?style\b/i,
-    /<\/?script\b/i
+    /<\/?script\b/i,
+    /<\s*tool_call\b/i,
+    /<\s*function\s*=/i,
+    /<\s*parameter\s*=/i,
+    /<\|tool_call\|/,
+    /\[:tool\b/i,
+    /\[:channel:/i
   ]
   let best = -1
   for (const re of patterns) {
@@ -330,7 +339,7 @@ export function sanitizeThinkProse(text: string | null | undefined): string {
     .trim()
   if (thinkLooksLikeChecklist(inner)) return ''
   if (isEllipsisOnly(inner)) return ''
-  // Allow DeepThink / Cursor-length reasoning in the fold (was capped at 800).
+  // Allow DeepThink-length reasoning in the fold (was capped at 800).
   if (inner.length > 6000) inner = inner.slice(0, 6000).trim()
   return inner
 }
@@ -755,9 +764,15 @@ export function isResearchScavengerPlanStep(text: string): boolean {
   if (!t) return true
   if (/readme\.md/i.test(t) && /созда|напис|write|лендинг|landing/i.test(t)) return false
   return (
-    /explore_subagent|web_search|curl(\.exe)?|Invoke-WebRequest|raw\.githubusercontent/i.test(t) ||
+    /explore_subagent|web_search|curl(\.exe)?|Invoke-WebRequest|raw\.githubusercontent|api\.github/i.test(
+      t
+    ) ||
     /изучить\s+(репозитор|github|readme)|исследовать\s+(репозитор|github)/i.test(t) ||
-    /собрать\s+(точн\w*\s+)?факт|fetch\s+(the\s+)?readme|scrape\s+github/i.test(t)
+    /собрать\s+(точн\w*\s+)?факт|fetch\s+(the\s+)?readme|scrape\s+github/i.test(t) ||
+    /fetch\s+.{0,80}(github|readme|репозитор)/i.test(t) ||
+    /github.{0,60}(readme|repo\s+content|source\s+code)/i.test(t) ||
+    /extract.{0,80}(product\s+)?facts/i.test(t) ||
+    /прочит(ать|ай).{0,40}(readme|github|репозитор)/i.test(t)
   )
 }
 
@@ -779,6 +794,14 @@ export function looksLikeLandingBuildTask(userText: string): boolean {
       t
     ) ||
     (/index\.html/i.test(t) && /navbar|hero|features|faq|footer/i.test(t) && t.length > 400)
+  )
+}
+
+/** User forbade a grid of AI feature cards. */
+export function looksLikeNoCardDumpRequest(userText: string): boolean {
+  const t = userText ?? ''
+  return /карточного\s+мусора|ai-?карточного|без\s+['«"]?карто|card(?:-|\s)?(?:dump|clutter)|without\s+.*cards?/i.test(
+    t
   )
 }
 
@@ -902,10 +925,7 @@ export function coerceProductPlan(
   opts?: CoercePlanOptions
 ): AgentTodoStep[] {
   let cleaned = (steps ?? []).filter(
-    (s) =>
-      !isJunkPlanStep(s.text) &&
-      !isToolOrientedPlanStep(s.text) &&
-      !isResearchScavengerPlanStep(s.text)
+    (s) => !isJunkPlanStep(s.text) && !isToolOrientedPlanStep(s.text)
   )
   if (opts?.surgical) {
     cleaned = cleaned.filter((s) => !isScaffoldLandingPlanStep(s.text))
@@ -989,7 +1009,7 @@ export function filterPlanToCurrentRequest(
   }))
 }
 
-/** Parse <plan>…</plan> or a markdown [Plan] / checklist body into Cursor-style todo steps. */
+/** Parse <plan>…</plan> or a markdown [Plan] / checklist body into todo steps. */
 export function parsePlanBlock(text: string | null | undefined): AgentTodoStep[] | null {
   const raw = text ?? ''
   let body = ''
@@ -1668,7 +1688,6 @@ export function isJunkPlanStep(text: string): boolean {
   if (!t || isEllipsisOnly(t)) return true
   if (isFullRewriteFallbackPlanStep(t)) return true
   if (isToolOrientedPlanStep(t)) return true
-  if (isResearchScavengerPlanStep(t)) return true
   if (isCssClassPlanStep(t)) return true
   // Markdown / think leak into plan: "*План хирургического вмешательства:**"
   // Do not use \b after Cyrillic — JS treats letters as non-word without the unicode flag.
@@ -1792,10 +1811,7 @@ const PLAN_CONTENT_RULES: PlanContentRule[] = [
   },
   {
     step: /feature|возможн|преимущ/i,
-    done: (h) =>
-      htmlSectionComplete(h, { idOrClass: /\bfeatures?\b/i, minChars: 36 }) ||
-      (/feature-card/i.test(htmlSansAssets(h)) &&
-        (htmlSansAssets(h).match(/feature-card/gi) ?? []).length >= 2)
+    done: (h) => htmlSectionComplete(h, { idOrClass: /\bfeatures?\b/i, minChars: 36 })
   },
   {
     step: /how|как\s*работа/i,
@@ -2318,8 +2334,17 @@ export function parseThinkBlocks(content: string): ThinkBlockPart[] {
     const rest = content.slice(last)
     const open = rest.match(/^\s*<\s*(think|thinking)\s*>([\s\S]*)$/i)
     if (open) {
-      const think = (open[2] ?? '').trim()
-      parts.push({ kind: 'think', text: think })
+      const inner = open[2] ?? ''
+      const leakAt = findCodeLeakIndex(inner)
+      if (leakAt >= 0) {
+        const think = inner.slice(0, leakAt).trim()
+        if (think) parts.push({ kind: 'think', text: think })
+        const tail = inner.slice(leakAt)
+        if (tail.trim()) parts.push({ kind: 'text', text: tail })
+      } else {
+        const think = inner.trim()
+        parts.push({ kind: 'think', text: think })
+      }
     } else if (rest.trim() || parts.length === 0) {
       parts.push({ kind: 'text', text: rest })
     }
@@ -2454,9 +2479,68 @@ export function evaluateAcceptanceGate(input: {
  */
 export function looksLikeToolMarkupLeak(text: string): boolean {
   if (!text) return false
-  return /<\/?tool_call\b|<\|tool_call\||\[:tool\b|\[:channel:|<\|channel\|>|call:write_file\b|call:create_directory\b|call:apply_(?:diff|patch)\b/i.test(
+  return /<\/?tool_call\b|<\|tool_call\||\[:tool\b|\[:channel:|<\|channel\|>|call:write_file\b|call:create_directory\b|call:apply_(?:diff|patch)\b|<\s*function\s*=\s*[a-z_]+/i.test(
     text
   )
+}
+
+const SALVAGEABLE_TOOLS = new Set([
+  'write_file',
+  'create_directory',
+  'apply_diff',
+  'apply_patch',
+  'execute_terminal_command'
+])
+
+/**
+ * Ornith/Qwen often dump `<tool_call><function=write_file><parameter=…>` as
+ * assistant text instead of OpenAI tool_calls. Recover those into real calls.
+ */
+export function salvageLeakedToolCalls(
+  text: string
+): Array<{ id: string; type: 'function'; function: { name: string; arguments: string } }> {
+  const raw = text ?? ''
+  if (!raw.trim()) return []
+  const out: Array<{
+    id: string
+    type: 'function'
+    function: { name: string; arguments: string }
+  }> = []
+  const fnRe = /<\s*function\s*=\s*([a-z_]+)\s*>([\s\S]*?)<\s*\/\s*function\s*>/gi
+  let m: RegExpExecArray | null
+  let n = 0
+  while ((m = fnRe.exec(raw)) !== null) {
+    const name = (m[1] ?? '').trim().toLowerCase()
+    if (!SALVAGEABLE_TOOLS.has(name)) continue
+    const body = m[2] ?? ''
+    const args: Record<string, string> = {}
+    const paramRe = /<\s*parameter\s*=\s*([a-z_]+)\s*>\s*([\s\S]*?)\s*<\s*\/\s*parameter\s*>/gi
+    let p: RegExpExecArray | null
+    while ((p = paramRe.exec(body)) !== null) {
+      const key = (p[1] ?? '').trim()
+      if (key) args[key] = (p[2] ?? '').replace(/^\n/, '').replace(/\n$/, '')
+    }
+    if (name === 'write_file' && !args.content && !args.relative_path && !args.path) continue
+    if (name === 'create_directory' && !args.relative_path && !args.path && !args.dir_path) {
+      continue
+    }
+    n++
+    out.push({
+      id: `salvage-${n}`,
+      type: 'function',
+      function: { name, arguments: JSON.stringify(args) }
+    })
+  }
+  return out
+}
+
+/** Strip leaked XML tool dumps from assistant text, keep think/prose. */
+export function stripLeakedToolMarkup(text: string): string {
+  return (text ?? '')
+    .replace(/<\s*tool_call\b[\s\S]*?<\/\s*tool_call\s*>/gi, '')
+    .replace(/<\s*function\s*=\s*[a-z_]+\s*>[\s\S]*?<\/\s*function\s*>/gi, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
 }
 
 /** Stable-ish fingerprint to detect identical repeated tool calls. */

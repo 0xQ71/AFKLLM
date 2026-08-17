@@ -22,11 +22,9 @@ import {
   looksLikeGuiLaunchCommand,
   looksLikeShellFileMutation,
   powershellOperatorMisuse,
-  productReadmeCloneRefusal,
-  productReadmeFetchRefusal,
-  curlIwrFlagRefusal,
   powershellNodeEvalRefusal,
-  recursiveListingRefusal
+  recursiveListingRefusal,
+  POWERSHELL_UNALIAS_CURL
 } from '../../shared/shellErrors'
 import {
   allowsFullOverwrite,
@@ -51,7 +49,7 @@ import {
   looksLikeLocalServerCommand,
   pathToFileUrl
 } from '../../shared/localPreview'
-import { contentLooksStructurallyComplete, contentLooksLikeSourceStub, formatStubOnDiskHint } from '../../shared/completeness'
+import { contentLooksStructurallyComplete, contentLooksLikeSourceStub, formatStubOnDiskHint, looksLikeEmptyOrStubWriteContent, formatEmptyWriteError } from '../../shared/completeness'
 import { formatWriteFileRequiredError } from '../../shared/writeFileRequired'
 import { fastApplyEdit } from '../llama/ApplyEditClient'
 import { locateApplyRegion, type ApplyRegion } from '../../shared/fastApply'
@@ -536,6 +534,15 @@ export class AgentToolRegistry {
         error:
           'MISSING_PATH: relative_path is required (e.g. "src/main.py", "index.html"). ' +
           'Put the path in relative_path BEFORE content. Do not write to the project root.'
+      }
+    }
+    if (looksLikeEmptyOrStubWriteContent('content' in args ? args.content : undefined, relativePath)) {
+      return {
+        id: '',
+        name: 'write_file',
+        ok: false,
+        content: '',
+        error: formatEmptyWriteError(relativePath)
       }
     }
     if (/\.(png|jpe?g|gif|webp|bmp|ico|gguf|safetensors)$/i.test(relativePath)) {
@@ -1396,33 +1403,6 @@ export class AgentToolRegistry {
       }
     }
 
-    const cloneRefuse =
-      productReadmeCloneRefusal(command) ?? productReadmeCloneRefusal(rawCommand)
-    if (cloneRefuse) {
-      return {
-        id: '',
-        name: 'execute_terminal_command',
-        ok: false,
-        content: '',
-        error: cloneRefuse
-      }
-    }
-
-    const fetchRefuse =
-      productReadmeFetchRefusal(command) ??
-      productReadmeFetchRefusal(rawCommand) ??
-      curlIwrFlagRefusal(command) ??
-      curlIwrFlagRefusal(rawCommand)
-    if (fetchRefuse) {
-      return {
-        id: '',
-        name: 'execute_terminal_command',
-        ok: false,
-        content: '',
-        error: fetchRefuse
-      }
-    }
-
     const nodeEvalRefuse =
       powershellNodeEvalRefusal(command) ?? powershellNodeEvalRefusal(rawCommand)
     if (nodeEvalRefuse) {
@@ -1971,7 +1951,7 @@ export class AgentToolRegistry {
       const isWin = process.platform === 'win32'
       // Surface python/pip stderr; PS otherwise wraps exit codes
       const wrapped = isWin
-        ? `$ErrorActionPreference='Continue'; ${command}; exit $LASTEXITCODE`
+        ? `$ErrorActionPreference='Continue'; ${POWERSHELL_UNALIAS_CURL}; ${command}; exit $LASTEXITCODE`
         : command
       const child = spawn(
         isWin ? 'powershell.exe' : 'bash',

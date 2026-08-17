@@ -1,6 +1,6 @@
 /**
- * Same-turn write cap for from-scratch landings: one complete write per path
- * (Cursor-like), plus one recovery only on the file that failed sanity.
+ * From-scratch landing helpers: require write_file before apply on a missing
+ * path; overwrites of a complete file are allowed.
  */
 
 import {
@@ -24,10 +24,7 @@ export function shouldRequireWriteFileForApply(opts: {
 }
 
 export function formatScratchWriteFileHint(): string {
-  return (
-    'Call write_file overwrite=true allow_full_rewrite=true ONCE with the COMPLETE file, ' +
-    'then WRITE_ONCE (do not overwrite that path again). Do not retry apply_diff.'
-  )
+  return 'Call write_file overwrite=true allow_full_rewrite=true with the COMPLETE file.'
 }
 
 export type LandingRewriteDecision = 'ok' | 'allow_recovery' | 'refuse'
@@ -48,24 +45,14 @@ export function isCappedLandingWritePath(relativePath: string): boolean {
   return landingSourceKind(relativePath) !== null
 }
 
-/**
- * First complete write is always ok.
- * Second write only if THIS path failed sanity and recovery was not used.
- * Otherwise refuse (including rewriting js/main.js after it already succeeded).
- */
-export function shouldRefuseLandingRewrite(opts: {
+/** Overwrite of a complete landing file is allowed. */
+export function shouldRefuseLandingRewrite(_opts: {
   path: string
   completeWritesThisTurn: number
   recoveryUsedOnPath: boolean
   sanityFailedOnThisPath: boolean
 }): LandingRewriteDecision {
-  if (!isCappedLandingWritePath(opts.path)) return 'ok'
-  const writes = opts.completeWritesThisTurn
-  if (writes <= 0) return 'ok'
-  if (opts.sanityFailedOnThisPath && !opts.recoveryUsedOnPath && writes === 1) {
-    return 'allow_recovery'
-  }
-  return 'refuse'
+  return 'ok'
 }
 
 export function formatWriteOnceError(relativePath: string): string {

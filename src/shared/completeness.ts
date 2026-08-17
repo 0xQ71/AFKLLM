@@ -135,6 +135,45 @@ export function formatStubOnDiskHint(relativePath: string, bytes: number): strin
   )
 }
 
+/** Landing HTML/CSS/JS (and SVG icons) need a real body — not a 5-byte stub. */
+export function isLandingWritePath(relativePath: string): boolean {
+  const p = relativePath.replace(/\\/g, '/').replace(/^\.\//, '')
+  if (isLandingJsPath(p)) return true
+  if (/(?:^|\/)index\.html?$/i.test(p)) return true
+  if (/\.css$/i.test(p)) return true
+  if (/\.svg$/i.test(p)) return true
+  return false
+}
+
+/**
+ * write_file with no body, or a compact-history stub copied as content.
+ * relative_path alone is not a write.
+ */
+export function looksLikeEmptyOrStubWriteContent(
+  content: unknown,
+  relativePath = ''
+): boolean {
+  if (content == null) return true
+  if (typeof content !== 'string') return true
+  const t = content.trim()
+  if (!t) return true
+  if (/^FILE_COMPLETE on disk/i.test(t)) return true
+  if (/^\[omitted\b/i.test(t)) return true
+  if (/^\[earlier write omitted/i.test(t)) return true
+  if (/do not rewrite/i.test(t) && t.length < 160) return true
+  if (isLandingWritePath(relativePath)) return t.length < 16
+  return false
+}
+
+export function formatEmptyWriteError(relativePath: string): string {
+  const p = (relativePath ?? '').replace(/\\/g, '/') || 'the file'
+  return (
+    `EMPTY_WRITE: relative_path="${p}" is not a write. Put the FULL file in the content argument. ` +
+    'Do not copy compact stubs (note / FILE_COMPLETE on disk / [omitted]). ' +
+    'Do not call write_file with only a path.'
+  )
+}
+
 /**
  * True when the buffer looks like a finished source file for `relativePath`.
  * Without a path: HTML needs `</html>`; other languages use brace/JSON/Python heuristics.

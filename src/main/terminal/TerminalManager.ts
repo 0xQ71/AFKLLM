@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import type { BrowserWindow } from 'electron'
 import { extractLocalPreviewUrl } from '../../shared/localPreview'
+import { POWERSHELL_AGENT_PTY_INIT } from '../../shared/shellErrors'
 
 export interface TerminalSession {
   id: string
@@ -109,7 +110,7 @@ export class TerminalManager {
             '-NoProfile',
             '-NoExit',
             '-Command',
-            "Remove-Module PSReadLine -ErrorAction SilentlyContinue; [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)"
+            POWERSHELL_AGENT_PTY_INIT
           ]
         : []
 

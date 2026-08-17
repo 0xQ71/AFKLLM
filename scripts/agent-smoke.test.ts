@@ -13,6 +13,8 @@ import {
   checklistHasItems,
   fingerprintToolCall,
   looksLikeToolMarkupLeak,
+  salvageLeakedToolCalls,
+  stripLeakedToolMarkup,
   coerceToolRelativePath,
   inferWritePathFromContent,
   resolveWriteFilePath,
@@ -72,6 +74,9 @@ import {
   looksLikeFinishMissingLandingFiles,
   landingBriefAlreadyHasFacts,
   isResearchScavengerPlanStep,
+  looksLikeEmptyOrStubWriteContent,
+  formatEmptyWriteError,
+  looksLikeNoCardDumpRequest,
   allowsComposerFullRewrite,
   shouldBlockSurgicalOverwrite,
   shouldBlockSurgicalCssRewrite,
@@ -104,7 +109,7 @@ import {
   estimateLocalContextSum
 } from '../src/renderer/src/agent/contextUsage'
 import { AgentToolRegistry } from '../src/main/agent/AgentToolRegistry'
-import { looksLikeShellFileMutation, powershellOperatorMisuse } from '../src/shared/shellErrors'
+import { looksLikeShellFileMutation, powershellOperatorMisuse, POWERSHELL_UNALIAS_CURL, POWERSHELL_AGENT_PTY_INIT } from '../src/shared/shellErrors'
 import {
   CHAT_MAX_CONTENT_CHARS,
   deriveChatTitle,
@@ -142,7 +147,10 @@ import {
   htmlJsI18nMismatch,
   htmlI18nKeysMissingFromJs,
   inventedI18nVerifierPath,
-  jsI18nDictLooksBroken
+  jsI18nDictLooksBroken,
+  jsAssignsNonStringToDom,
+  jsI18nUsesDestructiveSplit,
+  i18nSanityTargetPaths
 } from '../src/renderer/src/agent/loop/i18nSanity'
 import {
   formatWriteFileRequiredError,
@@ -153,7 +161,8 @@ import {
   shouldRequireWriteFileForApply
 } from '../src/renderer/src/agent/loop/landingWriteCap'
 import { maxTokensForAgent } from '../src/renderer/src/agent/loop/ctxBudget'
-import { formatEditSanityHint, navLooksUnstyled, htmlJsHasThemeControl, htmlCssLayoutMismatch, inlineSvgLooksUnsized, formatLandingCssContractHint } from '../src/renderer/src/agent/loop/editSanity'
+import { formatEditSanityHint, navLooksUnstyled, htmlJsHasThemeControl, htmlCssLayoutMismatch, inlineSvgLooksUnsized, formatLandingCssContractHint, extractCssClassNames } from '../src/renderer/src/agent/loop/editSanity'
+import { stubWriteFileArgs } from '../src/renderer/src/agent/loop/compactWrites'
 import { formatSurgicalFollowUpHint, isHtmlOnlyStacks } from '../src/renderer/src/agent/loop/prompts'
 import { truncationGuardMessage, isWholeFileSearchBlock } from '../src/shared/writeThresholds'
 import { evidenceSupportsStep, evidenceFromTool, recordEvidence } from '../src/renderer/src/agent/loop/evidence'
@@ -169,6 +178,30 @@ describe('looksLikeToolMarkupLeak', () => {
       true
     )
     assert.equal(looksLikeToolMarkupLeak('const x = 1\nconsole.log(x)\n'), false)
+  })
+
+  it('salvages leaked XML write_file instead of stopping the loop', () => {
+    const leaked =
+      '<think>Now README</think>\n' +
+      '<tool_call>\n<function=write_file>\n' +
+      '<parameter=content>\n# AFKLLM Landing\nOpen index.html\n</parameter>\n' +
+      '<parameter=relative_path>\nREADME.md\n</parameter>\n' +
+      '</function>\n</tool_call>'
+    assert.equal(looksLikeToolMarkupLeak(leaked), true)
+    const calls = salvageLeakedToolCalls(leaked)
+    assert.equal(calls.length, 1)
+    assert.equal(calls[0]!.function.name, 'write_file')
+    const args = JSON.parse(calls[0]!.function.arguments) as {
+      content?: string
+      relative_path?: string
+    }
+    assert.equal(args.relative_path, 'README.md')
+    assert.match(args.content ?? '', /AFKLLM Landing/)
+    const stripped = stripLeakedToolMarkup(leaked)
+    assert.match(stripped, /Now README/)
+    assert.doesNotMatch(stripped, /tool_call|function=write_file/)
+    assert.match(liveThinkProse(leaked), /Now README/)
+    assert.doesNotMatch(liveThinkProse(leaked), /tool_call|function=/)
   })
 
   it('fingerprints identical mkdir / writes', () => {
@@ -244,6 +277,24 @@ describe('looksLikeToolMarkupLeak', () => {
       }),
       'index.html'
     )
+  })
+})
+
+describe('compact write_file args', () => {
+  it('keeps content and never uses note', () => {
+    const raw = stubWriteFileArgs({
+      relativePath: 'index.html',
+      omittedChars: 4000,
+      lineCount: 120,
+      latest: true
+    })
+    const args = JSON.parse(raw) as Record<string, unknown>
+    assert.equal(args.relative_path, 'index.html')
+    assert.equal(typeof args.content, 'string')
+    assert.match(String(args.content), /\[omitted/)
+    assert.equal(args.note, undefined)
+    assert.equal(looksLikeEmptyOrStubWriteContent(args.content, 'index.html'), true)
+    assert.match(formatEmptyWriteError('index.html'), /EMPTY_WRITE/)
   })
 })
 
@@ -620,6 +671,15 @@ describe('parseThinkBlocks', () => {
     assert.match(promoted, /landing hero/)
     assert.ok(!/<think>/i.test(promoted))
   })
+
+  it('splits unclosed think before leaked tool_call XML', () => {
+    const parts = parseThinkBlocks(
+      '<think>\nNext: README.md\n<tool_call>\n<function=write_file>\n<parameter=relative_path>README.md</parameter>\n'
+    )
+    assert.ok(parts.some((p) => p.kind === 'think' && /README/.test(p.text)))
+    assert.ok(parts.some((p) => p.kind === 'text' && /tool_call|function=write_file/.test(p.text)))
+    assert.ok(!parts.some((p) => p.kind === 'think' && /function=write_file/.test(p.text)))
+  })
 })
 
 describe('mergeChecklistIntoSystem', () => {
@@ -694,7 +754,7 @@ describe('agent todo plan', () => {
     assert.ok(coerced.some((s) => /визуальн|вёрст|верст/i.test(s.text)))
   })
 
-  it('drops GitHub scavenger plan rows when the brief already has facts', () => {
+  it('keeps GitHub research plan rows for the model to execute or recover from', () => {
     const brief =
       'Сделай полноценный профессиональный многофайловый лендинг продукта AFKLLM. ' +
       'Факты только из https://github.com/0xQ71/AFKLLM. ' +
@@ -706,10 +766,11 @@ describe('agent todo plan', () => {
       false
     )
     assert.equal(
-      isResearchScavengerPlanStep('Исследовать репозиторий AFKLLM через explore_subagent'),
+      isResearchScavengerPlanStep(
+        'Fetch AFKLLM GitHub repo content (read README, source code) to extract accurate product facts for the landing page.'
+      ),
       true
     )
-    assert.equal(isResearchScavengerPlanStep('web_search AFKLLM github 0xQ71'), true)
     assert.equal(
       isResearchScavengerPlanStep(
         'Создать README.md лендинга — инструкция открыть index.html в браузере'
@@ -718,16 +779,14 @@ describe('agent todo plan', () => {
     )
     const raw = parsePlanBlock(
       '<plan>\n' +
-        '- Исследовать репозиторий AFKLLM через explore_subagent\n' +
-        '- web_search для фактов из GitHub\n' +
+        '- Fetch AFKLLM GitHub repo content (read README, source code)\n' +
         '- Создать assets/ — SVG-иконки\n' +
         '- Написать styles.css — dark-тема\n' +
         '- Создать README.md лендинга — как открыть\n' +
         '</plan>'
     )
     const coerced = coerceProductPlan(raw, { userText: brief })
-    assert.ok(!coerced.some((s) => isResearchScavengerPlanStep(s.text)))
-    assert.ok(!coerced.some((s) => /explore_subagent|web_search/i.test(s.text)))
+    assert.ok(coerced.some((s) => /Fetch AFKLLM GitHub/i.test(s.text)))
     assert.ok(coerced.some((s) => /assets|SVG/i.test(s.text)))
     assert.ok(coerced.some((s) => /styles\.css/i.test(s.text)))
     assert.ok(coerced.some((s) => /README\.md/i.test(s.text)))
@@ -2502,6 +2561,36 @@ describe('i18n sanity', () => {
     assert.match(formatI18nSanityHint({ html: landingHtml, js: landingJs }) ?? '', /I18N_SANITY/)
   })
 
+  it('does not treat textContent = value as [object Object]; flags split/filter', () => {
+    assert.equal(
+      jsAssignsNonStringToDom("el.textContent = t[key];\n"),
+      false
+    )
+    assert.equal(
+      jsAssignsNonStringToDom("el.textContent = value || t[key];\n"),
+      false
+    )
+    assert.equal(
+      jsAssignsNonStringToDom("item.textContent = feature;\n"),
+      true
+    )
+    const splitJs =
+      "const i18n = { ru: { hero_title: 'AFKLLM' } };\n" +
+      "document.querySelectorAll('[data-i18n]').forEach(el => {\n" +
+      "  const key = el.dataset.i18n;\n" +
+      "  const t = i18n.ru;\n" +
+      "  const value = t[key].split(' ').filter(w => w.startsWith('Чат') || '').join(' ');\n" +
+      "  el.textContent = value || t[key];\n" +
+      "});\n"
+    assert.equal(jsI18nUsesDestructiveSplit(splitJs), true)
+    assert.equal(jsI18nUsesDestructiveSplit("el.textContent = t[key];\n"), false)
+    const hint = formatI18nSanityHint({ js: splitJs })
+    assert.match(hint ?? '', /I18N_SANITY/)
+    assert.match(hint ?? '', /split/i)
+    const blamed = i18nSanityTargetPaths(hint!, { written: 'index.html' })
+    assert.ok(blamed.includes('js/main.js'))
+  })
+
   it('flags empty data-i18n shells that hide the page', () => {
     const emptyHtml =
       '<h1 data-i18n="hero.title"></h1><p data-i18n="hero.subtitle"></p>' +
@@ -2564,8 +2653,8 @@ describe('i18n sanity', () => {
   })
 })
 
-describe('landing WRITE_ONCE cap', () => {
-  it('allows the first complete write and refuses a second js/main.js rewrite', () => {
+describe('landing write cap', () => {
+  it('allows a second complete write_file (overwrite is allowed)', () => {
     assert.equal(
       shouldRefuseLandingRewrite({
         path: 'js/main.js',
@@ -2582,39 +2671,18 @@ describe('landing WRITE_ONCE cap', () => {
         recoveryUsedOnPath: false,
         sanityFailedOnThisPath: false
       }),
-      'refuse'
-    )
-    assert.match(formatWriteOnceError('js/main.js'), /WRITE_ONCE/)
-  })
-
-  it('allows one recovery only on the path that failed sanity', () => {
-    assert.equal(
-      shouldRefuseLandingRewrite({
-        path: 'index.html',
-        completeWritesThisTurn: 1,
-        recoveryUsedOnPath: false,
-        sanityFailedOnThisPath: true
-      }),
-      'allow_recovery'
-    )
-    assert.equal(
-      shouldRefuseLandingRewrite({
-        path: 'index.html',
-        completeWritesThisTurn: 1,
-        recoveryUsedOnPath: true,
-        sanityFailedOnThisPath: true
-      }),
-      'refuse'
+      'ok'
     )
     assert.equal(
       shouldRefuseLandingRewrite({
         path: 'js/main.js',
         completeWritesThisTurn: 1,
-        recoveryUsedOnPath: false,
-        sanityFailedOnThisPath: false
+        recoveryUsedOnPath: true,
+        sanityFailedOnThisPath: true
       }),
-      'refuse'
+      'ok'
     )
+    assert.match(formatWriteOnceError('js/main.js'), /WRITE_ONCE/)
   })
 
   it('landingBundleReady when css+html+js each have a write', () => {
@@ -2845,56 +2913,46 @@ describe('edit sanity + html-only stacks', () => {
     assert.ok(ownContract)
     assert.match(ownContract!, /\.nav-container/)
     assert.doesNotMatch(ownContract!, /\.navbar/)
+    const urlCss =
+      '.hero { background: url("assets/hero.svg"); min-height:80vh } ' +
+      '.hero-content { z-index:1 } .hero-title { font-size:4rem } ' +
+      '.btn-primary { background:#6c63ff } .feature-grid { display:grid } .footer { padding:2rem }\n'
+    const names = extractCssClassNames(urlCss)
+    assert.ok(names.includes('hero'))
+    assert.ok(!names.includes('svg'))
+    const urlContract = formatLandingCssContractHint(urlCss)
+    assert.ok(urlContract)
+    assert.doesNotMatch(urlContract!, /\.svg\b/)
+  })
+
+  it('flags a feature-card dump when the user forbade AI cards', () => {
+    const prompt = 'Сделай лендинг без «AI-карточного» мусора, один сильный hero.'
+    assert.equal(looksLikeNoCardDumpRequest(prompt), true)
+    const cards =
+      '<!DOCTYPE html><html><head><link rel="stylesheet" href="styles.css"></head><body>' +
+      '<section class="hero"><h1>AFKLLM</h1></section>' +
+      '<section id="features">' +
+      '<div class="feature-card">a</div><div class="feature-card">b</div>' +
+      '<div class="feature-card">c</div><div class="feature-card">d</div>' +
+      '<div class="why-card">e</div></section></body></html>'
+    const hint =
+      formatEditSanityHint({
+        path: 'index.html',
+        content: cards,
+        html: cards,
+        css: '.hero { min-height:80vh } .feature-card { padding:1rem } .why-card { padding:1rem }\n',
+        userText: prompt
+      }) ?? ''
+    assert.match(hint, /EDIT_SANITY/)
+    assert.match(hint, /card/i)
   })
 })
 
-describe('product README git clone refusal', () => {
-  it('blocks git clone of AFKLLM into /tmp', async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'afkllm-clone-'))
-    try {
-      const reg = new AgentToolRegistry({ projectRoot: root })
-      const res = await reg.invoke({
-        id: '1',
-        name: 'execute_terminal_command',
-        arguments: {
-          command: 'git clone https://github.com/0xQ71/AFKLLM.git /tmp/afkllm-repo'
-        }
-      })
-      assert.equal(res.ok, false)
-      assert.match(res.error ?? '', /SHELL_REFUSED/)
-      assert.match(res.error ?? '', /write_file/i)
-    } finally {
-      await fs.rm(root, { recursive: true, force: true })
-    }
-  })
-
-  it('blocks curl of the product README and curl.exe -UseBasicParsing', async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'afkllm-curl-'))
-    try {
-      const reg = new AgentToolRegistry({ projectRoot: root })
-      const fetchReadme = await reg.invoke({
-        id: '1',
-        name: 'execute_terminal_command',
-        arguments: {
-          command:
-            'curl.exe -sL "https://raw.githubusercontent.com/0xQ71/AFKLLM/main/README.md"'
-        }
-      })
-      assert.equal(fetchReadme.ok, false)
-      assert.match(fetchReadme.error ?? '', /SHELL_REFUSED/)
-      const iwrFlag = await reg.invoke({
-        id: '2',
-        name: 'execute_terminal_command',
-        arguments: {
-          command:
-            'curl.exe -sL -UseBasicParsing "https://raw.githubusercontent.com/0xQ71/AFKLLM/main/README.md"'
-        }
-      })
-      assert.equal(iwrFlag.ok, false)
-      assert.match(iwrFlag.error ?? '', /SHELL_SYNTAX|SHELL_REFUSED/)
-    } finally {
-      await fs.rm(root, { recursive: true, force: true })
-    }
+describe('PowerShell curl alias', () => {
+  it('drops the IWR curl alias in PTY init and runShell prefix', () => {
+    assert.match(POWERSHELL_UNALIAS_CURL, /alias:curl/)
+    assert.match(POWERSHELL_AGENT_PTY_INIT, /alias:curl/)
+    assert.match(POWERSHELL_AGENT_PTY_INIT, /PSReadLine/)
   })
 })
 
