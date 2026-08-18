@@ -5,7 +5,7 @@ import type {
   QueuePriority
 } from '../../../shared/types'
 import { samplingFromSettings, type AppSettings } from '../../../shared/settings'
-import { sanitizeModelChatTitle } from '../../../shared/chats'
+import { pickChatTitle } from '../../../shared/chats'
 
 export type EnqueueFn = (
   request: Omit<LLMCompletionRequest, 'id'> & { id?: string; stream?: boolean }
@@ -177,7 +177,8 @@ export class QueueManager {
               content:
                 'You name chat threads for a local coding IDE. ' +
                 `${lang}. Output ONLY a short title (2–5 words) in the nominative case. ` +
-                'Prefer TASK + product brand (e.g. «Лендинг Northline»). ' +
+                'Prefer TASK + artifact (e.g. «Python wordfreq», «Fix navbar»). ' +
+                'Use Landing/Лендинг only if the user asked for a landing page. ' +
                 'Never use UI words as the brand (Icons, Features, Hero, Navbar, FAQ, SVG). ' +
                 'Ignore constraints («без…», forbidden items). No quotes, <think>, or markdown.'
             },
@@ -191,7 +192,7 @@ export class QueueManager {
         })
       })
       if (result.aborted || result.error) return ''
-      return sanitizeModelChatTitle(result.text ?? '')
+      return pickChatTitle(userPrompt, result.text ?? '')
     } catch {
       return ''
     }

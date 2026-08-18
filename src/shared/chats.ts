@@ -38,6 +38,8 @@ export interface PersistedChatMessage {
   content: string
   toolName?: string
   filePath?: string
+  /** Shell stdout / write preview — capped on sanitize. */
+  codePreview?: string
   images?: PersistedChatImage[]
   files?: PersistedChatFile[]
   stats?: PersistedChatMessageStats
@@ -106,7 +108,10 @@ export function sanitizePersistedMessages(
       role: m.role,
       content: m.content.slice(0, CHAT_MAX_CONTENT_CHARS),
       ...(m.toolName ? { toolName: String(m.toolName) } : {}),
-      ...(m.filePath ? { filePath: String(m.filePath) } : {})
+      ...(m.filePath ? { filePath: String(m.filePath) } : {}),
+      ...(typeof m.codePreview === 'string' && m.codePreview.trim()
+        ? { codePreview: m.codePreview.slice(0, 4000) }
+        : {})
     }
     if (Array.isArray(m.images) && m.images.length > 0) {
       cleaned.images = m.images
@@ -321,6 +326,10 @@ export function pickChatTitle(userPrompt: string, modelTitle: string): string {
   const heuristic = deriveChatTitle(userPrompt)
   const model = sanitizeModelChatTitle(modelTitle)
   if (!model || isAwkwardChatTitle(model)) return heuristic
+  const userAskedLanding = /лендинг|landing/i.test(userPrompt)
+  if (!userAskedLanding && /^(лендинг|landing)(?=$|[^\p{L}\p{N}_])/iu.test(model)) {
+    return heuristic
+  }
   const brand = extractBrandFromPrompt(userPrompt)
   if (brand && heuristic && new RegExp(brand.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i').test(heuristic)) {
     if (!new RegExp(brand.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i').test(model)) return heuristic

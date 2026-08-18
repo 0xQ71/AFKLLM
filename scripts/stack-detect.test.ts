@@ -348,6 +348,26 @@ describe('evidence-gated plan', () => {
     assert.equal(evidenceSupportsStep('Запустить pytest', log), true)
   })
 
+  it('running a script on sample text is not a pytest step', () => {
+    const log = recordEvidence(
+      [],
+      evidenceFromTool({
+        name: 'execute_terminal_command',
+        ok: true,
+        command: 'echo "the cat sat" | python wordfreq.py',
+        content: 'the: 1\ncat: 1\nexit_code=0'
+      })!
+    )
+    assert.equal(
+      evidenceSupportsStep(
+        'Запустить скрипт на тестовом тексте через terminal и показать вывод.',
+        log
+      ),
+      true
+    )
+    assert.equal(evidenceSupportsStep('Запустить тесты', log), false)
+  })
+
   it('web_search ticks weather/search plan rows and does not need a write', () => {
     const steps = [
       {

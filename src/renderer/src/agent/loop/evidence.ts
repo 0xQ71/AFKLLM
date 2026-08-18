@@ -97,7 +97,11 @@ export function evidenceSupportsStep(stepText: string, log: StepEvidence[]): boo
   if (/web_search|поиск|search\s+the\s+web|искать\s+в\s+интернет|погод|weather/i.test(t)) {
     return okSearch.length > 0
   }
-  if (/тест|test|pytest|junit|cargo test|go test|dotnet test/i.test(t)) {
+  if (
+    /pytest|junit|cargo\s+test|go\s+test|dotnet\s+test|npm\s+test|node\s+--test/i.test(t) ||
+    /(?:запустить|прогнать|run)\s+(?:the\s+)?(?:тесты|тест|tests?)(?=$|[^\p{L}])/iu.test(t) ||
+    /(?:^|[^\p{L}])тесты(?:$|[^\p{L}])/iu.test(t)
+  ) {
     return okShell.some((e) =>
       /test|pytest|gradle test|mvn .*test|cargo test|go test|dotnet test/i.test(
         e.command ?? ''
@@ -111,6 +115,9 @@ export function evidenceSupportsStep(stepText: string, log: StepEvidence[]): boo
   }
   if (/открыть|превью|preview|browser|браузер|start-process/i.test(t)) {
     return okShell.some((e) => e.kind === 'preview_ok')
+  }
+  if (/запуст|выполнить|(?:^|[^\p{L}])run(?:$|[^\p{L}])|execute|через\s+terminal/iu.test(t)) {
+    return okShell.length > 0
   }
   const namedFile = t.match(
     /[\w./\\-]+\.(html?|css|js|ts|tsx|jsx|py|java|cs|go|rs|c|cpp|h|kt|json|xml|toml|md|svg)/i

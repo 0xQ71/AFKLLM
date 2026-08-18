@@ -79,6 +79,7 @@ import {
   looksLikeEmptyOrStubWriteContent,
   formatEmptyWriteError,
   evaluateAcceptanceGate,
+  userAskedForCliSmoke,
   fingerprintToolCall,
   looksLikeToolMarkupLeak,
   salvageLeakedToolCalls,
@@ -2556,8 +2557,7 @@ export async function runAgentTurn(params: {
     )
   const userWantsNodeTest =
     /node:test|node\s+--test|npm\s+test/i.test(params.userText)
-  const userWantsCli =
-    /\bCLI\b|stdin|argv|first argv|command.?line/i.test(params.userText)
+  const userWantsCli = userAskedForCliSmoke(params.userText)
 
   let agentTools: unknown[] = [...AGENT_TOOL_SCHEMAS]
   if (!isPlan) {
@@ -5154,7 +5154,9 @@ export async function runAgentTurn(params: {
               name === 'apply_diff' ||
               name === 'apply_patch'
                 ? (codePreview ?? messages[idx].codePreview)
-                : undefined,
+                : name === 'execute_terminal_command'
+                  ? (content || messages[idx].codePreview || '').slice(0, 4000)
+                  : undefined,
             filePath:
               toolResult.filePath ||
               displayPath ||
@@ -6007,7 +6009,7 @@ export async function runAgentTurn(params: {
               : '↻ File still incomplete — not reporting success…'
           : hardMissing.length > 0
             ? uiLang === 'ru'
-              ? '↻ Acceptance incomplete — finish required checks…'
+              ? '↻ Проверки не закрыты — доделываю…'
               : '↻ Acceptance incomplete — finish required checks…'
             : planStillOpen
               ? uiLang === 'ru'

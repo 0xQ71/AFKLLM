@@ -98,6 +98,7 @@ import {
   countOccurrencesCi,
   isFullRewriteFallbackPlanStep,
   evaluateAcceptanceGate,
+  userAskedForCliSmoke,
   stripCodeLeakFromThink,
   extractAssistantHtmlDump,
   looksLikeAssistantHtmlDump,
@@ -527,6 +528,21 @@ describe('sanitizePersistedMessages', () => {
     assert.equal(a!.stats!.tps, 27.4)
     assert.equal(a!.stats!.completionTokens, 16)
     assert.equal(a!.stats!.turnElapsedMs, 2500)
+  })
+
+  it('keeps shell stdout in codePreview', () => {
+    const out = sanitizePersistedMessages([
+      { id: 'welcome', role: 'assistant', content: 'hi' },
+      {
+        id: 'sh1',
+        role: 'assistant',
+        content: 'Ran python wordfreq.py',
+        toolName: 'execute_terminal_command',
+        codePreview: 'the: 4\ncat: 3\nexit_code=0'
+      }
+    ])
+    const sh = out.find((m) => m.id === 'sh1')
+    assert.equal(sh?.codePreview, 'the: 4\ncat: 3\nexit_code=0')
   })
 
   it('keeps thread-summary after welcome', () => {
@@ -1481,6 +1497,15 @@ describe('agent todo plan', () => {
     assert.equal(isJunkPlanStep('↻ Checking for missing files before finishing…'), true)
     assert.equal(isJunkPlanStep('Готово! Лендинг Northline открыт в браузере.'), true)
     assert.equal(isJunkPlanStep('Navbar'), false)
+    assert.equal(isJunkPlanStep('План из 3–6 шагов:'), true)
+    assert.equal(isJunkPlanStep('Plan of 3-6 atomic product steps'), true)
+    assert.equal(isJunkPlanStep('Написать wordfreq.py'), false)
+    const echoed = parsePlanBlock(
+      '<plan>\n- План из 3–6 шагов:\n- Написать wordfreq.py\n- Запустить скрипт на тестовом тексте\n</plan>'
+    )
+    const coercedEcho = coerceProductPlan(echoed)
+    assert.ok(!coercedEcho.some((s) => /план\s+из\s+\d/i.test(s.text)))
+    assert.ok(coercedEcho.some((s) => /wordfreq/i.test(s.text)))
   })
 
   it('keeps model Navbar/Hero rows instead of inventing a template', () => {
@@ -1557,6 +1582,14 @@ describe('chat titles', () => {
     assert.equal(pickChatTitle(prompt, 'Лендинг Icons'), 'Лендинг Northline')
     assert.equal(pickChatTitle(prompt, 'Лендинг Features'), 'Лендинг Northline')
     assert.equal(pickChatTitle(prompt, 'Лендинг Northline'), 'Лендинг Northline')
+  })
+
+  it('does not title a Python script chat as a landing', () => {
+    const prompt =
+      'Создай в корне проекта Python-скрипт wordfreq.py: считает частоту слов из аргумента-файла или stdin, без учёта регистра, печатает топ-10.'
+    const titled = pickChatTitle(prompt, 'Лендинг Python')
+    assert.doesNotMatch(titled, /лендинг/i)
+    assert.doesNotMatch(titled, /landing/i)
   })
 })
 

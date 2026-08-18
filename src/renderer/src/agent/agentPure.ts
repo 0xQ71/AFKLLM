@@ -1693,6 +1693,12 @@ export function isJunkPlanStep(text: string): boolean {
   // Do not use \b after Cyrillic — JS treats letters as non-word without the unicode flag.
   if (/^\*+\s*план|^план\s+хирург|^#{1,6}\s*план|вмешательства\s*:\*+/i.test(t)) return true
   if (/^секци[яюи]?\s*:\s*['"`]?[\w.-]+['"`]?\s*$/i.test(t) && isCssClassPlanStep(t)) return true
+  // PLAN_ONLY instruction echoed as a todo ("План из 3–6 шагов:")
+  if (/^план\s+из\s+\d/i.test(t)) return true
+  if (/^plan\s+of\s+\d/i.test(t)) return true
+  if (/^\d+\s*[–-]\s*\d+\s+(atomic\s+)?(product\s+)?steps?\b/i.test(t)) return true
+  if (/^\d+\s*[–-]\s*\d+\s+шагов?:?\s*$/i.test(t)) return true
+  if (/atomic\s+(product\s+)?steps?\s*:?\s*$/i.test(t) && t.length < 80) return true
   if (/^```/.test(t) || /```/.test(t)) return true
   if (/^</.test(t)) return true
   if (/<!DOCTYPE|<html[\s>]|<style[\s>]|<script[\s>]|<head[\s>]|<body[\s>]/i.test(t)) return true
@@ -2400,6 +2406,23 @@ export function formatNowForAgent(now: Date = new Date()): string {
     `Current local datetime: ${weekday}, ${date} ${time} (UTC${sign}${offH}:${offM}, ${tz}). ` +
     `Use this for “today”, deadlines, logs, and timestamps — do not invent another date.`
   )
+}
+
+/**
+ * True only when the user asked for a product CLI smoke (cli.js / JSON-on-stdout).
+ * Bare "stdin" / "argv" in a script description (Python wordfreq) must not trip this.
+ */
+export function userAskedForCliSmoke(text: string): boolean {
+  const t = text ?? ''
+  if (/\bcli\.js\b/i.test(t)) return true
+  if (
+    /\bCLI\b/.test(t) &&
+    /json|stdout|one\s+line|prints?\s+one|command[-\s]?line/i.test(t)
+  ) {
+    return true
+  }
+  if (/command[-\s]?line\s+(tool|app|utility)/i.test(t)) return true
+  return false
 }
 
 /** Gate premature "Task completed" / false test-pass claims. */
