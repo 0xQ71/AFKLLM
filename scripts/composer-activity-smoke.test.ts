@@ -70,6 +70,26 @@ describe('composerActivity', () => {
     assert.match(formatActivityLabel(a), /Ran Recheck TypeScript/)
   })
 
+  it('shell chip label uses stdout, not the afk-run wrapper', () => {
+    const a = buildActivityFromTool({
+      name: 'execute_terminal_command',
+      args: {
+        command: 'go run wordfreq.go <<< "Go is a programming language"'
+      },
+      resultContent:
+        `note: rewrote Unix shell for PowerShell\n` +
+        `& 'C:\\Users\\iron\\AppData\\Local\\Temp\\afk-run-mt0gdyqt.ps1'; Remove-Item -LiteralPath 'C:\\Users\\iron\\AppData\\Local\\Temp\\afk-run-mt0gdyqt.ps1' -Force\n` +
+        '> Write-Output -- "Go is a programming language" | go run wordfreq.go\n' +
+        'Топ-10 частых слов:\n' +
+        '1. and 3\n\nexit_code=0',
+      ok: true
+    })
+    const label = formatActivityLabel(a)
+    assert.doesNotMatch(label, /afk-run-/i)
+    assert.match(label, /go run wordfreq/)
+    assert.match(label, /Топ-10/)
+  })
+
   it('formats Editing basename', () => {
     const a = buildActivityFromTool({
       name: 'apply_patch',

@@ -103,6 +103,9 @@ import {
   isFullRewriteFallbackPlanStep,
   evaluateAcceptanceGate,
   userAskedForCliSmoke,
+  looksLikeFromScratchRunTask,
+  isCliVerifyCommand,
+  cliVerifyLooksSuccessful,
   stripCodeLeakFromThink,
   preferUserFacingCloser,
   looksTruncatedCloser,
@@ -231,6 +234,33 @@ describe('looksLikeToolMarkupLeak', () => {
     assert.doesNotMatch(stripped, /tool_call|function=write_file/)
     assert.match(liveThinkProse(leaked), /Now README/)
     assert.doesNotMatch(liveThinkProse(leaked), /tool_call|function=/)
+  })
+
+  it('does not salvage tool XML rehearsed only inside think', () => {
+    const leaked =
+      '<think>I will search.\n<function=web_search><parameter=query>LTS Node</parameter></function>\n</think>\nNeed a real tool next.'
+    assert.equal(salvageLeakedToolCalls(leaked).length, 0)
+  })
+
+  it('salvages JSON <tool_call> and truncated function= XML', () => {
+    const json =
+      '<tool_call>{"name":"web_search","arguments":{"query":"LTS Node.js"}}</tool_call>'
+    const jsonCalls = salvageLeakedToolCalls(json)
+    assert.equal(jsonCalls.length, 1)
+    assert.equal(jsonCalls[0]!.function.name, 'web_search')
+    assert.equal(JSON.parse(jsonCalls[0]!.function.arguments).query, 'LTS Node.js')
+
+    const truncated =
+      '<function=write_file><parameter=relative_path>src/App.jsx</parameter><parameter=content>\nexport default function App() {\n'
+    const cut = salvageLeakedToolCalls(truncated)
+    assert.equal(cut.length, 1)
+    assert.equal(cut[0]!.function.name, 'write_file')
+    const args = JSON.parse(cut[0]!.function.arguments) as {
+      relative_path?: string
+      content?: string
+    }
+    assert.equal(args.relative_path, 'src/App.jsx')
+    assert.match(args.content ?? '', /function App/)
   })
 
   it('salvages leaked verify_project XML and strips it from chat text', () => {
@@ -1491,6 +1521,16 @@ describe('agent todo plan', () => {
     assert.doesNotMatch(outThink, /<think>/i)
     assert.doesNotMatch(outThink, /Let me summarize/)
     assert.match(outThink, /Игра готова/)
+    const ruMeta =
+      'Пользователь просит дописать заключение, но без новых tool calls. ' +
+      'Задача выполнена: файлы записаны, программа запущена успешно с exit_code=0, вывод показан. ' +
+      'Нужно просто добавить завершающий текст на русском языке.\n\n' +
+      'Программа wordfreq.go создана и успешно запущена — топ-10 слов подсчитан корректно.'
+    const outRuMeta = preferUserFacingCloser(ruMeta, 'ru')
+    assert.doesNotMatch(outRuMeta, /Пользователь просит/)
+    assert.doesNotMatch(outRuMeta, /tool calls/i)
+    assert.doesNotMatch(outRuMeta, /завершающий текст/)
+    assert.match(outRuMeta, /wordfreq\.go/)
     const longOdd =
       'The terminal keeps showing `npm run dev -- --host 127.0.0.1 --port 3000 because the rewrite pinned a busy port. ' +
       'Next I tried vite --port 5173 which is the IDE. Files: package.json, src/App.jsx.'
@@ -1631,6 +1671,28 @@ describe('agent todo plan', () => {
     assert.ok(reconciled.some((s) => isBrowserPlanStep(s.text) && s.status !== 'done'))
   })
 
+  it('Plan steps: and Confirm exit code do not keep pendingPlanWork open', () => {
+    const steps = [
+      { id: 's1', text: 'Plan steps:', status: 'in_progress' as const },
+      { id: 's2', text: 'Write wordfreq.go', status: 'done' as const },
+      { id: 's3', text: 'Run go run wordfreq.go', status: 'done' as const },
+      {
+        id: 's4',
+        text: 'Confirm exit code is 0 and output contains expected top words.',
+        status: 'pending' as const
+      },
+      {
+        id: 's5',
+        text: 'Показать реальный вывод терминала.',
+        status: 'in_progress' as const
+      }
+    ]
+    assert.equal(isJunkPlanStep(steps[0]!.text), true)
+    assert.equal(isMetaOrSummaryPlanStep(steps[3]!.text), true)
+    assert.equal(isMetaOrSummaryPlanStep(steps[4]!.text), true)
+    assert.equal(pendingPlanWork(steps).length, 0)
+  })
+
   it('точечно исправить стили/разметку is soft — does not block pendingPlanWork', () => {
     const steps = [
       { id: '1', text: 'Найти нужный блок в существующем файле', status: 'done' as const },
@@ -1767,7 +1829,72 @@ describe('agent todo plan', () => {
     assert.equal(isJunkPlanStep('Navbar'), false)
     assert.equal(isJunkPlanStep('План из 3–6 шагов:'), true)
     assert.equal(isJunkPlanStep('Plan of 3-6 atomic product steps'), true)
+    assert.equal(isJunkPlanStep('Plan steps:'), true)
+    assert.equal(isJunkPlanStep('Шаги плана:'), true)
+    assert.equal(isJunkPlanStep('Шаги:'), true)
+    assert.equal(isJunkPlanStep('Steps:'), true)
     assert.equal(isJunkPlanStep('Написать wordfreq.py'), false)
+    const t07d = [
+      {
+        id: 's1',
+        text: 'План: создать wordfreq.go в корне проекта, затем запустить его через go run с тестовым текстом и показать вывод.',
+        status: 'done' as const
+      },
+      { id: 's2', text: 'Шаги:', status: 'in_progress' as const },
+      {
+        id: 's3',
+        text: 'Создать файл wordfreq.go в корне проекта с реализацией подсчёта частоты слов.',
+        status: 'done' as const
+      },
+      {
+        id: 's4',
+        text: 'Запустить программу через go run wordfreq.go с тестовым текстом.',
+        status: 'done' as const
+      },
+      {
+        id: 's5',
+        text: 'Показать реальный вывод терминала из запуска.',
+        status: 'done' as const
+      }
+    ]
+    assert.equal(pendingPlanWork(t07d).length, 0)
+    const t07ePrep =
+      'Подготовить короткий тестовый текст (например: "hello world hello foo bar foo baz hello") для запуска.'
+    assert.equal(isMetaOrSummaryPlanStep(t07ePrep), true)
+    assert.equal(
+      pendingPlanWork([
+        { id: 's2', text: t07ePrep, status: 'in_progress' as const },
+        { id: 's3', text: 'Запустить программу через go run wordfreq.go', status: 'done' as const }
+      ]).length,
+      0
+    )
+    const t07Prompt =
+      'Создай в корне проекта Go-программу wordfreq.go: считает частоту слов. Сразу после записи запусти её (go run) и покажи реальный вывод терминала.'
+    assert.equal(looksLikeFromScratchRunTask(t07Prompt), true)
+    assert.equal(isCliVerifyCommand('echo "hello" | go run wordfreq.go'), true)
+    assert.equal(isCliVerifyCommand('python -m http.server 4173'), false)
+    assert.equal(
+      cliVerifyLooksSuccessful(
+        'go run ./wordfreq.go test_input.txt',
+        '> go run ./wordfreq.go test_input.txt\nНет слов для анализа.\n\nexit_code=0',
+        true
+      ),
+      false
+    )
+    assert.equal(
+      cliVerifyLooksSuccessful(
+        'go run ./wordfreq.go test_input.txt',
+        '> go run ./wordfreq.go test_input.txt\n1. hello — 3\n2. foo — 2\n\nexit_code=0',
+        true
+      ),
+      true
+    )
+    assert.equal(
+      isJunkPlanStep(
+        'Суммарно: создать 3 файла (go.mod, wordfreq.go, test_input.txt), затем выполнить один запуск команды.'
+      ),
+      true
+    )
     const echoed = parsePlanBlock(
       '<plan>\n- План из 3–6 шагов:\n- Написать wordfreq.py\n- Запустить скрипт на тестовом тексте\n</plan>'
     )
@@ -2692,6 +2819,14 @@ describe('honest evidence and truncation helpers', () => {
     assert.ok(closer.length >= 80)
     assert.equal(preferUserFacingCloser(closer, 'ru'), closer)
     assert.equal(isFalseSuccessProse(closer), false)
+    const cliCloser = fallbackWorkDoneCloser({
+      lang: 'ru',
+      paths: ['wordfreq.go'],
+      previewOpened: false
+    })
+    assert.match(cliCloser, /wordfreq\.go/)
+    assert.match(cliCloser, /чипе терминала/)
+    assert.doesNotMatch(cliCloser, /npm run dev/)
     const poisoned = resolveTurnCloser({
       lastClosingText: 'Зависимости установлены успешно. Теперь запускаю npm run dev.',
       lang: 'ru',

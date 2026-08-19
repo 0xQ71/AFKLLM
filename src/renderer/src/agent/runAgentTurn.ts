@@ -82,6 +82,9 @@ import {
   formatWriteRedirectChip,
   evaluateAcceptanceGate,
   userAskedForCliSmoke,
+  looksLikeFromScratchRunTask,
+  isCliVerifyCommand,
+  cliVerifyLooksSuccessful,
   fingerprintToolCall,
   looksLikeToolMarkupLeak,
   salvageLeakedToolCalls,
@@ -4784,6 +4787,9 @@ export async function runAgentTurn(params: {
           ) {
             ranCliSmoke = true
           }
+          if (toolResult.ok && isCliVerifyCommand(cmd)) {
+            ranCliSmoke = cliVerifyLooksSuccessful(cmd, toolResult.content, toolResult.ok)
+          }
           if (
             isHtmlPreviewShell(cmd) ||
             markPreviewFromShell({
@@ -5500,7 +5506,13 @@ export async function runAgentTurn(params: {
       const workSettled =
         htmlPreviewOpened &&
         mutatingEditOk
-      if (workSettled) {
+      const cliWorkDone =
+        looksLikeFromScratchRunTask(params.userText) &&
+        mutatingEditOk &&
+        ranCliSmoke &&
+        !mutatingEditFailed &&
+        !editSanityFailed
+      if (workSettled || cliWorkDone) {
         settledStopAsked = true
         concludeAsked = true
         pinFallbackCloserIfNeeded()
@@ -5543,6 +5555,13 @@ export async function runAgentTurn(params: {
             apiMessages,
             'WRITE_FILE_REQUIRED: this landing file is new or not complete this turn. ' +
               formatScratchWriteFileHint()
+          )
+        } else if (/CLI_EMPTY|GO_SPLIT/i.test(tc)) {
+          appendToolHint(
+            apiMessages,
+            /GO_SPLIT/i.test(tc)
+              ? 'GO_SPLIT: regexp.Split(s, n) — n=0 returns nil (no words). Use n=-1 to split all. Then re-run. Do not stop.'
+              : 'CLI_EMPTY: exit_code=0 but stdout has no counted words. Fix the tokenizer and re-run go run / python. Do not write a closing summary yet.'
           )
         } else if (/I18N_SANITY|EDIT_SANITY|LANDING_CONTRACT/i.test(tc)) {
           appendToolHint(
@@ -6159,7 +6178,10 @@ export async function runAgentTurn(params: {
       !mutatingEditFailed &&
       !editSanityFailed
 
-    if (viteWorkDone) {
+    if (
+      viteWorkDone &&
+      !(looksLikeFromScratchRunTask(params.userText) && !ranCliSmoke)
+    ) {
       if (closerVisible.length >= 48) lastClosingText = closerVisible
       pinFallbackCloserIfNeeded()
       params.onUpdate([...messages])
@@ -6542,7 +6564,11 @@ export async function runAgentTurn(params: {
       continue
     }
 
-    if (htmlPreviewOpened && mutatingEditOk && !mutatingEditFailed && !editSanityFailed) {
+    if (
+      htmlPreviewOpened && mutatingEditOk && !mutatingEditFailed && !editSanityFailed
+    ) {
+      pinFallbackCloserIfNeeded()
+    } else if (mutatingEditOk && ranCliSmoke) {
       pinFallbackCloserIfNeeded()
     }
 

@@ -3,7 +3,9 @@ import { describe, it } from 'node:test'
 import {
   normalizeAgentShellCommand,
   peelLeadingCd,
-  rewriteBashOperators
+  rewriteBashOperators,
+  stripAfkPtyChrome,
+  cliStdoutLooksVacuous
 } from '../src/shared/shellNormalize'
 import {
   classifyBrowserOpenCommand,
@@ -67,6 +69,42 @@ describe('shellNormalize', () => {
 
     const nullRedir = normalizeAgentShellCommand('dir 2>/dev/null', '.', 'win32')
     assert.match(nullRedir.command, /2>\$null/)
+  })
+
+  it('rewrites bash here-string to a PowerShell stdin pipe', () => {
+    const r = normalizeAgentShellCommand(
+      'go run wordfreq.go <<< "hello world hello"',
+      '.',
+      'win32'
+    )
+    assert.match(r.command, /Write-Output -- "hello world hello" \| go run wordfreq\.go/)
+    assert.doesNotMatch(r.command, /<<</)
+    assert.ok(r.note)
+  })
+
+  it('strips afk-run wrapper echo from PTY output', () => {
+    const raw =
+      `& 'C:\\Users\\iron\\AppData\\Local\\Temp\\afk-run-mt0gdyqt.ps1'; Remove-Item -LiteralPath 'C:\\Users\\iron\\AppData\\Local\\Temp\\afk-run-mt0gdyqt.ps1' -Force -ErrorAction SilentlyContinue\n` +
+      '> Write-Output -- "hello world" | go run wordfreq.go\n' +
+      'Топ-10 частых слов:\n' +
+      '1. and 3\n' +
+      '__AFK_EXIT_mt0gdyqt__0'
+    const out = stripAfkPtyChrome(raw)
+    assert.doesNotMatch(out, /afk-run-/i)
+    assert.doesNotMatch(out, /__AFK_EXIT_/)
+    assert.match(out, /> Write-Output/)
+    assert.match(out, /Топ-10 частых слов/)
+  })
+
+  it('treats empty wordfreq stdout as vacuous even with exit 0', () => {
+    assert.equal(
+      cliStdoutLooksVacuous('> go run ./wordfreq.go test_input.txt\nНет слов для анализа.\n\nexit_code=0'),
+      true
+    )
+    assert.equal(
+      cliStdoutLooksVacuous('> go run wordfreq.go\n1. hello — 3\n2. foo — 2\n\nexit_code=0'),
+      false
+    )
   })
 })
 

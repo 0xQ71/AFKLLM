@@ -166,6 +166,17 @@ export function evidenceSupportsStep(stepText: string, log: StepEvidence[]): boo
     }
     return true
   }
+  // "Confirm exit code is 0 and output contains expected top words" is a
+  // verify row, not a second compile — a successful go run / python ticks it.
+  if (
+    /confirm\s+(exit|output|stdout|результат)|exit\s+code|код\s+возврата|output\s+contains|вывод\s+содержит|expected\s+top/i.test(
+      t
+    ) ||
+    (/^(confirm|verify|validate)\b/i.test(t) && /exit|output|stdout|вывод|код/i.test(t))
+  ) {
+    const runShell = okShell.filter((e) => !/go\s+mod\b/i.test(e.command ?? ''))
+    return runShell.length > 0
+  }
   if (/(?:^|[^\p{L}])запустить|(?:^|[^\p{L}])run(?:$|[^\p{L}])|выполнить|go\s+run|через\s+terminal/iu.test(t)) {
     const runShell = okShell.filter((e) => !/go\s+mod\b/i.test(e.command ?? ''))
     if (runShell.length === 0) return false

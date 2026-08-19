@@ -5,5 +5,7 @@ export {
   cssLooksLikeRealStylesheet,
   svgLooksLikeRealGraphic,
   contentLooksLikeSourceStub,
-  formatStubOnDiskHint
+  formatStubOnDiskHint,
+  patchWouldBreakCompleteness,
+  formatBrokenPatchError
 } from '../../../../shared/completeness'

@@ -86,7 +86,61 @@ export function rewriteUnixismsForPowerShell(command: string): string {
     cmd = cmd.replace(/^ls\s+-[laRh]+\b/i, 'Get-ChildItem')
   }
 
+  // bash here-string: `go run wordfreq.go <<< "hello"` → stdin pipe (PowerShell has no <<<)
+  const here = cmd.match(
+    /^([\s\S]+?)\s+<<<\s+("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\S+)\s*$/
+  )
+  if (here) {
+    const lhs = here[1]!.trim()
+    const payload = here[2]!
+    cmd = `Write-Output -- ${payload} | ${lhs}`
+  }
+
   return cmd.trim()
+}
+
+/** PTY echo of the temp wrapper (`& '...\afk-run-….ps1'; Remove-Item…`) or leftover exit marker. */
+export function isAfkPtyChromeLine(line: string): boolean {
+  const t = line.trim()
+  if (!t) return false
+  if (/afk-run-[a-z0-9]+\.ps1/i.test(t)) return true
+  if (/__AFK_EXIT_[a-z0-9]+__/i.test(t) && !/^> /.test(t)) return true
+  return false
+}
+
+/** Drop wrapper invoke / exit-marker lines; keep `> actual command` and program stdout. */
+export function stripAfkPtyChrome(output: string): string {
+  if (!output) return output
+  return output
+    .split(/\r?\n/)
+    .flatMap((line) => {
+      if (!isAfkPtyChromeLine(line)) return [line]
+      const leftover = line.replace(/__AFK_EXIT_[a-z0-9]+__\d*/gi, '').trim()
+      if (leftover && !isAfkPtyChromeLine(leftover)) return [leftover]
+      return []
+    })
+    .join('\n')
+    .replace(/^\n+/, '')
+    .replace(/\n+$/, '')
+}
+
+/** exit_code=0 but no real program output (T07f: «Нет слов для анализа.» after Split n=0). */
+export function cliStdoutLooksVacuous(resultContent: string): boolean {
+  const t = stripAfkPtyChrome(resultContent ?? '')
+    .replace(/^note:.*$/gim, '')
+    .replace(/\n*exit_code=-?\d+\s*$/i, '')
+    .replace(/TERMINAL_ERROR:[\s\S]*$/i, '')
+    .replace(/ERROR_FOCUS[\s\S]*$/i, '')
+    .replace(/^GO_SPLIT:.*$/gim, '')
+    .replace(/^CLI_EMPTY:.*$/gim, '')
+    .replace(/^>\s.*$/gm, '')
+    .replace(/^PS\s+\S+>/gm, '')
+    .trim()
+  if (!t || t === '(no output)') return true
+  if (/нет слов( для анализа)?|no words to (analyze|analyse)|empty (input|result)/i.test(t)) {
+    return true
+  }
+  return false
 }
 
 /** Peel `cd dir && rest` into cwd + rest when cwdRel is `.` / empty. */

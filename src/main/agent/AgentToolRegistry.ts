@@ -15,7 +15,7 @@ import {
   formatApplyPatchResult,
   parseApplyPatch
 } from '../../shared/applyPatch'
-import { normalizeAgentShellCommand } from '../../shared/shellNormalize'
+import { normalizeAgentShellCommand, stripAfkPtyChrome, cliStdoutLooksVacuous } from '../../shared/shellNormalize'
 import {
   extractErrorFocus,
   isUserInterruptExit,
@@ -58,7 +58,7 @@ import {
   looksLikeViteScaffoldCommand,
   devCommandNeedsNodeModules
 } from '../../shared/localPreview'
-import { contentLooksStructurallyComplete, contentLooksLikeSourceStub, formatStubOnDiskHint, looksLikeEmptyOrStubWriteContent, formatEmptyWriteError } from '../../shared/completeness'
+import { contentLooksStructurallyComplete, contentLooksLikeSourceStub, formatStubOnDiskHint, looksLikeEmptyOrStubWriteContent, formatEmptyWriteError, patchWouldBreakCompleteness, formatBrokenPatchError } from '../../shared/completeness'
 import { formatWriteFileRequiredError } from '../../shared/writeFileRequired'
 import { fastApplyEdit } from '../llama/ApplyEditClient'
 import { locateApplyRegion, type ApplyRegion } from '../../shared/fastApply'
@@ -937,6 +937,15 @@ export class AgentToolRegistry {
         replaceAll
       )
       if (applied.ok) {
+        if (patchWouldBreakCompleteness(original, applied.content, effectivePath)) {
+          return {
+            id: '',
+            name: 'apply_diff',
+            ok: false,
+            content: '',
+            error: formatBrokenPatchError(effectivePath)
+          }
+        }
         this.rememberEdit(effectivePath, true, original)
         await fs.writeFile(abs, applied.content, 'utf8')
         this.notifyChange(effectivePath)
@@ -1059,6 +1068,16 @@ export class AgentToolRegistry {
         ok: false,
         content: result.error,
         error: result.error
+      }
+    }
+
+    if (patchWouldBreakCompleteness(opts.original, result.content, opts.relativePath)) {
+      return {
+        id: '',
+        name: opts.toolName,
+        ok: false,
+        content: '',
+        error: formatBrokenPatchError(opts.relativePath)
       }
     }
 
@@ -1212,6 +1231,10 @@ export class AgentToolRegistry {
               .join('\n')
               .slice(0, 2_000)
           }
+          continue
+        }
+        if (patchWouldBreakCompleteness(original, applied.content, updatePath)) {
+          errors.push(formatBrokenPatchError(updatePath))
           continue
         }
         this.rememberEdit(updatePath, true, original)
@@ -1848,7 +1871,7 @@ export class AgentToolRegistry {
     normalizeNote?: string
   ): AgentToolResult {
     const noteLine = normalizeNote ? `note: ${normalizeNote}\n` : ''
-    const body = stripAnsi(output).trim() || '(no output)'
+    const body = stripAfkPtyChrome(stripAnsi(output)).trim() || '(no output)'
     const denyPorts = this.getDenyPreviewPorts?.() ?? [8080]
     const preview = extractLocalPreviewUrl(body, { denyPorts })
     if (preview) {
@@ -1856,6 +1879,16 @@ export class AgentToolRegistry {
     } else if (looksLikeLocalServerCommand(command) && exitCode === 0) {
       // Preview URL arrives later via PTY stream → browser:open-url
     }
+    const goSplit =
+      /regex(?:p)?\.Split|not enough arguments in call to regex\.Split/i.test(body)
+        ? '\nGO_SPLIT: regexp.Split(s, n) — n=0 returns nil (empty word list). Use n=-1 to split all.'
+        : ''
+    const cliEmpty =
+      exitCode === 0 &&
+      /\bgo\s+run\b/i.test(command) &&
+      cliStdoutLooksVacuous(body)
+        ? '\nCLI_EMPTY: exit_code=0 but stdout has no counted words. Fix tokenizer (Go regexp.Split n=-1, not 0). Re-run. Do not stop.'
+        : ''
     if (exitCode === 0) {
       return {
         id: '',
@@ -1863,6 +1896,8 @@ export class AgentToolRegistry {
         ok: true,
         content:
           `${noteLine}${body}\n\nexit_code=0` +
+          goSplit +
+          cliEmpty +
           (preview
             ? `\nPREVIEW_URL: ${preview} (opened in AFKLLM Browser)`
             : looksLikeLocalServerCommand(command)
@@ -1934,7 +1969,9 @@ export class AgentToolRegistry {
       `command: ${command}\n` +
       noteLine +
       `\n` +
-      `ERROR_FOCUS (read and fix THIS — do not guess):\n${focusOrTail}\n\n` +
+      `ERROR_FOCUS (read and fix THIS — do not guess):\n${focusOrTail}\n` +
+      goSplit +
+      `\n` +
       `FULL_OUTPUT:\n${body}\n\n` +
       `REQUIRED: open the file/line named in the traceback (read_file), apply_diff to fix the stated cause, then re-run the SAME command (use cwd=… instead of bash &&). Do not rewrite the whole project or drop the tech stack.`
     return {

@@ -1,5 +1,6 @@
 import { parseReadFileMeta } from './agentPure'
 import { DEFAULT_UI_LANGUAGE } from '../../../shared/i18n'
+import { isAfkPtyChromeLine, stripAfkPtyChrome } from '../../../shared/shellNormalize'
 import { translate } from '../i18n/messages'
 
 export type ComposerActivityKind =
@@ -282,7 +283,7 @@ export function buildActivityFromTool(params: {
     }
     case 'execute_terminal_command': {
       const stdout = !streaming
-        ? (params.resultContent ?? '')
+        ? stripAfkPtyChrome(params.resultContent ?? '')
             .replace(/^note:.*$/gim, '')
             .replace(/\n*exit_code=-?\d+\s*$/i, '')
             .replace(/TERMINAL_ERROR:[\s\S]*$/i, '')
@@ -292,7 +293,13 @@ export function buildActivityFromTool(params: {
       const firstOut = stdout
         .split(/\n/)
         .map((l) => l.trim())
-        .find((l) => l && !/^> /.test(l) && l !== '(no output)')
+        .find(
+          (l) =>
+            l &&
+            !/^> /.test(l) &&
+            l !== '(no output)' &&
+            !isAfkPtyChromeLine(l)
+        )
       return {
         kind: 'shell',
         verb: streaming ? 'Running' : 'Ran',

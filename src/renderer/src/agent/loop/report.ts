@@ -74,10 +74,18 @@ export function fallbackWorkDoneCloser(opts: {
     ? ru
       ? ' Превью открыто в приложении — вкладка Browser (npm run dev).'
       : ' Preview is open in the app Browser tab (npm run dev).'
-    : ru
-      ? ' Можно открыть превью через npm run dev.'
-      : ' Open the preview with npm run dev.'
+    : looksLikeCliPaths(opts.paths)
+      ? ru
+        ? ' Программа записана и запущена — вывод в чипе терминала.'
+        : ' Program written and run — see the terminal chip.'
+      : ru
+        ? ' Можно открыть превью через npm run dev.'
+        : ' Open the preview with npm run dev.'
   return `${fileBit}${previewBit}`.trim()
+}
+
+function looksLikeCliPaths(paths: string[]): boolean {
+  return paths.some((p) => /\.(go|py|java|cs|rs|c|cc|cpp|kt)$/i.test(p.replace(/\\/g, '/')))
 }
 
 /**

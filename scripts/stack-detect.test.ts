@@ -21,7 +21,7 @@ import {
   inferredVerifyMode
 } from '../src/renderer/src/agent/loop/verify'
 import { allowsFullOverwrite } from '../src/shared/writeThresholds'
-import { contentLooksStructurallyComplete, isLandingJsPath, isSourcePath } from '../src/renderer/src/agent/loop/completeness'
+import { contentLooksStructurallyComplete, isLandingJsPath, isSourcePath, patchWouldBreakCompleteness } from '../src/renderer/src/agent/loop/completeness'
 import { evidenceSupportsStep, evidenceFromTool, recordEvidence } from '../src/renderer/src/agent/loop/evidence'
 import { advanceTodosOnEvidence } from '../src/renderer/src/agent/loop/plan'
 import { AgentToolRegistry } from '../src/main/agent/AgentToolRegistry'
@@ -371,6 +371,41 @@ describe('completeness by language', () => {
     assert.equal(contentLooksStructurallyComplete('def add(a, b):\n', 'a.py'), false)
   })
 
+  it('refuses a Go patch that unbalances braces', () => {
+    const before =
+      'package main\n\nfunc main() {\n\tprintln("hi")\n}\n'
+    const after =
+      'package main\n\nfunc main() {\n\tprintln("hi")\n'
+    assert.equal(contentLooksStructurallyComplete(before, 'wordfreq.go'), true)
+    assert.equal(contentLooksStructurallyComplete(after, 'wordfreq.go'), false)
+    assert.equal(patchWouldBreakCompleteness(before, after, 'wordfreq.go'), true)
+    assert.equal(patchWouldBreakCompleteness(before, before, 'wordfreq.go'), false)
+  })
+
+  it('apply_diff leaves a complete Go file on disk when the hunk would unbalance braces', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'afkllm-go-patch-'))
+    const go = 'package main\n\nfunc main() {\n\tprintln("hi")\n}\n'
+    try {
+      await fs.writeFile(path.join(root, 'wordfreq.go'), go, 'utf8')
+      const reg = new AgentToolRegistry({ projectRoot: root })
+      const res = await reg.invoke({
+        id: '1',
+        name: 'apply_diff',
+        arguments: {
+          relative_path: 'wordfreq.go',
+          search_block: 'func main() {\n\tprintln("hi")\n}',
+          replace_block: 'func main() {\n\tprintln("hi")'
+        }
+      })
+      assert.equal(res.ok, false)
+      assert.match(res.error ?? '', /PATCH_INCOMPLETE/)
+      const disk = await fs.readFile(path.join(root, 'wordfreq.go'), 'utf8')
+      assert.equal(disk, go)
+    } finally {
+      await fs.rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('CSS/SVG stubs are incomplete; a real stylesheet is complete', () => {
     assert.equal(
       contentLooksStructurallyComplete('/* landing */\n:root { --bg: #000; }\n', 'styles.css'),
@@ -568,6 +603,20 @@ describe('evidence-gated plan', () => {
     assert.equal(
       evidenceSupportsStep(
         'Запустить программу через go run wordfreq.go на коротком тестовом тексте',
+        ran
+      ),
+      true
+    )
+    assert.equal(
+      evidenceSupportsStep(
+        'Confirm exit code is 0 and output contains expected top words.',
+        mod
+      ),
+      false
+    )
+    assert.equal(
+      evidenceSupportsStep(
+        'Confirm exit code is 0 and output contains expected top words.',
         ran
       ),
       true

@@ -264,3 +264,24 @@ export function contentLooksStructurallyComplete(
   if (/[{([]/.test(t)) return bracesBalanced(t)
   return t.length > 0 && !/[,\\]$/.test(lastNonEmptyLine(t))
 }
+
+/** True when a patch would turn a finished source file into unbalanced / truncated source. */
+export function patchWouldBreakCompleteness(
+  before: string,
+  after: string,
+  relativePath: string
+): boolean {
+  return (
+    contentLooksStructurallyComplete(before, relativePath) &&
+    !contentLooksStructurallyComplete(after, relativePath)
+  )
+}
+
+export function formatBrokenPatchError(relativePath: string): string {
+  const p = (relativePath ?? '').replace(/\\/g, '/') || 'this file'
+  return (
+    `PATCH_INCOMPLETE: apply would leave "${p}" structurally incomplete (unbalanced braces / truncated). ` +
+    'Disk is unchanged. Use a smaller unique search_block that keeps the file complete, ' +
+    'or write_file overwrite=true with the FULL file. Do not claim the task is done.'
+  )
+}

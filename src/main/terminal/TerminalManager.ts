@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { execFileSync } from 'node:child_process'
 import type { BrowserWindow } from 'electron'
 import { extractLocalPreviewUrl, looksLikeLocalServerCommand } from '../../shared/localPreview'
+import { stripAfkPtyChrome } from '../../shared/shellNormalize'
 import {
   AGENT_SHELL_HARD_TIMEOUT_MS,
   AGENT_SHELL_IDLE_TIMEOUT_MS,
@@ -298,9 +299,9 @@ export class TerminalManager {
         if (this.activeCommandCancel === cancel) this.activeCommandCancel = null
         this.dataListeners.delete(onData)
         const plain = strip(buf)
-        const cleaned = plain
-          .replace(new RegExp(`${marker}\\d+\\s*$`), '')
-          .trim()
+        const cleaned = stripAfkPtyChrome(
+          plain.replace(new RegExp(`${marker}\\d+\\s*$`), '')
+        ).trim()
         resolvePromise({ output: cleaned, exitCode })
       }
 

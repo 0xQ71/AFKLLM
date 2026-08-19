@@ -3,6 +3,7 @@
  */
 
 import { looksLikeOpenHtmlCommand } from '../../../shared/localPreview'
+import { cliStdoutLooksVacuous } from '../../../shared/shellNormalize'
 import {
   contentLooksStructurallyComplete as contentLooksStructurallyCompleteV2,
   isLandingJsPath,
@@ -1211,8 +1212,14 @@ export function isMetaOrSummaryPlanStep(text: string): boolean {
     /уже\s+(дан|даны|предоставлен|сообщен|выполнен)|already\s+(been\s+)?(given|provided|answered|done)/i.test(
       t
     ) ||
-    /^(verify|validate|check|done|finish|summarize|report|закрыть|close)\b/i.test(t) ||
-    /напиши\s+(кратк|итог|заключен)|write\s+(a\s+)?(short\s+)?(summary|closing)/i.test(t)
+    /^(verify|validate|check|confirm|done|finish|summarize|report|закрыть|close)\b/i.test(t) ||
+    /напиши\s+(кратк|итог|заключен)|write\s+(a\s+)?(short\s+)?(summary|closing)/i.test(t) ||
+    /показать\s+(реальн\w+\s+)?вывод|show\s+(the\s+)?(real\s+)?(terminal\s+)?output|вывод\s+терминала/i.test(
+      t
+    ) ||
+    /подготовить\s+(короткий\s+)?тестовый\s+текст|prepare\s+(a\s+)?(short\s+)?test(\s+text| input)?/i.test(
+      t
+    )
   )
 }
 
@@ -1291,9 +1298,30 @@ export function isFalseSuccessProse(prose: string): boolean {
   )
 }
 
-/**
- * Drop model-to-self chatter so the user sees the real closer (RU when the UI is RU).
- */
+function isCloserMetaBlock(block: string): boolean {
+  const s = block.trim()
+  if (!s) return true
+  if (
+    /^(perfect!?|now i need to write.{0,80}summary|let me write a concise.{0,60}summary|the task is complete|the user wants me to stop|let me compile what was done)/i.test(
+      s
+    )
+  ) {
+    return true
+  }
+  if (/пользователь просит дописать заключен/i.test(s)) return true
+  if (/нужно просто добавить завершающий текст/i.test(s)) return true
+  if (/без новых tool calls/i.test(s) && /заключен|closing|summary/i.test(s)) return true
+  if (
+    /the user .{0,100}(?:asks|wants|is asking|requested).{0,100}(?:closing|summary|заключен)/i.test(
+      s
+    )
+  ) {
+    return true
+  }
+  return false
+}
+
+/** Drop model-to-self chatter so the user sees the real closer (RU when the UI is RU). */
 export function preferUserFacingCloser(text: string, uiLang: 'ru' | 'en'): string {
   let t = stripThinkBlocks(text ?? '').trim()
   if (!t) return t
@@ -1315,13 +1343,22 @@ export function preferUserFacingCloser(text: string, uiLang: 'ru' | 'en'): strin
       /Let me write a concise (?:Russian )?summary[^.]*\.?\s*/gi,
       ''
     )
+    .replace(/Пользователь просит дописать заключен[^.!?\n]*[.!?]\s*/gi, '')
+    .replace(/Нужно просто добавить завершающий текст[^.!?\n]*[.!?]\s*/gi, '')
+    .replace(/(?:^|\s)(?:но )?без новых tool calls\.?\s*/gi, ' ')
+    .replace(
+      /The user (?:asks|wants|is asking|requested)[^.!?\n]*(?:closing|summary|заключен)[^.!?\n]*[.!?]\s*/gi,
+      ''
+    )
+    .replace(/(?:^|\s)(?:but )?without (?:any )?new tool calls\.?\s*/gi, ' ')
+    .replace(/Need to (?:just )?add (?:a |the )?(?:closing|concluding) text[^.!?\n]*[.!?]\s*/gi, '')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/[ \t]{2,}/g, ' ')
     .trim()
-  const metaPara =
-    /^(perfect!?|now i need to write.{0,80}summary|let me write a concise.{0,60}summary|the task is complete|the user wants me to stop|let me compile what was done)/i
   t = t
     .split(/\n{2,}/)
     .map((b) => b.trim())
-    .filter((b) => b && !metaPara.test(b))
+    .filter((b) => b && !isCloserMetaBlock(b))
     .join('\n\n')
     .trim()
   if (uiLang !== 'ru') return t
@@ -1783,6 +1820,12 @@ export function isJunkPlanStep(text: string): boolean {
   // PLAN_ONLY instruction echoed as a todo ("План из 3–6 шагов:")
   if (/^план\s+из\s+\d/i.test(t)) return true
   if (/^план\s+действий/i.test(t)) return true
+  if (/^plan\s+steps?:?\s*$/i.test(t)) return true
+  if (/^шаги\s+плана:?\s*$/i.test(t)) return true
+  // Bare heading leaked as a row (T07d: «Шаги:» stayed in_progress → false incomplete closer)
+  if (/^шаги:?\s*$/i.test(t)) return true
+  if (/^steps?:?\s*$/i.test(t)) return true
+  if (/^суммарно\s*:|^итого\s*:/i.test(t)) return true
   if (/каждый\s+шаг\s+созда[её]т\s+файлы/i.test(t)) return true
   if (/^plan\s+of\s+\d/i.test(t)) return true
   if (/^\d+\s*[–-]\s*\d+\s+(atomic\s+)?(product\s+)?steps?\b/i.test(t)) return true
@@ -2039,6 +2082,7 @@ export function pendingPlanWork(steps: AgentTodoStep[]): AgentTodoStep[] {
   return steps.filter(
     (s) =>
       s.status !== 'done' &&
+      !isJunkPlanStep(s.text) &&
       !isBrowserPlanStep(s.text) &&
       !isMetaOrSummaryPlanStep(s.text) &&
       !isFluffPlanStep(s.text) &&
@@ -2555,6 +2599,38 @@ export function userAskedForCliSmoke(text: string): boolean {
   return false
 }
 
+/** From-scratch CLI (wordfreq.go / .py): write the file, run it, show stdout — then stop. */
+export function looksLikeFromScratchRunTask(text: string): boolean {
+  const t = text ?? ''
+  const write = /создай|create|напиши|write|сделай/i.test(t)
+  const prog =
+    /\.go\b|\.py\b|wordfreq|программ[ауеы]?|go-программ|python-скрипт/i.test(t)
+  const run = /go\s+run|python3?|запусти|run it|покажи.{0,48}вывод|show.{0,40}(stdout|output|вывод)/i.test(
+    t
+  )
+  return write && prog && run
+}
+
+/** Successful host verify for a from-scratch CLI — not a Vite preview server. */
+export function isCliVerifyCommand(command: string): boolean {
+  const c = command ?? ''
+  if (/python\s+-m\s+http\.server|npm\s+run\s+dev|\bvite\b/i.test(c)) return false
+  return /\bgo\s+run\b|\bpython3?\s+\S+\.py\b|\bpy\s+\S+\.py\b|\bdotnet\s+run\b|\bcargo\s+run\b/i.test(
+    c
+  )
+}
+
+/** True when go/python run exited 0 AND printed real output (not empty-wordfreq). */
+export function cliVerifyLooksSuccessful(
+  command: string,
+  resultContent: string,
+  ok: boolean
+): boolean {
+  if (!ok || !isCliVerifyCommand(command)) return false
+  if (/TERMINAL_ERROR|exit_code=[1-9]/i.test(resultContent ?? '')) return false
+  return !cliStdoutLooksVacuous(resultContent)
+}
+
 /** Gate premature "Task completed" / false test-pass claims. */
 export function evaluateAcceptanceGate(input: {
   finalText: string
@@ -2643,48 +2719,100 @@ const SALVAGEABLE_TOOLS = new Set([
   'apply_diff',
   'apply_patch',
   'execute_terminal_command',
-  'verify_project'
+  'verify_project',
+  'read_file',
+  'web_search',
+  'list_directory',
+  'search_codebase',
+  'delete_file'
 ])
 
+function parseXmlParameters(body: string): Record<string, string> {
+  const args: Record<string, string> = {}
+  const paramRe =
+    /<\s*parameter\s*=\s*([a-z0-9_]+)\s*>\s*([\s\S]*?)(?:<\s*\/\s*parameter\s*>|$)/gi
+  let p: RegExpExecArray | null
+  while ((p = paramRe.exec(body)) !== null) {
+    const key = (p[1] ?? '').trim()
+    if (key) args[key] = (p[2] ?? '').replace(/^\n/, '').replace(/\n$/, '')
+  }
+  return args
+}
+
+function pushSalvagedCall(
+  out: Array<{ id: string; type: 'function'; function: { name: string; arguments: string } }>,
+  name: string,
+  args: Record<string, unknown>
+): void {
+  if (name === 'write_file' && !args.content && !args.relative_path && !args.path) return
+  if (name === 'create_directory' && !args.relative_path && !args.path && !args.dir_path) return
+  if (name === 'verify_project' && !args.mode && !args.command) return
+  if (name === 'read_file' && !args.relative_path && !args.path) return
+  if (name === 'web_search' && !args.query && !args.q) return
+  if (name === 'execute_terminal_command' && !args.command) return
+  out.push({
+    id: `salvage-${out.length + 1}`,
+    type: 'function',
+    function: { name, arguments: JSON.stringify(args) }
+  })
+}
+
 /**
- * Ornith/Qwen often dump `<tool_call><function=write_file><parameter=…>` as
- * assistant text instead of OpenAI tool_calls. Recover those into real calls.
+ * Ornith/Qwen dump `<tool_call><function=write_file><parameter=…>` as assistant
+ * text instead of OpenAI tool_calls. Recover those into real calls.
+ * Rehearsals inside `<think>` are skipped (same idea as Unsloth auto-heal).
  */
 export function salvageLeakedToolCalls(
   text: string
 ): Array<{ id: string; type: 'function'; function: { name: string; arguments: string } }> {
   const raw = text ?? ''
   if (!raw.trim()) return []
+  const actionable = parseThinkBlocks(raw)
+    .filter((p) => p.kind === 'text')
+    .map((p) => p.text)
+    .join('\n')
+  if (!actionable.trim()) return []
   const out: Array<{
     id: string
     type: 'function'
     function: { name: string; arguments: string }
   }> = []
-  const fnRe = /<\s*function\s*=\s*([a-z_]+)\s*>([\s\S]*?)<\s*\/\s*function\s*>/gi
+
+  const jsonRe = /<\s*tool_call\s*>\s*(\{[\s\S]*?\})\s*<\s*\/\s*tool_call\s*>/gi
+  let jm: RegExpExecArray | null
+  while ((jm = jsonRe.exec(actionable)) !== null) {
+    try {
+      const obj = JSON.parse(jm[1] ?? '') as {
+        name?: string
+        arguments?: unknown
+        parameters?: unknown
+      }
+      const name = String(obj.name ?? '').trim().toLowerCase()
+      if (!SALVAGEABLE_TOOLS.has(name)) continue
+      let args = obj.arguments ?? obj.parameters ?? {}
+      if (typeof args === 'string') {
+        try {
+          args = JSON.parse(args) as Record<string, unknown>
+        } catch {
+          args = { value: args }
+        }
+      }
+      if (!args || typeof args !== 'object' || Array.isArray(args)) continue
+      pushSalvagedCall(out, name, args as Record<string, unknown>)
+    } catch {
+      /* not JSON — fall through to function= XML */
+    }
+  }
+
+  const fnRe =
+    /<\s*function\s*=\s*([a-z0-9_-]+)\s*>([\s\S]*?)(?:<\s*\/\s*function\s*>|$)/gi
   let m: RegExpExecArray | null
-  let n = 0
-  while ((m = fnRe.exec(raw)) !== null) {
+  while ((m = fnRe.exec(actionable)) !== null) {
     const name = (m[1] ?? '').trim().toLowerCase()
     if (!SALVAGEABLE_TOOLS.has(name)) continue
-    const body = m[2] ?? ''
-    const args: Record<string, string> = {}
-    const paramRe = /<\s*parameter\s*=\s*([a-z_]+)\s*>\s*([\s\S]*?)\s*<\s*\/\s*parameter\s*>/gi
-    let p: RegExpExecArray | null
-    while ((p = paramRe.exec(body)) !== null) {
-      const key = (p[1] ?? '').trim()
-      if (key) args[key] = (p[2] ?? '').replace(/^\n/, '').replace(/\n$/, '')
-    }
-    if (name === 'write_file' && !args.content && !args.relative_path && !args.path) continue
-    if (name === 'create_directory' && !args.relative_path && !args.path && !args.dir_path) {
-      continue
-    }
-    if (name === 'verify_project' && !args.mode && !args.command) continue
-    n++
-    out.push({
-      id: `salvage-${n}`,
-      type: 'function',
-      function: { name, arguments: JSON.stringify(args) }
-    })
+    const args = parseXmlParameters(m[2] ?? '')
+    if (Object.keys(args).length === 0) continue
+    pushSalvagedCall(out, name, args)
   }
   return out
 }
