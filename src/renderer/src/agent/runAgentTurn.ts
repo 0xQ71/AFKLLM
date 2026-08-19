@@ -9,7 +9,7 @@ import {
   formatSurgicalFollowUpHint,
   isHtmlOnlyStacks
 } from './loop/prompts'
-import { honestClosingNote } from './loop/report'
+import { fallbackWorkDoneCloser, honestClosingNote } from './loop/report'
 import { type StepEvidence } from './loop/evidence'
 import { advanceTodosOnEvidence } from './loop/plan'
 import {
@@ -156,7 +156,11 @@ import {
   formatViteReactPreviewHint,
   shouldRequireWriteFileForApply
 } from './loop/landingWriteCap'
-import { AGENT_MAX_TOKENS, maxTokensForAgent } from './loop/ctxBudget'
+import {
+  AGENT_MAX_TOKENS,
+  maxTokensForAgent,
+  shouldCompactForOverflow as ctxShouldCompact
+} from './loop/ctxBudget'
 
 const RECENT_TURNS_WITH_SUMMARY = 12
 
@@ -564,12 +568,6 @@ const DEFAULT_MAX_ROUNDS = 64
 const TOOL_RESULT_CHARS = 6_000
 /** Cyrillic/code runs denser than English. */
 const CHARS_PER_TOKEN = 3.2
-/**
- * Compact only when prompt is actually near the model ctx — NOT after every file write.
- * Reserve a thin completion slice; old 2800 reserve fired compact around ~30–40% fill.
- */
-const CTX_COMPACT_RATIO = 0.9
-const CTX_RESERVE_TOKENS = 900
 /** Cap forced append loops on the same path when stream was truncated. */
 const MAX_INCOMPLETE_APPENDS_PER_PATH = 4
 /** Source files: after this many incomplete writes, demand one full overwrite. */
@@ -1251,12 +1249,13 @@ function estimateTokens(msgs: ApiMessage[]): number {
 }
 
 function shouldCompactForOverflow(msgs: ApiMessage[], ctxSize: number): boolean {
-  const ctx = ctxSize > 0 ? ctxSize : 8192
-  const budget = Math.max(
-    4096,
-    Math.floor(ctx * CTX_COMPACT_RATIO) - CTX_RESERVE_TOKENS
-  )
-  return estimateTokens(msgs) >= budget
+  return ctxShouldCompact(estimateTokens(msgs), ctxSize)
+}
+
+/** Stub write_file bodies in history only when ctx is actually 99% full. */
+function maybeSlimWritesForCtx(msgs: ApiMessage[], ctxSize: number): void {
+  if (!ctxShouldCompact(estimateTokens(msgs), ctxSize)) return
+  slimCompletedWriteToolCalls(msgs)
 }
 
 /** Drop bulky write/patch payloads from history so we don't compact after every file. */
@@ -2486,8 +2485,8 @@ export async function runAgentTurn(params: {
     stacks
   )
 
-  // Only compact before the first call if we are already near the hard ceiling.
-  slimCompletedWriteToolCalls(apiMessages)
+  // Compact write bodies / history only at 99% ctx — never after every file.
+  maybeSlimWritesForCtx(apiMessages, ctxSize)
   if (shouldCompactForOverflow(apiMessages, ctxSize)) {
     const beforeTok = estimateTokens(apiMessages)
     messages.push({
@@ -3101,6 +3100,20 @@ export async function runAgentTurn(params: {
   let lastNoToolFingerprint = ''
   let proseStutterHits = 0
 
+  const pinFallbackCloserIfNeeded = (): void => {
+    if (lastClosingText.trim()) {
+      ensureClosingMessage(messages, userMessageId, lastClosingText)
+      return
+    }
+    const closer = fallbackWorkDoneCloser({
+      lang: uiLang,
+      paths: [...turnFileChanges.keys()],
+      previewOpened: htmlPreviewOpened
+    })
+    lastClosingText = closer
+    ensureClosingMessage(messages, userMessageId, closer)
+  }
+
   for (let round = 0; round < maxRounds; round++) {
     if (params.signal?.aborted) return finishStopped()
     if (forceEndTurn) {
@@ -3113,6 +3126,7 @@ export async function runAgentTurn(params: {
       if (todoSteps.length > 0) {
         paintTodo(todoSteps, { afterId: thinkBubbleId ?? undefined })
       }
+      pinFallbackCloserIfNeeded()
       params.onUpdate([...messages])
       return finishWithTiming(messages)
     }
@@ -3124,8 +3138,7 @@ export async function runAgentTurn(params: {
     })
     clearPlanningRows(messages)
 
-    // Compact ONLY when truly near ctx — never after every successful file write.
-    slimCompletedWriteToolCalls(apiMessages)
+    maybeSlimWritesForCtx(apiMessages, ctxSize)
     if (round > 0 && shouldCompactForOverflow(apiMessages, ctxSize)) {
       const beforeTok = estimateTokens(apiMessages)
       const compacted = await compactApiMessages(
@@ -5402,7 +5415,7 @@ export async function runAgentTurn(params: {
           tool_call_id: call.id,
           content
         })
-        slimCompletedWriteToolCalls(apiMessages)
+        maybeSlimWritesForCtx(apiMessages, ctxSize)
         params.onUpdate([...messages])
         // Do not auto-open every edited/created file — agents can touch hundreds of paths.
         // Users open paths from chat file chips / explorer when they want a tab.
@@ -5683,6 +5696,7 @@ export async function runAgentTurn(params: {
           }
           if (alreadyWarned) {
             forceEndTurn = true
+            pinFallbackCloserIfNeeded()
             params.onUpdate([...messages])
             return finishWithTiming(messages)
           }
@@ -6106,6 +6120,13 @@ export async function runAgentTurn(params: {
 
     if (viteWorkDone && lastClosingText.trim()) {
       ensureClosingMessage(messages, userMessageId, lastClosingText)
+      params.onUpdate([...messages])
+      return finishWithTiming(messages)
+    }
+
+    if (viteWorkDone && (concludeAsked || settledStopAsked)) {
+      if (closerVisible.length >= 48) lastClosingText = closerVisible
+      pinFallbackCloserIfNeeded()
       params.onUpdate([...messages])
       return finishWithTiming(messages)
     }

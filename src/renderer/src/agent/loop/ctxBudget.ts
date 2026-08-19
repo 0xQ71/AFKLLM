@@ -4,6 +4,8 @@
  */
 
 export const AGENT_MAX_TOKENS = 8192
+/** Compact history only when the prompt estimate fills this fraction of ctx. */
+export const CTX_COMPACT_RATIO = 0.99
 const COMPLETION_CAP = 4096
 const COMPLETION_FLOOR = 256
 const COMPLETION_RESERVE = 256
@@ -19,4 +21,14 @@ export function maxTokensForAgent(ctxSize: number, promptEst: number): number {
   const room = ctx - prompt - COMPLETION_RESERVE
   if (room < COMPLETION_FLOOR) return COMPLETION_FLOOR
   return Math.min(COMPLETION_CAP, AGENT_MAX_TOKENS, room)
+}
+
+export function compactTokenThreshold(ctxSize: number): number {
+  const ctx = ctxSize > 0 ? ctxSize : AGENT_MAX_TOKENS
+  return Math.max(COMPLETION_FLOOR, Math.floor(ctx * CTX_COMPACT_RATIO))
+}
+
+/** True only when estimated prompt tokens occupy ≥99% of the model ctx. */
+export function shouldCompactForOverflow(estTokens: number, ctxSize: number): boolean {
+  return estTokens >= compactTokenThreshold(ctxSize)
 }

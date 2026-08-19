@@ -150,7 +150,7 @@ import {
   laterSuccessAfterFail,
   type StepEvidence
 } from '../src/renderer/src/agent/loop/evidence'
-import { honestClosingNote } from '../src/renderer/src/agent/loop/report'
+import { fallbackWorkDoneCloser, honestClosingNote } from '../src/renderer/src/agent/loop/report'
 import {
   formatI18nSanityHint,
   formatI18nCloserWhy,
@@ -181,7 +181,11 @@ import {
   shouldRefuseLandingRewrite,
   shouldRequireWriteFileForApply
 } from '../src/renderer/src/agent/loop/landingWriteCap'
-import { maxTokensForAgent } from '../src/renderer/src/agent/loop/ctxBudget'
+import {
+  compactTokenThreshold,
+  maxTokensForAgent,
+  shouldCompactForOverflow
+} from '../src/renderer/src/agent/loop/ctxBudget'
 import { formatEditSanityHint, navLooksUnstyled, htmlJsHasThemeControl, htmlCssLayoutMismatch, inlineSvgLooksUnsized, formatLandingCssContractHint, extractCssClassNames, unboundJsxClickHandlers, viteHtmlEntryMismatch, jsxCssClassMismatch, jsxMissingCssImports, viteReactHtmlLooksLikePageDump } from '../src/renderer/src/agent/loop/editSanity'
 import { stubWriteFileArgs } from '../src/renderer/src/agent/loop/compactWrites'
 import { formatSurgicalFollowUpHint, isHtmlOnlyStacks } from '../src/renderer/src/agent/loop/prompts'
@@ -2587,6 +2591,19 @@ describe('honest evidence and truncation helpers', () => {
     assert.equal(note, null)
   })
 
+  it('fallbackWorkDoneCloser is a visible RU closer with files and preview', () => {
+    const closer = fallbackWorkDoneCloser({
+      lang: 'ru',
+      paths: ['package.json', 'src\\App.jsx'],
+      previewOpened: true
+    })
+    assert.match(closer, /Файлы:/)
+    assert.match(closer, /src\/App\.jsx/)
+    assert.match(closer, /Превью открыто в приложении/)
+    assert.ok(closer.length >= 48)
+    assert.equal(preferUserFacingCloser(closer, 'ru'), closer)
+  })
+
   it('truncationGuardMessage fires below 70% and respects allow_full_rewrite', () => {
     const msg = truncationGuardMessage({
       relativePath: 'index.html',
@@ -3010,6 +3027,15 @@ describe('landing write cap', () => {
 })
 
 describe('Gemma 8k harness', () => {
+  it('history compact waits for 99% of real ctx, not ~8k of a 131k window', () => {
+    assert.equal(shouldCompactForOverflow(8_000, 131_072), false)
+    assert.equal(shouldCompactForOverflow(8_000, 8_192), false)
+    assert.equal(compactTokenThreshold(131_072), Math.floor(131_072 * 0.99))
+    assert.equal(shouldCompactForOverflow(compactTokenThreshold(131_072), 131_072), true)
+    assert.equal(shouldCompactForOverflow(compactTokenThreshold(8_192) - 1, 8_192), false)
+    assert.equal(shouldCompactForOverflow(compactTokenThreshold(8_192), 8_192), true)
+  })
+
   it('maxTokensForAgent uses leftover ctx, not another 8192', () => {
     const n = maxTokensForAgent(8192, 5500)
     assert.equal(n, 8192 - 5500 - 256)

@@ -33,3 +33,29 @@ export function honestClosingNote(opts: {
   }
   return null
 }
+
+/** Host-authored closer when preview/files succeeded but the model never wrote one. */
+export function fallbackWorkDoneCloser(opts: {
+  lang: 'ru' | string
+  paths: string[]
+  previewOpened: boolean
+}): string {
+  const ru = opts.lang === 'ru'
+  const files = opts.paths
+    .map((p) => p.replace(/\\/g, '/'))
+    .filter(Boolean)
+    .slice(0, 12)
+  const fileBit = files.length
+    ? ru
+      ? `Файлы: ${files.join(', ')}.`
+      : `Files: ${files.join(', ')}.`
+    : ru
+      ? 'Файлы записаны.'
+      : 'Files were written.'
+  const previewBit = opts.previewOpened
+    ? ru
+      ? ' Превью открыто в приложении.'
+      : ' Preview is open in the app.'
+    : ''
+  return `${fileBit}${previewBit}`.trim()
+}
