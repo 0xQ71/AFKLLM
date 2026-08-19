@@ -120,7 +120,21 @@ export function looksLikeDevOrPreviewCommand(command: string): boolean {
 export function shellResultOpenedPreview(content: string | undefined): boolean {
   const c = content ?? ''
   if (/PREVIEW_URL\s*:|PREVIEW_OK|opened in AFKLLM Browser/i.test(c)) return true
-  return /Local:\s*https?:\/\/(?:127\.0\.0\.1|localhost):\d+/i.test(c) && /exit_code\s*=\s*0/i.test(c)
+  return /Local:\s*https?:\/\/(?:127\.0\.0\.1|localhost):\d+/i.test(c)
+}
+
+/** Successful npm run dev / Vite Local: — even if persist chip omitted PREVIEW_URL. */
+export function markPreviewFromShell(opts: {
+  command?: string
+  content?: string
+  ok?: boolean
+}): boolean {
+  const cmd = opts.command ?? ''
+  const content = opts.content ?? ''
+  if (shellResultOpenedPreview(content)) return true
+  if (!looksLikeDevOrPreviewCommand(cmd)) return false
+  if (opts.ok) return true
+  return /Local:\s*https?:\/\/(?:127\.0\.0\.1|localhost):\d+/i.test(content)
 }
 
 export type ViteReactScaffoldId =

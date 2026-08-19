@@ -117,6 +117,52 @@ export function isVisibleChatMessageId(id: string): boolean {
   return id !== THREAD_SUMMARY_MSG_ID
 }
 
+/** Host-pinned turn closer — must survive persist races. */
+export function isAgentClosingMessageId(id: string | undefined): boolean {
+  return Boolean(id && id.startsWith('agent-closing-'))
+}
+
+/** Closer is prose, never a live shell/write chip. */
+export function withoutCloserToolChrome<T extends PersistedChatMessage>(m: T): T {
+  if (!isAgentClosingMessageId(m.id)) return m
+  const { toolName: _t, filePath: _f, codePreview: _c, activity: _a, ...rest } = m
+  return rest as T
+}
+
+/** Host closer belongs immediately before files_changed (or at the end). */
+export function relocateAgentCloser<T extends { id: string; toolName?: string }>(
+  msgs: T[],
+  closerId: string
+): T[] {
+  const idx = msgs.findIndex((m) => m.id === closerId)
+  if (idx < 0) return msgs
+  const [closer] = msgs.splice(idx, 1)
+  if (!closer) return msgs
+  const filesIdx = msgs.findIndex((m) => m.toolName === '__files_changed__')
+  if (filesIdx >= 0) msgs.splice(filesIdx, 0, closer)
+  else msgs.push(closer)
+  return msgs
+}
+
+/**
+ * A later persist of the same turn (title freeze, debounce) must not drop
+ * the host closer and leave only __files_changed__.
+ */
+export function mergePersistedKeepingCloser(
+  prev: PersistedChatMessage[],
+  next: PersistedChatMessage[]
+): PersistedChatMessage[] {
+  const closerRaw = [...prev].reverse().find((m) => isAgentClosingMessageId(m.id))
+  if (!closerRaw) return next
+  if (next.some((m) => isAgentClosingMessageId(m.id))) return next
+  const closer = withoutCloserToolChrome(closerRaw)
+  const out = [...next]
+  const filesIdx = out.findIndex((m) => m.toolName === '__files_changed__')
+  if (filesIdx >= 0) out.splice(filesIdx, 0, closer)
+  else out.push(closer)
+  return out
+}
+
 /** Also used by smoke tests. */
 export function sanitizePersistedMessages(
   msgs: PersistedChatMessage[]
@@ -127,7 +173,7 @@ export function sanitizePersistedMessages(
     if (!m || typeof m !== 'object') continue
     if (!m.id || !m.role || typeof m.content !== 'string') continue
     // agent-checklist / agent-todo / agent-plan are kept (live plan stages)
-    const cleaned: PersistedChatMessage = {
+    const cleaned: PersistedChatMessage = withoutCloserToolChrome({
       id: String(m.id),
       role: m.role,
       content: m.content.slice(0, CHAT_MAX_CONTENT_CHARS),
@@ -135,8 +181,9 @@ export function sanitizePersistedMessages(
       ...(m.filePath ? { filePath: String(m.filePath) } : {}),
       ...(typeof m.codePreview === 'string' && m.codePreview.trim()
         ? { codePreview: m.codePreview.slice(0, 4000) }
-        : {})
-    }
+        : {}),
+      ...(m.activity ? { activity: m.activity } : {})
+    })
     if (Array.isArray(m.images) && m.images.length > 0) {
       cleaned.images = m.images
         .filter(
@@ -183,7 +230,7 @@ export function sanitizePersistedMessages(
     }
     const stats = sanitizeStats(m.stats)
     if (stats) cleaned.stats = stats
-    if (m.activity && typeof m.activity === 'object') {
+    if (!isAgentClosingMessageId(cleaned.id) && m.activity && typeof m.activity === 'object') {
       const a = m.activity as PersistedChatMessage['activity']
       if (
         a &&

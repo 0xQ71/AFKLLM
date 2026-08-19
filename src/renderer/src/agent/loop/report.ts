@@ -34,6 +34,24 @@ export function honestClosingNote(opts: {
   return null
 }
 
+export function closerMentionsPreview(text: string): boolean {
+  return /превью\s+открыт|preview is open in the app/i.test(text ?? '')
+}
+
+/** Mid-turn "next I will npm install / run dev" — not a user-facing closer. */
+export function isNextActionNarration(text: string): boolean {
+  const t = (text ?? '').trim()
+  if (!t) return false
+  return (
+    /now I (need to|will|should) (run|start|call|execute|write)|let me (start|run|call|write)|I(?:['’]ll| will) (now )?(run|start)|going to run/i.test(
+      t
+    ) ||
+    /теперь запускаю|сейчас запущу|сейчас запускаю|осталось запустить|сейчас вызову|начну с npm|запускаю (npm|vite|dev[- ]сервер)/i.test(
+      t
+    )
+  )
+}
+
 /** Host-authored closer when preview/files succeeded but the model never wrote one. */
 export function fallbackWorkDoneCloser(opts: {
   lang: 'ru' | string
@@ -54,8 +72,30 @@ export function fallbackWorkDoneCloser(opts: {
       : 'Files were written.'
   const previewBit = opts.previewOpened
     ? ru
-      ? ' Превью открыто в приложении.'
-      : ' Preview is open in the app.'
-    : ''
+      ? ' Превью открыто в приложении — вкладка Browser (npm run dev).'
+      : ' Preview is open in the app Browser tab (npm run dev).'
+    : ru
+      ? ' Можно открыть превью через npm run dev.'
+      : ' Open the preview with npm run dev.'
   return `${fileBit}${previewBit}`.trim()
+}
+
+/**
+ * Prefer a real model closer; if it is status chatter or omits the open preview,
+ * replace it with the host fallback so the chat cannot end on files_changed only.
+ */
+export function resolveTurnCloser(opts: {
+  lastClosingText: string
+  lang: 'ru' | string
+  paths: string[]
+  previewOpened: boolean
+}): string {
+  const existing = (opts.lastClosingText ?? '').trim()
+  const usable =
+    existing.length >= 48 &&
+    !/^[↻⏹]/.test(existing) &&
+    !isNextActionNarration(existing) &&
+    (!opts.previewOpened || closerMentionsPreview(existing))
+  if (usable) return existing
+  return fallbackWorkDoneCloser(opts)
 }

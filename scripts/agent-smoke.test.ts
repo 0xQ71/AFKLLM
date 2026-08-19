@@ -126,6 +126,9 @@ import {
   pickChatTitle,
   sanitizeModelChatTitle,
   sanitizePersistedMessages,
+  mergePersistedKeepingCloser,
+  isAgentClosingMessageId,
+  relocateAgentCloser,
   isReusableEmptySession,
   userAskedForLanding,
   welcomeMessageForLang,
@@ -150,7 +153,7 @@ import {
   laterSuccessAfterFail,
   type StepEvidence
 } from '../src/renderer/src/agent/loop/evidence'
-import { fallbackWorkDoneCloser, honestClosingNote } from '../src/renderer/src/agent/loop/report'
+import { fallbackWorkDoneCloser, honestClosingNote, resolveTurnCloser, closerMentionsPreview, isNextActionNarration } from '../src/renderer/src/agent/loop/report'
 import {
   formatI18nSanityHint,
   formatI18nCloserWhy,
@@ -173,6 +176,7 @@ import {
   userAskedViteReactPreview,
   looksLikeDevOrPreviewCommand,
   shellResultOpenedPreview,
+  markPreviewFromShell,
   collectPathsFromTreeText,
   viteReactScaffoldMissing,
   formatViteReactScaffoldHint,
@@ -186,7 +190,7 @@ import {
   maxTokensForAgent,
   shouldCompactForOverflow
 } from '../src/renderer/src/agent/loop/ctxBudget'
-import { formatEditSanityHint, navLooksUnstyled, htmlJsHasThemeControl, htmlCssLayoutMismatch, inlineSvgLooksUnsized, formatLandingCssContractHint, extractCssClassNames, unboundJsxClickHandlers, viteHtmlEntryMismatch, jsxCssClassMismatch, jsxMissingCssImports, viteReactHtmlLooksLikePageDump } from '../src/renderer/src/agent/loop/editSanity'
+import { formatEditSanityHint, navLooksUnstyled, htmlJsHasThemeControl, htmlCssLayoutMismatch, inlineSvgLooksUnsized, formatLandingCssContractHint, extractCssClassNames, unboundJsxClickHandlers, viteHtmlEntryMismatch, jsxCssClassMismatch, jsxMissingCssImports, viteReactHtmlLooksLikePageDump, jsxNestsHtmlRootId, jsxUsesEmojiAsSvgFill, jsxTeleportsControlOffscreen } from '../src/renderer/src/agent/loop/editSanity'
 import { stubWriteFileArgs } from '../src/renderer/src/agent/loop/compactWrites'
 import { formatSurgicalFollowUpHint, isHtmlOnlyStacks } from '../src/renderer/src/agent/loop/prompts'
 import { truncationGuardMessage, isWholeFileSearchBlock } from '../src/shared/writeThresholds'
@@ -606,6 +610,91 @@ describe('sanitizePersistedMessages', () => {
     const ids = out.map((m) => m.id)
     assert.ok(ids.includes(THREAD_SUMMARY_MSG_ID))
     assert.equal(ids.indexOf(THREAD_SUMMARY_MSG_ID), ids.indexOf('welcome') + 1)
+  })
+
+  it('mergePersistedKeepingCloser inserts host closer before files_changed', () => {
+    const closer: PersistedChatMessage = {
+      id: 'agent-closing-u1',
+      role: 'assistant',
+      content: 'Файлы: src/App.jsx. Превью открыто в приложении — вкладка Browser (npm run dev).'
+    }
+    const files: PersistedChatMessage = {
+      id: 'fc1',
+      role: 'assistant',
+      toolName: '__files_changed__',
+      content: '{"files":[]}'
+    }
+    const prev = [
+      { id: 'welcome', role: 'assistant', content: 'hi' },
+      { id: 'u1', role: 'user', content: 'go' },
+      closer,
+      files
+    ]
+    const stale = [
+      { id: 'welcome', role: 'assistant', content: 'hi' },
+      { id: 'u1', role: 'user', content: 'go' },
+      files
+    ]
+    const merged = mergePersistedKeepingCloser(prev, stale)
+    const ids = merged.map((m) => m.id)
+    assert.ok(isAgentClosingMessageId(closer.id))
+    assert.equal(ids.indexOf('agent-closing-u1'), ids.indexOf('fc1') - 1)
+    assert.equal(
+      mergePersistedKeepingCloser(stale, stale).some((m) => isAgentClosingMessageId(m.id)),
+      false
+    )
+  })
+
+  it('strips shell chrome off a host closer on persist', () => {
+    const out = sanitizePersistedMessages([
+      { id: 'welcome', role: 'assistant', content: 'hi' },
+      {
+        id: 'agent-closing-u1',
+        role: 'assistant',
+        content: 'Файлы: src/App.jsx. Превью открыто в приложении — вкладка Browser (npm run dev).',
+        toolName: 'execute_terminal_command',
+        codePreview: 'npm run dev',
+        activity: {
+          kind: 'shell',
+          verb: 'Running',
+          status: 'running',
+          command: 'npm run dev'
+        }
+      }
+    ])
+    const closer = out.find((m) => m.id === 'agent-closing-u1')
+    assert.equal(closer?.toolName, undefined)
+    assert.equal(closer?.codePreview, undefined)
+    assert.equal(closer?.activity, undefined)
+    assert.match(closer?.content ?? '', /Превью открыто/)
+    const merged = mergePersistedKeepingCloser(
+      [
+        {
+          id: 'agent-closing-u1',
+          role: 'assistant',
+          content: 'Превью открыто в приложении — вкладка Browser.',
+          toolName: 'execute_terminal_command'
+        }
+      ],
+      [{ id: 'fc1', role: 'assistant', toolName: '__files_changed__', content: '{}' }]
+    )
+    assert.equal(merged[0]?.toolName, undefined)
+  })
+
+  it('relocateAgentCloser moves a mid-thread closer to just before files_changed', () => {
+    const msgs: PersistedChatMessage[] = [
+      { id: 'u1', role: 'user', content: 'go' },
+      {
+        id: 'agent-closing-u1',
+        role: 'assistant',
+        content: 'Превью открыто в приложении — вкладка Browser.'
+      },
+      { id: 'w1', role: 'assistant', content: 'Edited App.jsx', toolName: 'write_file' },
+      { id: 'fc1', role: 'assistant', toolName: '__files_changed__', content: '{}' }
+    ]
+    relocateAgentCloser(msgs, 'agent-closing-u1')
+    const ids = msgs.map((m) => m.id)
+    assert.deepEqual(ids, ['u1', 'w1', 'agent-closing-u1', 'fc1'])
   })
 
   it('keeps agent-plan and agent-checklist bubbles', () => {
@@ -2600,8 +2689,48 @@ describe('honest evidence and truncation helpers', () => {
     assert.match(closer, /Файлы:/)
     assert.match(closer, /src\/App\.jsx/)
     assert.match(closer, /Превью открыто в приложении/)
-    assert.ok(closer.length >= 48)
+    assert.ok(closer.length >= 80)
     assert.equal(preferUserFacingCloser(closer, 'ru'), closer)
+    assert.equal(isFalseSuccessProse(closer), false)
+    const poisoned = resolveTurnCloser({
+      lastClosingText: 'Зависимости установлены успешно. Теперь запускаю npm run dev.',
+      lang: 'ru',
+      paths: ['package.json', 'src/App.jsx'],
+      previewOpened: true
+    })
+    assert.equal(closerMentionsPreview(poisoned), true)
+    assert.match(poisoned, /src\/App\.jsx/)
+    assert.ok(poisoned.length >= 80)
+  })
+
+  it('next-action narration is not a usable closer', () => {
+    assert.equal(
+      isNextActionNarration(
+        'npm install succeeded. Now I need to run npm run dev to start the Vite dev server.'
+      ),
+      true
+    )
+    assert.equal(
+      isNextActionNarration(
+        'All source files are done. Let me start with npm install.\nВсе файлы созданы. Теперь запускаю npm install и dev-сервер.'
+      ),
+      true
+    )
+    assert.equal(
+      isNextActionNarration(
+        'Файлы: src/App.jsx. Превью открыто в приложении — вкладка Browser (npm run dev).'
+      ),
+      false
+    )
+    const poisoned = resolveTurnCloser({
+      lastClosingText:
+        'npm install succeeded. Now I need to run npm run dev to start the Vite dev server.',
+      lang: 'ru',
+      paths: ['src/App.jsx'],
+      previewOpened: false
+    })
+    assert.equal(isNextActionNarration(poisoned), false)
+    assert.match(poisoned, /Файлы:/)
   })
 
   it('truncationGuardMessage fires below 70% and respects allow_full_rewrite', () => {
@@ -3112,6 +3241,38 @@ describe('edit sanity + html-only stacks', () => {
     )
   })
 
+  it('does not treat PascalCase FishingGame as an unbound click handler', () => {
+    const src = `const FishingGame = () => {
+  const handleCast = () => {}
+  return <button onClick={handleCast}>Забросить</button>
+}
+export default FishingGame`
+    assert.deepEqual(unboundJsxClickHandlers(src), [])
+    assert.equal(formatEditSanityHint({ path: 'src/App.jsx', content: src, js: src }), null)
+  })
+
+  it('flags unplayable fishing JSX: nested #root, emoji SVG fill, bobber teleported offscreen', () => {
+    const src = `export default function App() {
+  const [bobberPos, setBobberPos] = useState({ x: '50%', y: '75%' })
+  const handleBobberClick = () => setBobberPos({ x: '-100%', y: '-100%' })
+  return (
+    <div id="root">
+      <svg><path fill={f.emoji} /></svg>
+      <div className="hook-bobber" onClick={handleBobberClick} />
+    </div>
+  )
+}`
+    assert.equal(jsxNestsHtmlRootId(src), true)
+    assert.equal(jsxUsesEmojiAsSvgFill(src), true)
+    assert.equal(jsxTeleportsControlOffscreen(src), true)
+    const hint = formatEditSanityHint({ path: 'src/App.jsx', content: src, js: src })
+    assert.ok(hint)
+    assert.match(hint!, /EDIT_SANITY/)
+    assert.match(hint!, /id="root"/)
+    assert.match(hint!, /emoji/)
+    assert.match(hint!, /-100%/)
+  })
+
   it('flags Vite script src vs App.jsx and JSX/CSS class mismatch', () => {
     const html =
       '<!DOCTYPE html><html><head></head><body>' +
@@ -3215,7 +3376,27 @@ describe('edit sanity + html-only stacks', () => {
       ),
       true
     )
+    assert.equal(
+      shellResultOpenedPreview('  ➜  Local:   http://127.0.0.1:4173/\n'),
+      true
+    )
     assert.equal(shellResultOpenedPreview('npm install\nexit_code=0'), false)
+    assert.equal(
+      markPreviewFromShell({
+        command: 'npm run dev',
+        content: 'Выполнил npm run dev',
+        ok: true
+      }),
+      true
+    )
+    assert.equal(
+      markPreviewFromShell({
+        command: 'npm install',
+        content: 'added 65 packages\nexit_code=0',
+        ok: true
+      }),
+      false
+    )
     assert.deepEqual(
       jsxMissingCssImports("import './App.css'\nexport default function App(){return null}\n", ''),
       []

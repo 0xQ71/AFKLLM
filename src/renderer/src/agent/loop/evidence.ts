@@ -127,7 +127,13 @@ export function evidenceSupportsStep(stepText: string, log: StepEvidence[]): boo
       )
     )
   }
-  if (/сборк|build|compile|javac|mvn|gradle|cmake|cargo build|go build|dotnet build/i.test(t)) {
+  // "скриптами для dev и build" on a package.json row is NOT cargo/mvn compile.
+  if (
+    !/package\.json/i.test(t) &&
+    /сборк|compile|javac|mvn |gradle |cmake|cargo build|go build|dotnet build|npm run build/i.test(
+      t
+    )
+  ) {
     return okShell.some((e) =>
       /build|compile|javac|mvn|gradle|cmake|cargo|go build|dotnet/i.test(e.command ?? '')
     )

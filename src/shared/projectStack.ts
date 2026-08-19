@@ -171,17 +171,24 @@ export function detectStacks(
   return hit
 }
 
+function nodeRunCommand(scripts: Record<string, string>): string | undefined {
+  if (String(scripts.dev ?? '').trim()) return 'npm run dev'
+  if (String(scripts.start ?? '').trim()) return 'npm start'
+  return undefined
+}
+
 function refineNodeStack(base: ProjectStack, pkgRaw: string | null): ProjectStack {
   if (!pkgRaw) return base
   try {
     const pkg = JSON.parse(pkgRaw) as { scripts?: Record<string, string> }
     const scripts = pkg.scripts ?? {}
+    const run = nodeRunCommand(scripts)
     return {
       ...base,
       test: scripts.test ? 'npm test' : base.test,
       lint: scripts.lint ? 'npm run lint' : base.lint,
       build: scripts.build ? 'npm run build' : base.build,
-      run: scripts.start ? 'npm start' : base.run
+      ...(run ? { run } : { run: undefined })
     }
   } catch {
     return base

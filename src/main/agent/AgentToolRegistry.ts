@@ -1,4 +1,4 @@
-import { promises as fs } from 'node:fs'
+import { promises as fs, existsSync } from 'node:fs'
 import { dirname, join, normalize, relative, resolve, sep } from 'node:path'
 import { spawn } from 'node:child_process'
 import type { AgentToolCall, AgentToolName, AgentToolResult } from '../../shared/types'
@@ -55,7 +55,8 @@ import {
   pathToFileUrl,
   rewriteLocalDevServerCommand,
   rewriteViteScaffoldCommand,
-  looksLikeViteScaffoldCommand
+  looksLikeViteScaffoldCommand,
+  devCommandNeedsNodeModules
 } from '../../shared/localPreview'
 import { contentLooksStructurallyComplete, contentLooksLikeSourceStub, formatStubOnDiskHint, looksLikeEmptyOrStubWriteContent, formatEmptyWriteError } from '../../shared/completeness'
 import { formatWriteFileRequiredError } from '../../shared/writeFileRequired'
@@ -1502,6 +1503,21 @@ export class AgentToolRegistry {
       !cwdRel || cwdRel === '.' || cwdRel === './'
         ? this.projectRoot
         : this.safeResolve(cwdRel)
+
+    if (
+      (devCommandNeedsNodeModules(command) || devCommandNeedsNodeModules(rawCommand)) &&
+      !existsSync(join(cwd, 'node_modules'))
+    ) {
+      return {
+        id: '',
+        name: 'execute_terminal_command',
+        ok: false,
+        content: '',
+        error:
+          'NODE_MODULES_MISSING: node_modules is not on disk. Run npm install once, then npm run dev. ' +
+          'Do not retry npm run dev until install succeeds (exit_code=0).'
+      }
+    }
 
     if (this.confirmTerminal) {
       const allowed = await this.confirmTerminal(command, cwd)

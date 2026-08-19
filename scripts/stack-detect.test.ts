@@ -56,6 +56,31 @@ describe('stack detect', () => {
     assert.equal(commandForMode(go!, 'test'), 'go test ./...')
   })
 
+  it('Vite package.json run is npm run dev, not npm start', () => {
+    const vitePkg = JSON.stringify({
+      scripts: { dev: 'vite', build: 'vite build' }
+    })
+    const [node] = detectStacks(['package.json'], { packageJson: vitePkg })
+    assert.equal(commandForMode(node!, 'run'), 'npm run dev')
+    assert.equal(commandForMode(node!, 'build'), 'npm run build')
+  })
+
+  it('Node package with only start keeps npm start', () => {
+    const [node] = detectStacks(['package.json'], {
+      packageJson: JSON.stringify({ scripts: { start: 'node server.js' } })
+    })
+    assert.equal(commandForMode(node!, 'run'), 'npm start')
+  })
+
+  it('prefers npm run dev when both start and dev exist', () => {
+    const [node] = detectStacks(['package.json'], {
+      packageJson: JSON.stringify({
+        scripts: { start: 'node server.js', dev: 'vite' }
+      })
+    })
+    assert.equal(commandForMode(node!, 'run'), 'npm run dev')
+  })
+
   it('unknown stack prompt does not mention Bootstrap', () => {
     const text = formatStackPromptSection([])
     assert.match(text, /unknown/i)
@@ -476,6 +501,26 @@ describe('evidence-gated plan', () => {
       evidenceSupportsStep('Запустить npm run dev и проверить работу игры.', log),
       true
     )
+  })
+
+  it('package.json row with dev/build scripts ticks on write, not compile', () => {
+    const log = recordEvidence(
+      [],
+      evidenceFromTool({
+        name: 'write_file',
+        ok: true,
+        path: 'package.json',
+        content: '{"scripts":{"dev":"vite","build":"vite build"}}'
+      })!
+    )
+    assert.equal(
+      evidenceSupportsStep(
+        'Создать package.json с зависимостями react, react-dom и vite, а также скриптами для dev и build.',
+        log
+      ),
+      true
+    )
+    assert.equal(evidenceSupportsStep('Собрать проект npm run build', log), false)
   })
 
   it('apply_diff closes a replace step; go mod does not close go run', () => {

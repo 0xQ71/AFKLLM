@@ -1272,6 +1272,7 @@ export function countOccurrencesCi(content: string, needle: string): number {
 export function isFalseSuccessProse(prose: string): boolean {
   const t = prose.trim()
   if (!t) return false
+  if (/превью\s+открыто в приложении|preview is open in the app/i.test(t)) return false
   return (
     /^(готово|сделано|done)[!.,:\s]/i.test(t) ||
     /все\s+упоминания\s+\w+\s+заменен/i.test(t) ||

@@ -354,6 +354,20 @@ export function looksLikeLocalPreviewHealthCheck(command: string): boolean {
   return /localhost|127\.0\.0\.1/i.test(c)
 }
 
+/** npm/pnpm/yarn/vite preview — needs node_modules; python http.server does not. */
+export function devCommandNeedsNodeModules(command: string): boolean {
+  const c = command ?? ''
+  if (!c.trim()) return false
+  if (/\bnpm\s+install\b/i.test(c) && !/\bnpm\s+run\s+/i.test(c)) return false
+  return (
+    /\bnpm\s+(run\s+)?(dev|start|preview)\b/i.test(c) ||
+    /\bpnpm\s+(run\s+)?(dev|start|preview)\b/i.test(c) ||
+    /\byarn\s+(run\s+)?(dev|start|preview)\b/i.test(c) ||
+    /\bnpx\s+vite\b/i.test(c) ||
+    /(?:^|[;&]\s*)vite\b/i.test(c)
+  )
+}
+
 /** Heuristic: command likely starts a local HTTP preview. */
 export function looksLikeLocalServerCommand(command: string): boolean {
   const c = command.trim()

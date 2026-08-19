@@ -9,7 +9,7 @@ import {
   formatSurgicalFollowUpHint,
   isHtmlOnlyStacks
 } from './loop/prompts'
-import { fallbackWorkDoneCloser, honestClosingNote } from './loop/report'
+import { honestClosingNote, isNextActionNarration, resolveTurnCloser } from './loop/report'
 import { type StepEvidence } from './loop/evidence'
 import { advanceTodosOnEvidence } from './loop/plan'
 import {
@@ -18,7 +18,7 @@ import {
   verifyAlreadyRan,
   shouldNudgeVerify
 } from './loop/verify'
-import { THREAD_SUMMARY_MSG_ID } from '../../../shared/chats'
+import { THREAD_SUMMARY_MSG_ID, isAgentClosingMessageId, relocateAgentCloser, withoutCloserToolChrome, type PersistedChatMessage } from '../../../shared/chats'
 import { visionReusesChatModel } from '../../../shared/visionDetect'
 import {
   DEFAULT_UI_LANGUAGE,
@@ -150,6 +150,7 @@ import {
   userAskedViteReactPreview,
   looksLikeDevOrPreviewCommand,
   shellResultOpenedPreview,
+  markPreviewFromShell,
   collectPathsFromTreeText,
   viteReactScaffoldMissing,
   formatViteReactScaffoldHint,
@@ -845,15 +846,15 @@ function closingMessageId(userMessageId: string): string {
 function looksLikeClosingSummary(text: string): boolean {
   const t = text.trim()
   if (t.length < 48 || /^↻ /.test(t) || /^⏹ /.test(t)) return false
+  if (isNextActionNarration(t)) return false
   if (hasThinkBlock(t) && !stripThinkBlocksLive(t).trim()) return false
   return (
     /что\s+изменил|как\s+проверить|what\s+changed|how\s+to\s+(verify|check)|file paths?|путь|paths?:/i.test(
       t
     ) ||
     /превью\s+открыт|preview\s+opened|открыт[оа]\s+в\s+(браузер|приложении|AFKLLM)/i.test(t) ||
-    /npm run dev|localhost:\d+|dev server|файл[аы]?\s+создан|created \d+ files|port \d{4}/i.test(
-      t
-    ) ||
+    (/localhost:\d+|dev server|файл[аы]?\s+создан|created \d+ files|port \d{4}/i.test(t) &&
+      !/now I need to|let me |запускаю/i.test(t)) ||
     (/^\s*[-*•\d]/m.test(t) &&
       /создан|измен|обнов|added|updated|edited|fixed|написан|готово|done\b/i.test(t))
   )
@@ -872,7 +873,40 @@ function isKeepableChatBubble(m: ChatMessage | undefined): boolean {
 
 /** Persist the turn closing summary so later turns cannot splice/overwrite it away. */
 function isClosingMessageId(id: string | undefined): boolean {
-  return Boolean(id && id.startsWith('agent-closing-'))
+  return isAgentClosingMessageId(id)
+}
+
+function persistableChatMessage(m: ChatMessage): PersistedChatMessage {
+  return withoutCloserToolChrome({
+    id: m.id,
+    role: m.role,
+    content: m.content ?? '',
+    ...(m.toolName ? { toolName: m.toolName } : {}),
+    ...(m.filePath ? { filePath: m.filePath } : {}),
+    ...(m.codePreview ? { codePreview: m.codePreview } : {}),
+    ...(m.images?.length ? { images: m.images } : {}),
+    ...(m.files?.length ? { files: m.files } : {}),
+    ...(m.stats ? { stats: m.stats } : {}),
+    ...(m.activity ? { activity: m.activity } : {})
+  })
+}
+
+function transcriptOpenedPreview(msgs: ChatMessage[]): boolean {
+  for (const m of msgs) {
+    if (m.toolName !== 'execute_terminal_command' && m.toolName !== 'verify_project') {
+      continue
+    }
+    if (
+      markPreviewFromShell({
+        command: m.activity?.command ?? '',
+        content: `${m.codePreview ?? ''}\n${m.content ?? ''}`,
+        ok: m.activity?.status !== 'error'
+      })
+    ) {
+      return true
+    }
+  }
+  return false
 }
 
 function ensureClosingMessage(
@@ -882,9 +916,9 @@ function ensureClosingMessage(
 ): void {
   const content = stripThinkBlocks(text).trim()
   if (!content || /^↻ /.test(content) || /^⏹ /.test(content)) return
-  if (isAgentChatNoise(content) && content.length < 80) return
+  const hostCloser = /превью\s+открыто в приложении|preview is open in the app/i.test(content)
+  if (!hostCloser && isAgentChatNoise(content) && content.length < 80) return
   const id = closingMessageId(userMessageId)
-  // Drop transient "writing summary…" status lines and duplicate plain bubbles.
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i]
     if (!m || m.role !== 'assistant' || m.toolName) continue
@@ -897,12 +931,12 @@ function ensureClosingMessage(
       messages.splice(i, 1)
     }
   }
-  const idx = messages.findIndex((m) => m.id === id)
-  if (idx >= 0) {
-    messages[idx] = { ...messages[idx]!, content, streaming: false }
-    return
-  }
-  messages.push({ id, role: 'assistant', content, streaming: false })
+  const bubble: ChatMessage = { id, role: 'assistant', content, streaming: false }
+  const existing = messages.findIndex((m) => m.id === id)
+  if (existing >= 0) messages.splice(existing, 1)
+  const filesIdx = messages.findIndex((m) => m.toolName === FILES_CHANGED_TOOL)
+  if (filesIdx >= 0) messages.splice(filesIdx, 0, bubble)
+  else messages.push(bubble)
 }
 
 /** Live plan card (model-authored <plan>). Place AFTER think, not before. */
@@ -2202,6 +2236,9 @@ export async function runAgentTurn(params: {
   const turnStartedAt = Date.now()
   const turnFileChanges = new Map<string, TurnFileChange>()
   const writtenOkPaths = new Set<string>()
+  let lastClosingText = ''
+  let mutatingEditOk = false
+  let htmlPreviewOpened = false
 
   const commitTurnCheckpoint = (): void => {
     if (!params.sessionId || isPlan) return
@@ -2223,12 +2260,27 @@ export async function runAgentTurn(params: {
         msgs[i] = { ...msgs[i]!, streaming: false }
       }
     }
-    if (lastClosingText.trim()) {
+    if (!htmlPreviewOpened && transcriptOpenedPreview(msgs)) {
+      htmlPreviewOpened = true
+    }
+    if (htmlPreviewOpened && (mutatingEditOk || turnFileChanges.size > 0)) {
+      lastClosingText = resolveTurnCloser({
+        lastClosingText,
+        lang: uiLang,
+        paths: [...turnFileChanges.keys()],
+        previewOpened: true
+      })
+      ensureClosingMessage(msgs, userMessageId, lastClosingText)
+    } else if (lastClosingText.trim()) {
       ensureClosingMessage(msgs, userMessageId, lastClosingText)
     }
+    relocateAgentCloser(msgs, closingMessageId(userMessageId))
     appendFilesChangedSummary(msgs, turnFileChanges)
     attachStatsToLastVisible(msgs, { turnElapsedMs: Date.now() - turnStartedAt })
     params.onUpdate([...msgs])
+    if (params.sessionId && !isPlan) {
+      void window.api.chats.updateMessages(params.sessionId, msgs.map(persistableChatMessage))
+    }
     commitTurnCheckpoint()
     return msgs
   }
@@ -2372,7 +2424,6 @@ export async function runAgentTurn(params: {
   let previewNudges = 0
   let sectionFillTried = true
   /** A mutating edit (write_file / apply_diff / apply_patch) succeeded this turn. */
-  let mutatingEditOk = false
   /** Last mutating edit failed (path / parse / apply) — used for honest failure summary. */
   let mutatingEditFailed = false
   let lastMutatingFailDetail = ''
@@ -2523,7 +2574,6 @@ export async function runAgentTurn(params: {
   let loopRecoveryWarned = false
   let concludeAsked = false
   let settledStopAsked = false
-  let lastClosingText = ''
   /** Nudge when model paints "writing…" then returns zero tools after think/plan. */
   let emptyToolNudges = 0
   /** Once the model emits <think> this turn, later tool rounds may skip re-thinking. */
@@ -2570,7 +2620,6 @@ export async function runAgentTurn(params: {
   /** Hard cap — model must not restart image gen mid-turn (even with a tweaked prompt). */
   let generateImageCalls = 0
     /** After first successful HTML preview open, block further Start-Process / open loops. */
-    let htmlPreviewOpened = false
     /** Keyed by path|start-end so a cache hit can never serve a different range. */
     const readFileCache = new Map<string, string>()
     /** Newest read per path — kept fuller than other tool results during compact. */
@@ -3101,11 +3150,8 @@ export async function runAgentTurn(params: {
   let proseStutterHits = 0
 
   const pinFallbackCloserIfNeeded = (): void => {
-    if (lastClosingText.trim()) {
-      ensureClosingMessage(messages, userMessageId, lastClosingText)
-      return
-    }
-    const closer = fallbackWorkDoneCloser({
+    const closer = resolveTurnCloser({
+      lastClosingText,
       lang: uiLang,
       paths: [...turnFileChanges.keys()],
       previewOpened: htmlPreviewOpened
@@ -3519,7 +3565,7 @@ export async function runAgentTurn(params: {
             const salvaged =
               stripped.trim() ||
               stripPlanBlock(promoteThinkOnlyAnswer(result.text || rawBubble)).trim()
-            if (salvaged && (concludeAsked || looksLikeClosingSummary(salvaged))) {
+            if (salvaged && (concludeAsked || settledStopAsked)) {
               lastClosingText = salvaged
               const thinkInner = extractThinkInner(rawBubble)
               if (thinkInner && thinkInner.trim().length >= 20) {
@@ -3530,25 +3576,18 @@ export async function runAgentTurn(params: {
                 }
                 ensureClosingMessage(messages, userMessageId, salvaged)
               } else {
-                const closeId = closingMessageId(userMessageId)
-                for (let i = messages.length - 1; i >= 0; i--) {
-                  if (i === sIdx) continue
-                  if (messages[i]?.id === closeId) messages.splice(i, 1)
-                  else if (
-                    /^↻\s*(Пишу заключение|Writing closing)/i.test(
-                      messages[i]?.content ?? ''
-                    )
-                  ) {
-                    messages.splice(i, 1)
-                  }
-                }
-                messages[sIdx] = {
-                  ...messages[sIdx]!,
-                  id: closeId,
-                  content: salvaged,
-                  streaming: false
+                ensureClosingMessage(messages, userMessageId, salvaged)
+                const leftover = messages.findIndex((m) => m.id === streamId)
+                if (
+                  leftover >= 0 &&
+                  !isClosingMessageId(messages[leftover]?.id) &&
+                  (messages[leftover]?.content ?? '').trim() === salvaged
+                ) {
+                  messages.splice(leftover, 1)
                 }
               }
+            } else if (salvaged && looksLikeClosingSummary(salvaged)) {
+              lastClosingText = salvaged
             }
           }
         }
@@ -4125,7 +4164,11 @@ export async function runAgentTurn(params: {
               arguments: args
             })
             syntheticResult = false
-            if (toolResult.ok && shellResultOpenedPreview(toolResult.content)) {
+            if (markPreviewFromShell({
+              command: String(args.command ?? ''),
+              content: toolResult.content,
+              ok: toolResult.ok
+            })) {
               htmlPreviewOpened = true
             }
           }
@@ -4742,11 +4785,18 @@ export async function runAgentTurn(params: {
             ranCliSmoke = true
           }
           if (
-            toolResult.ok &&
-            (isHtmlPreviewShell(cmd) || shellResultOpenedPreview(toolResult.content))
+            isHtmlPreviewShell(cmd) ||
+            markPreviewFromShell({
+              command: cmd,
+              content: toolResult.content,
+              ok: toolResult.ok
+            })
           ) {
             htmlPreviewOpened = true
           }
+        }
+        if (name === 'verify_project' && shellResultOpenedPreview(toolResult.content)) {
+          htmlPreviewOpened = true
         }
 
         // Track apply_patch / apply_diff failures → unlock overwrite after 2 fails.
@@ -5337,6 +5387,16 @@ export async function runAgentTurn(params: {
                 : messages[idx].editReview,
             diffStat: toolResult.diffStat ?? messages[idx].diffStat
           }
+          if (
+            name === 'execute_terminal_command' &&
+            markPreviewFromShell({
+              command: String(args.command ?? ''),
+              content,
+              ok: toolResult.ok
+            })
+          ) {
+            htmlPreviewOpened = true
+          }
 
           if (toolResult.ok && name === 'generate_image' && params.sessionId) {
             const outPath =
@@ -5439,27 +5499,13 @@ export async function runAgentTurn(params: {
 
       const workSettled =
         htmlPreviewOpened &&
-        mutatingEditOk &&
-        !mutatingEditFailed &&
-        !editSanityFailed &&
-        !i18nSanityFailed
-      if (workSettled && !settledStopAsked) {
+        mutatingEditOk
+      if (workSettled) {
         settledStopAsked = true
         concludeAsked = true
-        appendToolHint(
-          apiMessages,
-          uiLang === 'ru'
-            ? 'СТОП. Файлы записаны, превью уже открыто. Не вызывай Start-Process / get_diagnostics / патчи снова. Напиши краткое заключение на русском (что изменилось, пути) и закончи ход.'
-            : 'STOP. Files were written and the preview is already open. ' +
-              'Do NOT Start-Process again, do NOT get_diagnostics, do NOT patch more. ' +
-              'Write a short closing summary (what changed, paths) and end the turn.'
-        )
-        apiMessages = normalizeApiMessages(apiMessages)
+        pinFallbackCloserIfNeeded()
         params.onUpdate([...messages])
-        continue
-      }
-      if (workSettled && settledStopAsked) {
-        forceEndTurn = true
+        return finishWithTiming(messages)
       }
 
       // Hints on tool result — inserting `user` after `tool` breaks Devstral Jinja
@@ -6064,8 +6110,14 @@ export async function runAgentTurn(params: {
     const dropPrematureCloser = (): void => {
       for (let i = messages.length - 1; i >= 0; i--) {
         const m = messages[i]
-        if (!m || m.role !== 'assistant' || m.toolName) continue
-        if (isClosingMessageId(m.id) || isAgentTodoMessageId(m.id)) continue
+        if (!m || m.role !== 'assistant') continue
+        if (isAgentTodoMessageId(m.id)) continue
+        if (isClosingMessageId(m.id)) {
+          messages.splice(i, 1)
+          lastClosingText = ''
+          continue
+        }
+        if (m.toolName) continue
         if (/^↻ /.test(m.content ?? '') || /^⏹ /.test(m.content ?? '')) continue
         const visible = preferUserFacingCloser(m.content ?? '', uiLang)
         if (looksLikeClosingSummary(visible)) {
@@ -6107,24 +6159,7 @@ export async function runAgentTurn(params: {
       !mutatingEditFailed &&
       !editSanityFailed
 
-    if (
-      viteWorkDone &&
-      closerVisible.length >= 48 &&
-      looksLikeClosingSummary(closerVisible)
-    ) {
-      lastClosingText = closerVisible
-      ensureClosingMessage(messages, userMessageId, closerVisible)
-      params.onUpdate([...messages])
-      return finishWithTiming(messages)
-    }
-
-    if (viteWorkDone && lastClosingText.trim()) {
-      ensureClosingMessage(messages, userMessageId, lastClosingText)
-      params.onUpdate([...messages])
-      return finishWithTiming(messages)
-    }
-
-    if (viteWorkDone && (concludeAsked || settledStopAsked)) {
+    if (viteWorkDone) {
       if (closerVisible.length >= 48) lastClosingText = closerVisible
       pinFallbackCloserIfNeeded()
       params.onUpdate([...messages])
@@ -6335,7 +6370,7 @@ export async function runAgentTurn(params: {
       Boolean(lastHtmlWrite) && contentLooksStructurallyComplete(lastHtmlWrite)
     const fileWorkLeft = workLeft.filter((s) => isFileWorkPlanStep(s.text))
     const missingNamedFiles = fileWorkLeft.some((s) =>
-      /index\.html|readme|\.md\b|styles\.css|main\.js/i.test(s.text)
+      /index\.html|readme|\.md\b|styles\.css|main\.js|package\.json/i.test(s.text)
     )
 
     // Q&A / web_search: answer already in chat — never loop «Доделываю план» 3×.
@@ -6367,6 +6402,7 @@ export async function runAgentTurn(params: {
         lastClosingText = finalText.trim()
         ensureClosingMessage(messages, userMessageId, lastClosingText)
       }
+      if (htmlPreviewOpened && mutatingEditOk) pinFallbackCloserIfNeeded()
       params.onUpdate([...messages])
       return finishWithTiming(messages)
     }
@@ -6482,6 +6518,32 @@ export async function runAgentTurn(params: {
     ) {
       lastClosingText = finalText.trim()
       ensureClosingMessage(messages, userMessageId, lastClosingText)
+    }
+
+    if (
+      previewWanted &&
+      viteMissing.length === 0 &&
+      !htmlPreviewOpened &&
+      mutatingEditOk &&
+      previewNudges < 2 &&
+      round < maxRounds - 1
+    ) {
+      previewNudges++
+      dropPrematureCloser()
+      pushUserMessage(apiMessages, formatViteReactPreviewHint())
+      apiMessages = normalizeApiMessages(apiMessages)
+      pushStatusBubble(
+        messages,
+        uiLang === 'ru'
+          ? '↻ Файлы есть — запускаю dev-сервер и превью…'
+          : '↻ Files are on disk — starting dev server and preview…'
+      )
+      params.onUpdate([...messages])
+      continue
+    }
+
+    if (htmlPreviewOpened && mutatingEditOk && !mutatingEditFailed && !editSanityFailed) {
+      pinFallbackCloserIfNeeded()
     }
 
     if (todoSteps.length > 0 && todosAllDone(todoSteps)) {

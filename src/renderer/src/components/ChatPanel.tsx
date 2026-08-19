@@ -40,9 +40,11 @@ import {
   deriveChatTitle,
   isDefaultChatTitle,
   isVisibleChatMessageId,
+  isAgentClosingMessageId,
   isWelcomeChatMessage,
   pickChatTitle,
-  THREAD_SUMMARY_MSG_ID
+  THREAD_SUMMARY_MSG_ID,
+  withoutCloserToolChrome
 } from '../../../shared/chats'
 import { ComposerQueue, type QueuedFollowUp } from './ComposerQueue'
 import { EditReviewDiff } from './EditReviewDiff'
@@ -424,10 +426,15 @@ export function ChatPanel({
 
   useEffect(() => {
     return window.api.chats.onChanged((snap) => {
-      if (abortRef.current) {
-        // Don't clobber an in-flight turn; apply after it ends via persist/get.
+      if (abortRef.current || busyRef.current) {
         return
       }
+      const local = messagesRef.current
+      const localCloser = local.some((m) => isAgentClosingMessageId(m.id))
+      const sid = sessionIdRef.current
+      const incoming = snap.sessions.find((s) => s.id === sid)
+      const snapCloser = incoming?.messages.some((m) => isAgentClosingMessageId(m.id))
+      if (localCloser && !snapCloser) return
       setBusy(false)
       setPickerOpen(false)
       applySnapshot(snap)
@@ -532,13 +539,17 @@ export function ChatPanel({
 
   useEffect(() => {
     if (!sessionId) return
-    if (messages.some((m) => m.streaming || m.pending)) return
+    const hasCloser = messages.some((m) => isAgentClosingMessageId(m.id))
+    if (!hasCloser && messages.some((m) => m.streaming || m.pending)) return
     if (persistTimer.current) clearTimeout(persistTimer.current)
     persistTimer.current = setTimeout(() => {
       const id = sessionIdRef.current
       if (!id) return
+      const snapshot = messagesRef.current
+      const snapHasCloser = snapshot.some((m) => isAgentClosingMessageId(m.id))
+      if (!snapHasCloser && snapshot.some((m) => m.streaming || m.pending)) return
       void window.api.chats
-        .updateMessages(id, messages.map(toPersisted))
+        .updateMessages(id, snapshot.map(toPersisted))
         .then((snap) => {
           const list = snap.sessions
             .map(({ id: sid, title, createdAt, updatedAt }) => ({
@@ -552,7 +563,7 @@ export function ChatPanel({
           onSessionsChange?.(list, id)
         })
         .catch(console.error)
-    }, 400)
+    }, hasCloser ? 0 : 400)
     return () => {
       if (persistTimer.current) clearTimeout(persistTimer.current)
     }
@@ -1295,7 +1306,10 @@ export function ChatPanel({
                 </div>
               )
             }
-            const m = item.message
+            const raw = item.message
+            const m = isAgentClosingMessageId(raw.id)
+              ? { ...raw, toolName: undefined, activity: undefined, codePreview: undefined }
+              : raw
             return (
           <div key={m.id} className={messageRowClass(m)}>
             {m.toolName === FILES_CHANGED_TOOL ? (
@@ -1902,7 +1916,7 @@ function deriveThreadTitle(messages: ChatMessage[]): string {
 }
 
 function toPersisted(m: ChatMessage): PersistedChatMessage {
-  return {
+  return withoutCloserToolChrome({
     id: m.id,
     role: m.role,
     content: m.content ?? '',
@@ -1913,21 +1927,22 @@ function toPersisted(m: ChatMessage): PersistedChatMessage {
     ...(m.files?.length ? { files: m.files } : {}),
     ...(m.stats ? { stats: m.stats } : {}),
     ...(m.activity ? { activity: m.activity } : {})
-  }
+  })
 }
 
 function fromPersisted(m: PersistedChatMessage): ChatMessage {
-  const activity = sanitizeActivity(m.activity)
+  const cleaned = withoutCloserToolChrome(m)
+  const activity = sanitizeActivity(cleaned.activity)
   return {
-    id: m.id,
-    role: m.role,
-    content: m.content,
-    ...(m.toolName ? { toolName: m.toolName } : {}),
-    ...(m.filePath ? { filePath: m.filePath } : {}),
-    ...(m.codePreview ? { codePreview: m.codePreview } : {}),
-    ...(m.images?.length ? { images: m.images } : {}),
-    ...(m.files?.length ? { files: m.files } : {}),
-    ...(m.stats ? { stats: m.stats } : {}),
+    id: cleaned.id,
+    role: cleaned.role,
+    content: cleaned.content,
+    ...(cleaned.toolName ? { toolName: cleaned.toolName } : {}),
+    ...(cleaned.filePath ? { filePath: cleaned.filePath } : {}),
+    ...(cleaned.codePreview ? { codePreview: cleaned.codePreview } : {}),
+    ...(cleaned.images?.length ? { images: cleaned.images } : {}),
+    ...(cleaned.files?.length ? { files: cleaned.files } : {}),
+    ...(cleaned.stats ? { stats: cleaned.stats } : {}),
     ...(activity ? { activity } : {})
   }
 }
@@ -2434,7 +2449,12 @@ function buildComposerFeed(
   let i = 0
   while (i < messages.length) {
     const m = messages[i]!
-    if (!m.toolName || m.toolName === '__planning__' || m.toolName === FILES_CHANGED_TOOL) {
+    if (
+      !m.toolName ||
+      isAgentClosingMessageId(m.id) ||
+      m.toolName === '__planning__' ||
+      m.toolName === FILES_CHANGED_TOOL
+    ) {
       out.push({ type: 'message', message: m })
       i++
       continue

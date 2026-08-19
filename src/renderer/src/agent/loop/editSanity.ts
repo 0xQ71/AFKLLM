@@ -145,6 +145,7 @@ export function htmlJsHasThemeControl(html: string, js: string): boolean {
 }
 
 function isGameOrUiHandlerName(name: string): boolean {
+  if (!name || /^[A-Z]/.test(name)) return false
   return /^(cast|hook|strike|reel|bait|fish)/i.test(name) || /^(handle|on)[A-Z]\w*$/.test(name)
 }
 
@@ -180,6 +181,27 @@ function jsxHandlerIsBound(src: string, name: string): boolean {
     return true
   }
   return false
+}
+
+/** App.jsx must not wrap the tree in id="root" — that id already exists in index.html. */
+export function jsxNestsHtmlRootId(src: string): boolean {
+  return /<(?:div|main|section)\b[^>]*\bid\s*=\s*["']root["']/i.test(src ?? '')
+}
+
+/** SVG fill={fish.emoji} / fill="🐟" is not a CSS color — fish stay invisible. */
+export function jsxUsesEmojiAsSvgFill(src: string): boolean {
+  const t = src ?? ''
+  if (/fill\s*=\s*\{\s*[\w$.]*emoji[\w$.]*\s*\}/i.test(t)) return true
+  if (/fill\s*=\s*['"][^'"]*[\u{1F300}-\u{1FAFF}]/u.test(t)) return true
+  return false
+}
+
+/** First catch hides the bobber at -100% with no return — game dies after one click. */
+export function jsxTeleportsControlOffscreen(src: string): boolean {
+  const t = src ?? ''
+  if (!/(bobber|hook|float|поплав|крюч)/i.test(t)) return false
+  if (!/set[A-Za-z0-9_]*\(\s*\{[^}]*['"]-100%['"]/.test(t)) return false
+  return !/set[A-Za-z0-9_]*\(\s*\{[^}]*['"](?:[1-9]\d?|100)%['"]/.test(t)
 }
 
 export function extractHtmlModuleScriptSrcs(html: string): string[] {
@@ -425,6 +447,24 @@ export function formatEditSanityHint(opts: {
         `${EDIT_SANITY_PREFIX} ${unbound.slice(0, 6).join(', ')} is defined but never bound to ` +
           'onClick / onPointerDown. Wire the handler in JSX before claiming the UI works. ' +
           'apply_diff — do not claim the game is playable yet.'
+      )
+    }
+    if (jsxNestsHtmlRootId(checkSrc)) {
+      parts.push(
+        `${EDIT_SANITY_PREFIX} App.jsx must not render id="root" — that id is already on index.html. ` +
+          'Use a className for the game wrapper. apply_diff — nested #root breaks layout and clicks.'
+      )
+    }
+    if (jsxUsesEmojiAsSvgFill(checkSrc)) {
+      parts.push(
+        `${EDIT_SANITY_PREFIX} SVG fill must be a CSS color (#hex / rgb), not an emoji property. ` +
+          'Show fish as text/emoji in a <span> or path fill="#4a90e2". apply_diff — emoji fill is invisible.'
+      )
+    }
+    if (jsxTeleportsControlOffscreen(checkSrc)) {
+      parts.push(
+        `${EDIT_SANITY_PREFIX} hook/bobber is moved to -100% on catch and never comes back. ` +
+          'Keep it on screen and clickable after a catch (reset position). apply_diff — do not claim playable yet.'
       )
     }
     const cssMismatch = jsxCssClassMismatch(checkSrc, css)

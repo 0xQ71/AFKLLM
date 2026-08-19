@@ -9,6 +9,7 @@ import {
   isReusableEmptySession,
   isWelcomeChatMessage,
   sanitizePersistedMessages,
+  mergePersistedKeepingCloser,
   welcomeMessageForLang,
   type ChatSession,
   type ChatStoreSnapshot,
@@ -247,7 +248,10 @@ export class ChatStore {
     const idx = this.cache.sessions.findIndex((s) => s.id === id)
     if (idx === -1) return this.get()
     const prev = this.cache.sessions[idx]!
-    const cleaned = sanitizePersistedMessages(messages)
+    const incoming = sanitizePersistedMessages(messages)
+    const cleaned = sanitizePersistedMessages(
+      mergePersistedKeepingCloser(prev.messages, incoming)
+    )
     // Title is set once (model or first explicit name) and then frozen.
     let nextTitle = prev.title
     if (title?.trim() && isDefaultChatTitle(prev.title)) {

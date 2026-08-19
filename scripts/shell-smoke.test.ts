@@ -17,7 +17,8 @@ import {
   pathToFileUrl,
   rewriteLocalDevServerCommand,
   rewriteViteScaffoldCommand,
-  AFK_SAFE_VITE_PORT
+  AFK_SAFE_VITE_PORT,
+  devCommandNeedsNodeModules
 } from '../src/shared/localPreview'
 import { processKillRefusal } from '../src/shared/shellErrors'
 
@@ -75,6 +76,13 @@ describe('localPreview', () => {
       '  ➜  Local:   http://localhost:5173/\n  ➜  Network: http://192.168.1.2:5173/'
     )
     assert.equal(url, 'http://localhost:5173/')
+  })
+
+  it('npm run dev needs node_modules; install and python do not', () => {
+    assert.equal(devCommandNeedsNodeModules('npm run dev'), true)
+    assert.equal(devCommandNeedsNodeModules('npm run dev -- --host 127.0.0.1'), true)
+    assert.equal(devCommandNeedsNodeModules('npm install'), false)
+    assert.equal(devCommandNeedsNodeModules('python -m http.server 4173'), false)
   })
 
   it('rewrites 0.0.0.0 to 127.0.0.1', () => {
