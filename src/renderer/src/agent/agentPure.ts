@@ -1197,7 +1197,7 @@ export function isMetaOrSummaryPlanStep(text: string): boolean {
   if (isBrowserPlanStep(t)) return false
   if (isToolOrientedPlanStep(t)) return true
   return (
-    /сводк|summary|заключен|отчёт|отчет|report\s+completion/i.test(t) ||
+    /сводк|summary|summarizing|суммируя|заключен|отчёт|отчет|report\s+completion/i.test(t) ||
     /подвест[\p{L}]*\s+итог|итог[ауе]?\s*:/iu.test(t) ||
     /подтвердить|валидац|отсутствие\s+ошибок|корректность\s+отображ/i.test(t) ||
     /провер[\p{L}]*\s+(отсутств|ошибок|корректн|отображ|вёрст|верст|html|синтаксис)/iu.test(t) ||
@@ -1825,7 +1825,9 @@ export function isJunkPlanStep(text: string): boolean {
   // Bare heading leaked as a row (T07d: «Шаги:» stayed in_progress → false incomplete closer)
   if (/^шаги:?\s*$/i.test(t)) return true
   if (/^steps?:?\s*$/i.test(t)) return true
-  if (/^суммарно\s*:|^итого\s*:/i.test(t)) return true
+  if (/^суммарно\s*:|^суммируя\s*:|^итого\s*:|^summary\s*:|^summarizing\s*:/i.test(t)) {
+    return true
+  }
   if (/каждый\s+шаг\s+созда[её]т\s+файлы/i.test(t)) return true
   if (/^plan\s+of\s+\d/i.test(t)) return true
   if (/^\d+\s*[–-]\s*\d+\s+(atomic\s+)?(product\s+)?steps?\b/i.test(t)) return true

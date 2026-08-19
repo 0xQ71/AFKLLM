@@ -5666,6 +5666,17 @@ export async function runAgentTurn(params: {
             apiMessages,
             'PROCESS_ENDED: the user closed the app or it finished normally. Do NOT rewrite or relaunch. Stop and wait for the user.'
           )
+        } else if (
+          /COMPILER_MISSING/i.test(tc) ||
+          (/не распознано|not recognized|CommandNotFoundException/i.test(tc) &&
+            /\bg\+\+|gcc(?:\.exe)?/i.test(tc))
+        ) {
+          appendToolHint(
+            apiMessages,
+            'COMPILER_MISSING: g++ is not in PATH. Do not winget, choco, or download MinGW/7z. ' +
+              'Run MSVC: cl /EHsc /Fe:wordfreq wordfreq.cpp then .\\wordfreq.exe test.txt. ' +
+              'If cl is missing, stop and say so.'
+          )
         } else if (/TERMINAL_ERROR|ERROR_FOCUS|Traceback \(most recent call last\)/i.test(tc)) {
           appendToolHint(
             apiMessages,

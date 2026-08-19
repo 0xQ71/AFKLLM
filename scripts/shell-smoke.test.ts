@@ -4,6 +4,7 @@ import {
   normalizeAgentShellCommand,
   peelLeadingCd,
   rewriteBashOperators,
+  rewriteWhereAlias,
   stripAfkPtyChrome,
   cliStdoutLooksVacuous
 } from '../src/shared/shellNormalize'
@@ -22,7 +23,7 @@ import {
   AFK_SAFE_VITE_PORT,
   devCommandNeedsNodeModules
 } from '../src/shared/localPreview'
-import { processKillRefusal } from '../src/shared/shellErrors'
+import { processKillRefusal, compilerInstallRefusal } from '../src/shared/shellErrors'
 
 describe('shellNormalize', () => {
   it('rewrites && and || outside quotes', () => {
@@ -101,10 +102,64 @@ describe('shellNormalize', () => {
       cliStdoutLooksVacuous('> go run ./wordfreq.go test_input.txt\nНет слов для анализа.\n\nexit_code=0'),
       true
     )
-    assert.equal(
-      cliStdoutLooksVacuous('> go run wordfreq.go\n1. hello — 3\n2. foo — 2\n\nexit_code=0'),
-      false
+    assert.equal(cliStdoutLooksVacuous('> go run wordfreq.go\n1. hello — 3\n2. foo — 2\n\nexit_code=0'), false)
+  })
+
+  it('rewrites cmd >nul and bare cwd .exe for PowerShell', () => {
+    const nul = normalizeAgentShellCommand('where cl >nul 2>&1', '.', 'win32')
+    assert.match(nul.command, />\$null/)
+    assert.doesNotMatch(nul.command, />nul/)
+    assert.match(nul.command, /where\.exe/)
+
+    const exe = normalizeAgentShellCommand('wordfreq.exe test.txt', '.', 'win32')
+    assert.equal(exe.command, '.\\wordfreq.exe test.txt')
+
+    const already = normalizeAgentShellCommand('.\\wordfreq.exe test.txt', '.', 'win32')
+    assert.equal(already.command.includes('.\\wordfreq.exe'), true)
+
+    const cl = normalizeAgentShellCommand('cl.exe /EHsc wordfreq.cpp', '.', 'win32')
+    assert.match(cl.command, /^cl\.exe /)
+  })
+
+  it('rewrites PowerShell where alias to where.exe', () => {
+    assert.equal(rewriteWhereAlias('where cl.exe'), 'where.exe cl.exe')
+    const n = normalizeAgentShellCommand('where cl.exe', '.', 'win32')
+    assert.equal(n.command, 'where.exe cl.exe')
+    assert.equal(rewriteWhereAlias('Where-Object Name'), 'Where-Object Name')
+    assert.equal(rewriteWhereAlias('where { $_.Name -eq "cl" }'), 'where { $_.Name -eq "cl" }')
+    assert.equal(rewriteWhereAlias('where.exe gcc'), 'where.exe gcc')
+  })
+
+  it('refuses MinGW/compiler scavenger hunts', () => {
+    assert.match(
+      compilerInstallRefusal('winget install --id MinGW.GCC') ?? '',
+      /SHELL_REFUSED/
     )
+    assert.match(compilerInstallRefusal('choco install mingw -y') ?? '', /SHELL_REFUSED/)
+    assert.match(
+      compilerInstallRefusal(
+        "Invoke-WebRequest -Uri 'https://github.com/niXman/mingw-builds-binaries/releases/latest' -OutFile release.json"
+      ) ?? '',
+      /SHELL_REFUSED/
+    )
+    assert.match(
+      compilerInstallRefusal('curl -L -o gcc.tar.xz https://example.com/gcc.tar.xz') ?? '',
+      /SHELL_REFUSED/
+    )
+    assert.equal(compilerInstallRefusal('cl /EHsc /Fe:wordfreq wordfreq.cpp'), null)
+    assert.equal(compilerInstallRefusal('curl -I http://localhost:4173'), null)
+    assert.equal(processKillRefusal('npm run dev'), null)
+  })
+
+  it('strips PROCESS_ENDED leftover ontinue from PTY output', () => {
+    const raw =
+      'ontinue\n' +
+      '> .\\wordfreq.exe test.txt\n' +
+      'Top 10 most frequent words:\n' +
+      'the — 7\n'
+    const out = stripAfkPtyChrome(raw)
+    assert.doesNotMatch(out, /ontinue/)
+    assert.match(out, /Top 10/)
   })
 })
 

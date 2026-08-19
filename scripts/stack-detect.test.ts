@@ -11,7 +11,8 @@ import {
   POWERSHELL_AGENT_PTY_INIT,
   shellWatchdogFired,
   isShellTimeoutExit,
-  SHELL_TIMEOUT_EXIT
+  SHELL_TIMEOUT_EXIT,
+  compilerInstallRefusal
 } from '../src/shared/shellErrors'
 import {
   userAskedVerify,
@@ -22,7 +23,7 @@ import {
 } from '../src/renderer/src/agent/loop/verify'
 import { allowsFullOverwrite } from '../src/shared/writeThresholds'
 import { contentLooksStructurallyComplete, isLandingJsPath, isSourcePath, patchWouldBreakCompleteness } from '../src/renderer/src/agent/loop/completeness'
-import { evidenceSupportsStep, evidenceFromTool, recordEvidence } from '../src/renderer/src/agent/loop/evidence'
+import { evidenceSupportsStep, evidenceFromTool, recordEvidence, looksLikeCompileShellCommand } from '../src/renderer/src/agent/loop/evidence'
 import { advanceTodosOnEvidence } from '../src/renderer/src/agent/loop/plan'
 import { AgentToolRegistry } from '../src/main/agent/AgentToolRegistry'
 import { promises as fs } from 'node:fs'
@@ -153,7 +154,9 @@ describe('recursive listing refusal', () => {
 describe('PowerShell curl alias', () => {
   it('unaliases curl so pipelines use curl.exe instead of Invoke-WebRequest', () => {
     assert.match(POWERSHELL_UNALIAS_CURL, /Remove-Item alias:curl/)
+    assert.match(POWERSHELL_UNALIAS_CURL, /alias:where/)
     assert.match(POWERSHELL_AGENT_PTY_INIT, /alias:curl/)
+    assert.match(POWERSHELL_AGENT_PTY_INIT, /alias:where/)
   })
 })
 
@@ -233,6 +236,12 @@ describe('shell honesty', () => {
     assert.equal(isShellTimeoutExit(SHELL_TIMEOUT_EXIT), true)
     assert.equal(looksLikeGuiLaunchCommand('Start-Process .\\app.exe'), true)
     assert.equal(looksLikeGuiLaunchCommand('go build ./...'), false)
+    assert.equal(looksLikeGuiLaunchCommand('wordfreq.exe test.txt'), false)
+    assert.equal(looksLikeGuiLaunchCommand('.\\wordfreq.exe test.txt'), false)
+    assert.equal(
+      looksLikeGuiLaunchCommand('del wordfreq.exe wordfreq.obj 2>$null; cl /EHsc wordfreq.cpp'),
+      false
+    )
   })
 
   it('shell watchdog fires on idle stdin hang and hard wall', () => {
@@ -335,6 +344,31 @@ describe('shell honesty', () => {
       })
       assert.equal(r.ok, true)
       assert.match(r.content, /PROCESS_ENDED/)
+    } finally {
+      await fs.rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('CLI .exe with exit 1 is TERMINAL_ERROR, not GUI PROCESS_ENDED', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'afkllm-cli-exe-'))
+    try {
+      const reg = new AgentToolRegistry({
+        projectRoot: root,
+        confirmTerminal: async () => true,
+        runVisibleCommand: async () => ({
+          output: 'Имя "wordfreq.exe" не распознано как имя командлета',
+          exitCode: 1
+        })
+      })
+      const r = await reg.invoke({
+        id: '1',
+        name: 'execute_terminal_command',
+        arguments: { command: 'wordfreq.exe test.txt' }
+      })
+      assert.equal(r.ok, false)
+      assert.match(r.content, /TERMINAL_ERROR/)
+      assert.doesNotMatch(r.content, /PROCESS_ENDED/)
+      assert.match(r.content, /не распознано/)
     } finally {
       await fs.rm(root, { recursive: true, force: true })
     }
@@ -620,6 +654,40 @@ describe('evidence-gated plan', () => {
         ran
       ),
       true
+    )
+    const cl = recordEvidence(
+      [],
+      evidenceFromTool({
+        name: 'execute_terminal_command',
+        ok: true,
+        command: 'cl /EHsc /Fe:wordfreq wordfreq.cpp',
+        content: '/out:wordfreq.exe\nexit_code=0'
+      })!
+    )
+    assert.equal(
+      evidenceSupportsStep('Собрать программу g++ (если есть), иначе cl.', cl),
+      true
+    )
+    const whereCl = recordEvidence(
+      [],
+      evidenceFromTool({
+        name: 'execute_terminal_command',
+        ok: true,
+        command: 'where cl.exe',
+        content: '(no output)\nexit_code=0'
+      })!
+    )
+    assert.equal(looksLikeCompileShellCommand('where cl.exe'), false)
+    assert.equal(looksLikeCompileShellCommand('where.exe cl.exe'), false)
+    assert.equal(looksLikeCompileShellCommand('cl /EHsc /Fe:wordfreq wordfreq.cpp'), true)
+    assert.equal(looksLikeCompileShellCommand('g++ -O2 -o wordfreq wordfreq.cpp'), true)
+    assert.equal(
+      evidenceSupportsStep('Собрать программу g++ (если есть), иначе cl.', whereCl),
+      false
+    )
+    assert.match(
+      compilerInstallRefusal('winget install --id MinGW.GCC') ?? '',
+      /SHELL_REFUSED/
     )
   })
 

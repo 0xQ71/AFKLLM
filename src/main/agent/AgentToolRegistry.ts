@@ -27,6 +27,7 @@ import {
   powershellNodeEvalRefusal,
   recursiveListingRefusal,
   processKillRefusal,
+  compilerInstallRefusal,
   POWERSHELL_UNALIAS_CURL
 } from '../../shared/shellErrors'
 import {
@@ -1474,6 +1475,18 @@ export class AgentToolRegistry {
       }
     }
 
+    const compilerRefuse =
+      compilerInstallRefusal(command) ?? compilerInstallRefusal(rawCommand)
+    if (compilerRefuse) {
+      return {
+        id: '',
+        name: 'execute_terminal_command',
+        ok: false,
+        content: '',
+        error: compilerRefuse
+      }
+    }
+
     const killRefuse = processKillRefusal(command) ?? processKillRefusal(rawCommand)
     if (killRefuse) {
       return {
@@ -1883,6 +1896,13 @@ export class AgentToolRegistry {
       /regex(?:p)?\.Split|not enough arguments in call to regex\.Split/i.test(body)
         ? '\nGO_SPLIT: regexp.Split(s, n) — n=0 returns nil (empty word list). Use n=-1 to split all.'
         : ''
+    const compilerMissing =
+      /не распознано|not recognized|CommandNotFoundException/i.test(body) &&
+      /\bg\+\+|gcc(?:\.exe)?\b/i.test(command)
+        ? '\nCOMPILER_MISSING: g++/gcc is not in PATH. Do not winget/choco/download MinGW. ' +
+          'Run: cl /EHsc /Fe:wordfreq wordfreq.cpp then .\\wordfreq.exe <file>. ' +
+          'If cl fails, say so — do not download compilers.'
+        : ''
     const cliEmpty =
       exitCode === 0 &&
       /\bgo\s+run\b/i.test(command) &&
@@ -1971,6 +1991,7 @@ export class AgentToolRegistry {
       `\n` +
       `ERROR_FOCUS (read and fix THIS — do not guess):\n${focusOrTail}\n` +
       goSplit +
+      compilerMissing +
       `\n` +
       `FULL_OUTPUT:\n${body}\n\n` +
       `REQUIRED: open the file/line named in the traceback (read_file), apply_diff to fix the stated cause, then re-run the SAME command (use cwd=… instead of bash &&). Do not rewrite the whole project or drop the tech stack.`

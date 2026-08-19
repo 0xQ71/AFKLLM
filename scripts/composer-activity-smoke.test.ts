@@ -90,6 +90,19 @@ describe('composerActivity', () => {
     assert.match(label, /Топ-10/)
   })
 
+  it('shell chip skips leftover ontinue from PTY', () => {
+    const a = buildActivityFromTool({
+      name: 'execute_terminal_command',
+      args: { command: '.\\wordfreq.exe test.txt' },
+      resultContent:
+        'ontinue\n> .\\wordfreq.exe test.txt\nTop 10 most frequent words:\nthe — 7\n\nexit_code=0',
+      ok: true
+    })
+    const label = formatActivityLabel(a)
+    assert.doesNotMatch(label, /ontinue/i)
+    assert.match(label, /Top 10/)
+  })
+
   it('formats Editing basename', () => {
     const a = buildActivityFromTool({
       name: 'apply_patch',

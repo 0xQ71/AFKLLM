@@ -75,6 +75,23 @@ export function evidenceFromTool(opts: {
   return null
 }
 
+/** Real compile argv — not `where cl.exe` / Get-Command. */
+export function looksLikeCompileShellCommand(command: string): boolean {
+  const c = command ?? ''
+  if (!c.trim()) return false
+  if (
+    /\bwhere(?:\.exe)?\b|\bGet-Command\b|\bTest-Path\b/i.test(c) &&
+    !/\b(?:g\+\+|gcc|cl(?:\.exe)?)\s+[-/]|\bjavac\s+\S/i.test(c)
+  ) {
+    return false
+  }
+  return (
+    /\bg\+\+\s|\bgcc\s+-|\bclang(?:\+\+)?\s|\bjavac\s+\S|\bcargo\s+build|\bgo\s+build|\bdotnet\s+build|\bnpm\s+run\s+build|\bmvn\s|\bgradle\s|\bcmake\s/i.test(
+      c
+    ) || /\bcl(?:\.exe)?\s+(\/|\S)/i.test(c)
+  )
+}
+
 function parseExitCode(content?: string): number | undefined {
   if (!content) return undefined
   const m = content.match(/exit_code=(-?\d+)/i)
@@ -130,13 +147,11 @@ export function evidenceSupportsStep(stepText: string, log: StepEvidence[]): boo
   // "скриптами для dev и build" on a package.json row is NOT cargo/mvn compile.
   if (
     !/package\.json/i.test(t) &&
-    /сборк|compile|javac|mvn |gradle |cmake|cargo build|go build|dotnet build|npm run build/i.test(
+    /сборк|собрать|compile|javac|g\+\+|clang|\bcl\b|gcc |mvn |gradle |cmake|cargo build|go build|dotnet build|npm run build/i.test(
       t
     )
   ) {
-    return okShell.some((e) =>
-      /build|compile|javac|mvn|gradle|cmake|cargo|go build|dotnet/i.test(e.command ?? '')
-    )
+    return okShell.some((e) => looksLikeCompileShellCommand(e.command ?? ''))
   }
   if (/открыть|превью|preview|browser|браузер|start-process/i.test(t)) {
     return okShell.some((e) => e.kind === 'preview_ok')

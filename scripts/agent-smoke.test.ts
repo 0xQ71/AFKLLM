@@ -1833,6 +1833,30 @@ describe('agent todo plan', () => {
     assert.equal(isJunkPlanStep('Шаги плана:'), true)
     assert.equal(isJunkPlanStep('Шаги:'), true)
     assert.equal(isJunkPlanStep('Steps:'), true)
+    assert.equal(isJunkPlanStep('Суммарно: создать 3 файла'), true)
+    assert.equal(isJunkPlanStep('Summary: Создать Java-программу, скомпилировать, протестировать.'), true)
+    assert.equal(
+      isJunkPlanStep('Суммируя: создаётся один файл C++, собирается и тестируется.'),
+      true
+    )
+    assert.equal(
+      isMetaOrSummaryPlanStep('Суммируя: создаётся один файл C++, собирается и тестируется.'),
+      true
+    )
+    assert.equal(
+      isFileWorkPlanStep('Суммируя: создаётся один файл C++, собирается и тестируется.'),
+      false
+    )
+    assert.equal(
+      pendingPlanWork([
+        {
+          id: 's5',
+          text: 'Суммируя: создаётся один файл C++, собирается и тестируется.',
+          status: 'in_progress'
+        }
+      ]).length,
+      0
+    )
     assert.equal(isJunkPlanStep('Написать wordfreq.py'), false)
     const t07d = [
       {
@@ -2961,6 +2985,14 @@ describe('SHELL_EDIT_FORBIDDEN', () => {
     assert.equal(looksLikeShellFileMutation('npm test'), false)
     assert.equal(looksLikeShellFileMutation('git status'), false)
     assert.equal(looksLikeShellFileMutation('Start-Process index.html'), false)
+    assert.equal(
+      looksLikeShellFileMutation(
+        'g++ -o wordfreq wordfreq.cpp 2>&1 && echo BUILD_OK || (where cl >nul 2>&1 && echo FOUND_CL)'
+      ),
+      false
+    )
+    assert.equal(looksLikeShellFileMutation('where cl >nul 2>&1'), false)
+    assert.equal(looksLikeShellFileMutation('echo hello > test.txt'), true)
   })
 
   it('blocks sed -i and Set-Content without touching the file', async () => {
@@ -2997,6 +3029,36 @@ describe('SHELL_EDIT_FORBIDDEN', () => {
         })
         assert.doesNotMatch(res.error ?? '', /SHELL_EDIT_FORBIDDEN/)
       }
+    } finally {
+      await fs.rm(root, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('compiler install refusal', () => {
+  it('blocks winget/choco MinGW and mingw-builds downloads without writing archives', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'afkllm-compiler-refuse-'))
+    try {
+      const reg = new AgentToolRegistry({ projectRoot: root })
+      const winget = await reg.invoke({
+        id: '1',
+        name: 'execute_terminal_command',
+        arguments: { command: 'winget install --id MinGW.GCC' }
+      })
+      assert.equal(winget.ok, false)
+      assert.match(winget.error ?? '', /SHELL_REFUSED/)
+      const iwr = await reg.invoke({
+        id: '2',
+        name: 'execute_terminal_command',
+        arguments: {
+          command:
+            "Invoke-WebRequest -Uri 'https://github.com/niXman/mingw-builds-binaries/releases/download/x/mingw.7z' -OutFile mingw.7z"
+        }
+      })
+      assert.equal(iwr.ok, false)
+      assert.match(iwr.error ?? '', /SHELL_REFUSED/)
+      const names = await fs.readdir(root)
+      assert.equal(names.includes('mingw.7z'), false)
     } finally {
       await fs.rm(root, { recursive: true, force: true })
     }
@@ -3775,7 +3837,9 @@ export default FishingGame`
 describe('PowerShell curl alias', () => {
   it('drops the IWR curl alias in PTY init and runShell prefix', () => {
     assert.match(POWERSHELL_UNALIAS_CURL, /alias:curl/)
+    assert.match(POWERSHELL_UNALIAS_CURL, /alias:where/)
     assert.match(POWERSHELL_AGENT_PTY_INIT, /alias:curl/)
+    assert.match(POWERSHELL_AGENT_PTY_INIT, /alias:where/)
     assert.match(POWERSHELL_AGENT_PTY_INIT, /PSReadLine/)
   })
 })

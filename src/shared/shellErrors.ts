@@ -35,11 +35,9 @@ export function shellWatchdogFired(opts: {
 export function looksLikeGuiLaunchCommand(command: string): boolean {
   const c = command.trim()
   if (!c) return false
-  if (/^Start-Process\b/i.test(c)) return true
+  if (/\bStart-Process\b/i.test(c)) return true
+  if (/\bInvoke-Item\b|(?:^|[\s;|&])ii\b|\bexplorer(?:\.exe)?\b/i.test(c)) return true
   if (/\b(javaw|pythonw|wish|electron)\b/i.test(c)) return true
-  if (/\.(exe|app|msi)\b/i.test(c) && !/\b(csc|msbuild|dotnet|cl\.exe|link\.exe)\b/i.test(c)) {
-    return true
-  }
   return false
 }
 
@@ -80,11 +78,12 @@ export function recursiveListingRefusal(command: string): string | null {
 }
 
 /**
- * PowerShell aliases `curl` → Invoke-WebRequest, which breaks Unix pipelines
- * (`curl | jq` prompts for Uri). Drop the alias so `curl` is curl.exe.
+ * PowerShell aliases `curl` → Invoke-WebRequest (`curl | jq` prompts for Uri)
+ * and `where` → Where-Object (`where cl.exe` prints nothing with exit 0).
+ * Drop both so `curl`/`where` are the PATH executables.
  */
 export const POWERSHELL_UNALIAS_CURL =
-  'Remove-Item alias:curl -Force -ErrorAction SilentlyContinue'
+  'Remove-Item alias:curl,alias:where -Force -ErrorAction SilentlyContinue'
 
 /** Init for the visible agent PTY (`powershell.exe -NoProfile -Command`). */
 export const POWERSHELL_AGENT_PTY_INIT =
@@ -132,7 +131,8 @@ export function extractErrorFocus(text: string): string | null {
       /^\S+:\d+:\d+:\s+(fatal\s+)?error:/i.test(l) ||
       /\berror:|FAILED|FAILURES!|AssertionError|Invoke-Expression|ParserError|not recognized/i.test(
         l
-      )
+      ) ||
+      /не распознано|не удается найти позиционный|\berror C\d+/i.test(l)
     ) {
       markers.push(i)
     }
@@ -155,8 +155,14 @@ export function looksLikeShellFileMutation(command: string): boolean {
   if (/\b-replace\b/i.test(c) && /\b(Set-Content|Add-Content|Out-File|Set-Item)\b/i.test(c)) {
     return true
   }
-  // `echo x > file` / `cmd >> log.txt`, but not `2>&1` / `>&2`
-  if (/(^|[\s;|&])>{1,2}\s*(?!&)[^\s;&|]+/.test(c)) return true
+  // `echo x > file` / `cmd >> log.txt`, but not `2>&1` / `>&2` / `>nul` / `>$null`
+  const redir = /(?:^|[\s;|&])>{1,2}\s*(?!&)([^\s;&|]+)/g
+  let m: RegExpExecArray | null
+  while ((m = redir.exec(c))) {
+    const dest = m[1]!.replace(/^["']|["']$/g, '')
+    if (/^(\$null|nul|null|\/dev\/null)$/i.test(dest)) continue
+    return true
+  }
   return false
 }
 
@@ -177,5 +183,32 @@ export function processKillRefusal(command: string): string | null {
       'Do not target svchost or system PIDs.'
     )
   }
+  return null
+}
+
+const COMPILER_INSTALL_MSG =
+  'SHELL_REFUSED: do not install or download a C/C++ compiler (winget/choco/MinGW/7z toolchain). ' +
+  'g++ may be missing; on Windows run MSVC if present: cl /EHsc /Fe:wordfreq wordfreq.cpp ' +
+  'then .\\wordfreq.exe test.txt. If cl is also missing, say so and stop — do not fetch archives.'
+
+/**
+ * Installing MinGW because `g++` is not on PATH burns the turn on 100MB downloads.
+ * The host already has `cl` when vcvars was imported — try that instead.
+ */
+export function compilerInstallRefusal(command: string): string | null {
+  const c = command.trim()
+  if (!c) return null
+  const pkgMgr = /\b(winget|choco|chocolatey|scoop)\s+install\b/i.test(c)
+  const compilerPkg = /mingw|msys2?|\bgcc\b|\bg\+\+|llvm|visualstudio|buildtools|\bclang\b/i.test(c)
+  if (pkgMgr && compilerPkg) return COMPILER_INSTALL_MSG
+  if (/niXman\/mingw-builds|mstorsjo\/gcc-mingw|mingw-builds-binaries|MinGW\.GCC/i.test(c)) {
+    return COMPILER_INSTALL_MSG
+  }
+  const download = /\b(curl|wget|Invoke-WebRequest|\biwr\b)\b/i.test(c)
+  const compilerArchive =
+    /mingw-builds|gcc-mingw|mingw\.7z|msys2|gcc\.tar|\.(?:7z|tar\.xz)\b/i.test(c) ||
+    (/7-?zip\.org|sevenzip|7za\.exe|7z\d+-x64\.exe/i.test(c) &&
+      /OutFile|\s-o\s|--output\b|-OutFile/i.test(c))
+  if (download && compilerArchive) return COMPILER_INSTALL_MSG
   return null
 }

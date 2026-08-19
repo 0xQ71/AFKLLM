@@ -66,12 +66,14 @@ export function rewriteUnixismsForPowerShell(command: string): string {
     return n ? `${base} | Select-Object -First ${n}` : base
   }
 
-  // Redirects to /dev/null (PowerShell otherwise resolves D:\dev\null)
+  // Redirects to /dev/null or cmd `nul` (PowerShell otherwise resolves D:\dev\null)
   cmd = cmd
     .replace(/\s+2>&1\s*>\s*\/dev\/null\b/gi, ' 2>&1 >$null')
     .replace(/\s+2>\s*\/dev\/null\b/gi, ' 2>$null')
     .replace(/\s+>\s*\/dev\/null\b/gi, ' >$null')
     .replace(/\s+1>\s*\/dev\/null\b/gi, ' >$null')
+    .replace(/\s+2>\s*nul\b/gi, ' 2>$null')
+    .replace(/\s+>\s*nul\b/gi, ' >$null')
 
   // Pipes: head / tail / grep (simple cases)
   cmd = cmd.replace(/\|\s*head\s+-n?\s*(\d+)\b/gi, '| Select-Object -First $1')
@@ -96,7 +98,36 @@ export function rewriteUnixismsForPowerShell(command: string): string {
     cmd = `Write-Output -- ${payload} | ${lhs}`
   }
 
+  cmd = rewriteWhereAlias(cmd)
+  cmd = rewriteBareWindowsExe(cmd)
+
   return cmd.trim()
+}
+
+/**
+ * PowerShell aliases `where` → Where-Object, so `where cl.exe` is a silent
+ * filter (empty stdout, exit 0) instead of locating cl.exe. Call where.exe.
+ * Leave `Where-Object` and `where { … }` alone.
+ */
+export function rewriteWhereAlias(command: string): string {
+  return command.replace(
+    /(^|[\s;|&(])where(?!\.exe\b|-Object\b)(\s+)(?!\{)([A-Za-z0-9._*?-]+)/gi,
+    '$1where.exe$2$3'
+  )
+}
+
+/** PowerShell will not run `wordfreq.exe` from cwd; `.\wordfreq.exe` will. Skip toolchain names on PATH. */
+const WINDOWS_TOOLCHAIN_EXE =
+  /^(cl|link|csc|msbuild|python|pythonw|node|go|java|javac|git|npm|npx|cmd|powershell|pwsh|rustc|cargo|dotnet|cmake|ninja|gcc|g\+\+|clang|clang\+\+|nmake|dumpbin|where)\.exe$/i
+
+export function rewriteBareWindowsExe(command: string): string {
+  return command.replace(
+    /(^|[\s;|&])([A-Za-z0-9][A-Za-z0-9._-]*\.exe)\b/g,
+    (all, pre: string, exe: string) => {
+      if (WINDOWS_TOOLCHAIN_EXE.test(exe)) return all
+      return `${pre}.\\${exe}`
+    }
+  )
 }
 
 /** PTY echo of the temp wrapper (`& '...\afk-run-….ps1'; Remove-Item…`) or leftover exit marker. */
@@ -105,6 +136,10 @@ export function isAfkPtyChromeLine(line: string): boolean {
   if (!t) return false
   if (/afk-run-[a-z0-9]+\.ps1/i.test(t)) return true
   if (/__AFK_EXIT_[a-z0-9]+__/i.test(t) && !/^> /.test(t)) return true
+  if (/^PROCESS_ENDED:/i.test(t)) return true
+  if (/^Do NOT rewrite or relaunch/i.test(t)) return true
+  if (/ErrorActionPreference/i.test(t)) return true
+  if (/^(Continue|SilentlyContinue|ontinue)$/i.test(t)) return true
   return false
 }
 
