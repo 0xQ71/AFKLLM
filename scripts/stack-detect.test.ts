@@ -8,12 +8,17 @@ import {
   powershellNodeEvalRefusal,
   recursiveListingRefusal,
   POWERSHELL_UNALIAS_CURL,
-  POWERSHELL_AGENT_PTY_INIT
+  POWERSHELL_AGENT_PTY_INIT,
+  shellWatchdogFired,
+  isShellTimeoutExit,
+  SHELL_TIMEOUT_EXIT
 } from '../src/shared/shellErrors'
 import {
   userAskedVerify,
   shouldNudgeVerify,
-  stackSupportsVerify
+  stackSupportsVerify,
+  looksLikePlaytestAsk,
+  inferredVerifyMode
 } from '../src/renderer/src/agent/loop/verify'
 import { allowsFullOverwrite } from '../src/shared/writeThresholds'
 import { contentLooksStructurallyComplete, isLandingJsPath, isSourcePath } from '../src/renderer/src/agent/loop/completeness'
@@ -93,6 +98,19 @@ describe('verify nudge intent', () => {
       shouldNudgeVerify({ userText: 'проверь сборку', stacks: [html] }),
       false
     )
+  })
+
+  it('does not treat «запусти для теста» as npm test', () => {
+    assert.equal(looksLikePlaytestAsk('запусти для теста'), true)
+    assert.equal(userAskedVerify('запусти для теста'), false)
+    assert.equal(inferredVerifyMode('запусти для теста'), 'run')
+    const node = detectStacks(['package.json'])[0]!
+    assert.equal(
+      shouldNudgeVerify({ userText: 'запусти для теста', stacks: [node] }),
+      false
+    )
+    assert.equal(userAskedVerify('запусти тесты'), true)
+    assert.equal(looksLikePlaytestAsk('run npm test'), false)
   })
 })
 
@@ -187,8 +205,67 @@ describe('shell honesty', () => {
   it('Ctrl+C codes are user interrupt; GUI launch is detected by command', () => {
     assert.equal(isUserInterruptExit(0xc000013a), true)
     assert.equal(isUserInterruptExit(1), false)
+    assert.equal(isShellTimeoutExit(SHELL_TIMEOUT_EXIT), true)
     assert.equal(looksLikeGuiLaunchCommand('Start-Process .\\app.exe'), true)
     assert.equal(looksLikeGuiLaunchCommand('go build ./...'), false)
+  })
+
+  it('shell watchdog fires on idle stdin hang and hard wall', () => {
+    const t0 = 1_000
+    assert.equal(
+      shellWatchdogFired({
+        now: t0 + 10_000,
+        startedAt: t0,
+        lastOutputAt: t0,
+        hardMs: 90_000,
+        idleMs: 55_000
+      }),
+      null
+    )
+    assert.equal(
+      shellWatchdogFired({
+        now: t0 + 56_000,
+        startedAt: t0,
+        lastOutputAt: t0,
+        hardMs: 90_000,
+        idleMs: 55_000
+      }),
+      'idle'
+    )
+    assert.equal(
+      shellWatchdogFired({
+        now: t0 + 91_000,
+        startedAt: t0,
+        lastOutputAt: t0 + 80_000,
+        hardMs: 90_000,
+        idleMs: 55_000
+      }),
+      'hard'
+    )
+  })
+
+  it('SHELL_TIMEOUT is ok:false with a pipe hint', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'afkllm-timeout-'))
+    try {
+      const reg = new AgentToolRegistry({
+        projectRoot: root,
+        confirmTerminal: async () => true,
+        runVisibleCommand: async () => ({
+          output: '(hung)',
+          exitCode: 124
+        })
+      })
+      const r = await reg.invoke({
+        id: '1',
+        name: 'execute_terminal_command',
+        arguments: { command: 'go run wordfreq.go "hello world"' }
+      })
+      assert.equal(r.ok, false)
+      assert.match(r.content, /SHELL_TIMEOUT/)
+      assert.match(r.content, /echo/)
+    } finally {
+      await fs.rm(root, { recursive: true, force: true })
+    }
   })
 
   it('nonzero exit without traceback is ok:false', async () => {
@@ -262,6 +339,10 @@ describe('completeness by language', () => {
     )
     assert.equal(contentLooksStructurallyComplete('def add(a, b):\n    return a + b\n', 'a.py'), true)
     assert.equal(contentLooksStructurallyComplete('{"a": 1}', 'a.json'), true)
+    assert.equal(
+      contentLooksStructurallyComplete('import React from "react"', 'package.json'),
+      true
+    )
     assert.equal(contentLooksStructurallyComplete('def add(a, b):\n', 'a.py'), false)
   })
 
@@ -366,6 +447,86 @@ describe('evidence-gated plan', () => {
       true
     )
     assert.equal(evidenceSupportsStep('Запустить тесты', log), false)
+  })
+
+  it('npm run dev plan row needs a successful vite, not npm install', () => {
+    let log = recordEvidence(
+      [],
+      evidenceFromTool({
+        name: 'execute_terminal_command',
+        ok: true,
+        command: 'npm install',
+        content: 'exit_code=0'
+      })!
+    )
+    assert.equal(
+      evidenceSupportsStep('Запустить npm run dev и проверить работу игры.', log),
+      false
+    )
+    log = recordEvidence(
+      log,
+      evidenceFromTool({
+        name: 'execute_terminal_command',
+        ok: true,
+        command: 'npm run dev -- --host 127.0.0.1 --port 4173',
+        content: 'exit_code=0\nPREVIEW_URL: http://127.0.0.1:4173/'
+      })!
+    )
+    assert.equal(
+      evidenceSupportsStep('Запустить npm run dev и проверить работу игры.', log),
+      true
+    )
+  })
+
+  it('apply_diff closes a replace step; go mod does not close go run', () => {
+    const patched = recordEvidence(
+      [],
+      evidenceFromTool({ name: 'apply_diff', ok: true, path: 'total.js' })!
+    )
+    assert.equal(
+      evidenceSupportsStep('Заменить эту логику на умножение: сумма * (1 + taxRate).', patched),
+      true
+    )
+    const mod = recordEvidence(
+      [],
+      evidenceFromTool({
+        name: 'execute_terminal_command',
+        ok: true,
+        command: 'go mod init wordfreq',
+        content: 'exit_code=0'
+      })!
+    )
+    assert.equal(evidenceSupportsStep('Проверить наличие go.mod; если отсутствует — инициализировать модуль.', mod), true)
+    assert.equal(
+      evidenceSupportsStep(
+        'Запустить программу через go run wordfreq.go на коротком тестовом тексте',
+        mod
+      ),
+      false
+    )
+    assert.equal(
+      evidenceSupportsStep(
+        'Оформить итоговую сводку: что сделано и результат запуска.',
+        mod
+      ),
+      false
+    )
+    const ran = recordEvidence(
+      mod,
+      evidenceFromTool({
+        name: 'execute_terminal_command',
+        ok: true,
+        command: 'go run wordfreq.go',
+        content: 'hello\t3\nexit_code=0'
+      })!
+    )
+    assert.equal(
+      evidenceSupportsStep(
+        'Запустить программу через go run wordfreq.go на коротком тестовом тексте',
+        ran
+      ),
+      true
+    )
   })
 
   it('web_search ticks weather/search plan rows and does not need a write', () => {

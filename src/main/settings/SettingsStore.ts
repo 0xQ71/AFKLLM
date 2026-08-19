@@ -292,7 +292,7 @@ function sanitize(input: Record<string, unknown> | AppSettings): AppSettings {
   ) {
     next.visionModelPath = VISION_SAME_AS_CHAT
   }
-  next.visionKeepLoaded = next.visionKeepLoaded !== false
+  next.visionKeepLoaded = next.visionKeepLoaded === true
   // Chat applies patches — never spawn a second Apply GGUF.
   next.applyModelPath = ''
   // 0 = follow chat ctx; anything positive is clamped to a loadable window.

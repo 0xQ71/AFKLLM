@@ -40,6 +40,7 @@ import {
   deriveChatTitle,
   isDefaultChatTitle,
   isVisibleChatMessageId,
+  isWelcomeChatMessage,
   pickChatTitle,
   THREAD_SUMMARY_MSG_ID
 } from '../../../shared/chats'
@@ -1160,7 +1161,7 @@ export function ChatPanel({
   const feedItems = buildComposerFeed(visibleMessages, t)
 
   const displayContent = (m: ChatMessage): string => {
-    if (m.id === 'welcome') {
+    if (isWelcomeChatMessage(m)) {
       if (llmReady) {
         return imageMode ? t('chat.welcome.online') : t('chat.welcome.onlineNoImage')
       }
@@ -1449,7 +1450,7 @@ export function ChatPanel({
               ) : (
                 <div>
                   <div className="rounded-xl border border-ink-line/70 bg-ink-950/40 px-3.5 py-2.5">
-                    {m.id === 'welcome' ? (
+                    {isWelcomeChatMessage(m) ? (
                       <MarkdownBody content={displayContent(m)} />
                     ) : isAgentStatusLine(m) ? (
                       <div className="text-[12px] leading-relaxed text-ink-mute">
@@ -2056,7 +2057,7 @@ function formatRelativeTime(ts: number): string {
 }
 
 function isAgentStatusLine(m: ChatMessage): boolean {
-  if (m.toolName || m.id === 'welcome') return false
+  if (m.toolName || isWelcomeChatMessage(m)) return false
   const c = (m.content ?? '').trim()
   if (!c) return false
   if (/<\s*(?:think|thinking)\s*>/i.test(c)) return false
@@ -2590,7 +2591,9 @@ function isVisibleChatMessage(m: ChatMessage): boolean {
   if (!isVisibleChatMessageId(m.id)) return false
   if (isAgentTodoMessageId(m.id)) return Boolean(m.content?.trim())
   if (m.id === AGENT_CHECKLIST_MSG_ID) return Boolean(m.content?.trim())
-  if (m.id === 'welcome') return true
+  if (isWelcomeChatMessage(m)) return true
+  // Think folds stay in the transcript even if sanitize emptied the visible prose.
+  if (/<\s*(?:think|thinking)\s*>/i.test(m.content ?? '')) return true
   const hasText = Boolean(m.content?.trim())
   const hasCode = Boolean(m.codePreview && m.codePreview.length > 0)
   const hasFiles = Boolean(m.files?.length || m.images?.length)

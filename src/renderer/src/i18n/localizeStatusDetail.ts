@@ -106,6 +106,7 @@ export function localizeActivityVerb(verb: string, t: TFn): string {
     Explored: 'activity.verb.explored',
     Editing: 'activity.verb.editing',
     Edited: 'activity.verb.edited',
+    'Write failed': 'activity.verb.writeFailed',
     Deleting: 'activity.verb.deleting',
     Deleted: 'activity.verb.deleted',
     Creating: 'activity.verb.creating',

@@ -12,11 +12,31 @@ export function shouldVerifyAfterEdits(opts: {
 }
 
 /**
+ * «запусти для теста» / playtest — open the app, not `npm test`.
+ * Must run before the «запусти … тест» verify regex.
+ */
+export function looksLikePlaytestAsk(userText: string): boolean {
+  const t = userText ?? ''
+  if (!t.trim()) return false
+  if (/\b(npm|pnpm|yarn)\s+test\b|\bcargo\s+test\b|\bgo\s+test\b|\bpytest\b|\bmvn\s+test\b/i.test(t)) {
+    return false
+  }
+  return (
+    /(?:запусти|открой|запуск|run|start|open).{0,48}(?:для\s+теста|на\s+тест|поигра|playtest|try\s+(?:it|out)|посмотреть)/i.test(
+      t
+    ) ||
+    (/для\s+теста\b/i.test(t) &&
+      /(?:запусти|открой|dev|превью|preview|сервер|vite|npm\s+run)/i.test(t))
+  )
+}
+
+/**
  * Explicit ask to run build/tests — not casual wording like «после сборки открой».
  * Bare «сборк» / «build» used to fire a verify nudge on every landing-page prompt.
  */
 export function userAskedVerify(userText: string): boolean {
   const t = userText
+  if (looksLikePlaytestAsk(t)) return false
   if (
     /\b(npm|pnpm|yarn)\s+test\b|\bcargo\s+test\b|\bgo\s+test\b|\bpytest\b|\bmvn\s+test\b|\bdotnet\s+test\b|\bgradle(?:w)?\s+test\b|\bmake\s+(?:test|check)\b/i.test(
       t
@@ -69,6 +89,7 @@ export function formatVerifyNudge(mode: VerifyMode, lang: 'ru' | string): string
 }
 
 export function inferredVerifyMode(userText: string): VerifyMode {
+  if (looksLikePlaytestAsk(userText)) return 'run'
   if (/lint|eslint|clippy|ruff/i.test(userText)) return 'lint'
   if (/тест|test|pytest/i.test(userText)) return 'test'
   if (/запуск|run|start/i.test(userText) && !/лендинг|landing|сайт|site|html/i.test(userText)) {

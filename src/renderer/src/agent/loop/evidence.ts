@@ -54,7 +54,7 @@ export function evidenceFromTool(opts: {
   }
   if (name === 'execute_terminal_command') {
     const exit = parseExitCode(content)
-    const preview = /PREVIEW_URL|Opened .*preview|AFKLLM Browser/i.test(content ?? '')
+    const preview = /PREVIEW_URL|PREVIEW_OK|Opened .*preview|AFKLLM Browser/i.test(content ?? '')
     if (preview && ok) {
       return { kind: 'preview_ok', tool: name, ok: true, command }
     }
@@ -94,8 +94,27 @@ export function evidenceSupportsStep(stepText: string, log: StepEvidence[]): boo
   const okSearch = log.filter((e) => e.ok && e.kind === 'search_ok')
   const okMkdir = log.filter((e) => e.ok && e.kind === 'mkdir_ok')
 
-  if (/web_search|поиск|search\s+the\s+web|искать\s+в\s+интернет|погод|weather/i.test(t)) {
+  // Closing prose is not a tool step — never tick from go mod / a random shell.
+  if (
+    /оформить\s+итог|итоговую\s+сводк|кратк\w+\s+заключен|closing summary|напиши\s+заключен/i.test(
+      t
+    )
+  ) {
+    return false
+  }
+
+  if (
+    /web_search|поиск\s+в\s+интернет|искать\s+в\s+интернет|search\s+the\s+web|актуальн\w+\s+верси|найти\s+.*lts|погод|weather/i.test(
+      t
+    )
+  ) {
     return okSearch.length > 0
+  }
+  if (/go\.mod|go\s+mod|инициализир\w*\s+модул/i.test(t)) {
+    return (
+      okShell.some((e) => /go\s+mod/i.test(e.command ?? '')) ||
+      okWrites.some((e) => /go\.mod$/i.test((e.path ?? '').replace(/\\/g, '/')))
+    )
   }
   if (
     /pytest|junit|cargo\s+test|go\s+test|dotnet\s+test|npm\s+test|node\s+--test/i.test(t) ||
@@ -116,11 +135,50 @@ export function evidenceSupportsStep(stepText: string, log: StepEvidence[]): boo
   if (/открыть|превью|preview|browser|браузер|start-process/i.test(t)) {
     return okShell.some((e) => e.kind === 'preview_ok')
   }
-  if (/запуст|выполнить|(?:^|[^\p{L}])run(?:$|[^\p{L}])|execute|через\s+terminal/iu.test(t)) {
-    return okShell.length > 0
+  if (
+    /curl\s+-I|страница\s+загрузил|без\s+ошибок\s+загруз/i.test(t) ||
+    (/\bcurl\b|\binvoke-webrequest\b|\biwr\b/i.test(t) && /localhost|127\.0\.0\.1/i.test(t))
+  ) {
+    return okShell.some((e) => e.kind === 'preview_ok')
+  }
+  if (
+    /заменить|исправить|починить|поправ(?:ить|ь)|править\s+логик|fix\s|replace |patch /i.test(t) &&
+    !/запустить|go\s+run|node\s+test/i.test(t)
+  ) {
+    const codeWrites = okWrites.filter((e) =>
+      /\.(html?|css|jsx?|mjs|cjs|tsx?|py|java|cs|go|rs|c|cpp|h|kt)$/i.test(e.path ?? '')
+    )
+    if (codeWrites.length === 0) return false
+    const named = t.match(
+      /[\w./\\-]+\.(html?|css|js|ts|tsx|jsx|py|java|cs|go|rs|c|cpp|h|kt)/i
+    )
+    if (named) {
+      const want = named[0]!.replace(/\\/g, '/').toLowerCase()
+      return codeWrites.some((e) =>
+        (e.path ?? '').replace(/\\/g, '/').toLowerCase().endsWith(want)
+      )
+    }
+    return true
+  }
+  if (/(?:^|[^\p{L}])запустить|(?:^|[^\p{L}])run(?:$|[^\p{L}])|выполнить|go\s+run|через\s+terminal/iu.test(t)) {
+    const runShell = okShell.filter((e) => !/go\s+mod\b/i.test(e.command ?? ''))
+    if (runShell.length === 0) return false
+    if (/go\s+run/i.test(t)) {
+      return runShell.some((e) => /go\s+run/i.test(e.command ?? ''))
+    }
+    if (/node\s+test/i.test(t)) {
+      return runShell.some((e) => /node\s+test/i.test(e.command ?? ''))
+    }
+    if (/npm\s+run\s+dev|\bvite\b|dev[- ]server|превью\s+игр/i.test(t)) {
+      return (
+        runShell.some((e) => /npm\s+run\s+dev|\bvite\b/i.test(e.command ?? '')) ||
+        okShell.some((e) => e.kind === 'preview_ok')
+      )
+    }
+    return runShell.length > 0
   }
   const namedFile = t.match(
-    /[\w./\\-]+\.(html?|css|js|ts|tsx|jsx|py|java|cs|go|rs|c|cpp|h|kt|json|xml|toml|md|svg)/i
+    /[\w./\\-]+\.(html?|css|js|ts|tsx|jsx|py|java|cs|go|rs|c|cpp|h|kt|json|xml|toml|md|svg|mod)/i
   )
   if (
     /папк|folder|mkdir|каталог|директор/i.test(t) &&

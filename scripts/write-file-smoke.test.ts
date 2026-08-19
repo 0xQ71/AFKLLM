@@ -96,5 +96,16 @@ describe('write_file smoke', () => {
     })
     assert.equal(omitted.ok, false)
     assert.match(omitted.error ?? '', /EMPTY_WRITE/)
+    const compact = await tools.invoke({
+      id: 'empty-4',
+      name: 'write_file',
+      arguments: {
+        relative_path: 'src/App.jsx',
+        content:
+          '[HISTORY_COMPACT] This is NOT file contents (already on disk). The real file is already saved.'
+      }
+    })
+    assert.equal(compact.ok, false)
+    assert.match(compact.error ?? '', /EMPTY_WRITE/)
   })
 })

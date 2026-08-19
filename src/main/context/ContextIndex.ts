@@ -31,8 +31,7 @@ const IGNORED = new Set([
   '__pycache__',
   '.venv',
   'bin',
-  'models',
-  '.cursor'
+  'models'
 ])
 
 const TEXT_EXT = new Set([

@@ -21,8 +21,7 @@ const IGNORED = new Set([
   'coverage',
   '.cache',
   'bin',
-  'models',
-  '.cursor'
+  'models'
 ])
 
 const MAX_FILE_BYTES = 400_000

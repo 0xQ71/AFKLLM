@@ -158,6 +158,7 @@ export function looksLikeEmptyOrStubWriteContent(
   const t = content.trim()
   if (!t) return true
   if (/^FILE_COMPLETE on disk/i.test(t)) return true
+  if (/^\[HISTORY_COMPACT\b/i.test(t)) return true
   if (/^\[omitted\b/i.test(t)) return true
   if (/^\[earlier write omitted/i.test(t)) return true
   if (/do not rewrite/i.test(t) && t.length < 160) return true
@@ -169,9 +170,25 @@ export function formatEmptyWriteError(relativePath: string): string {
   const p = (relativePath ?? '').replace(/\\/g, '/') || 'the file'
   return (
     `EMPTY_WRITE: relative_path="${p}" is not a write. Put the FULL file in the content argument. ` +
-    'Do not copy compact stubs (note / FILE_COMPLETE on disk / [omitted]). ' +
+    'Do not copy compact stubs (note / FILE_COMPLETE on disk / [HISTORY_COMPACT] / [omitted]). ' +
     'Do not call write_file with only a path.'
   )
+}
+
+/** Short chip suffix for blocked writes — EMPTY_WRITE is not “use apply_diff”. */
+export function formatWriteRedirectChip(err: string, uiLang: 'ru' | 'en' = 'en'): string {
+  const ru = uiLang === 'ru'
+  if (/EMPTY_WRITE/i.test(err)) {
+    return ru
+      ? ' — пустая запись, нужен полный content'
+      : ' — empty write, put the full file in content'
+  }
+  if (/STUB_ON_DISK/i.test(err)) {
+    return ru
+      ? ' — на диске stub, нужен полный write_file'
+      : ' — stub on disk, write the full file'
+  }
+  return ru ? ' — нужен apply_diff, не полная перепись' : ' — use apply_diff, not a full rewrite'
 }
 
 /**
@@ -192,6 +209,8 @@ export function contentLooksStructurallyComplete(
     return /<\/html\s*>/i.test(t)
   }
   if (ext === '.json' || ext === '.jsonc') {
+    // apply_diff hunks / wrong-file buffers are not JSON — do not flag as truncated package.json.
+    if (!t.startsWith('{') && !t.startsWith('[')) return true
     try {
       JSON.parse(t.replace(/^\s*\/\/[^\n]*\n/gm, ''))
       return true

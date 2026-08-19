@@ -6,6 +6,8 @@
  * leaves is valid. Keys may be unquoted identifiers, not only `'key'`.
  */
 
+import { isViteConfigPath, looksLikeViteReactTask } from './landingWriteCap'
+
 export const I18N_SANITY_PREFIX = 'I18N_SANITY:'
 
 /** Full page on disk — JS↔HTML id/key matching before this is noise (JS-first landings). */
@@ -232,10 +234,18 @@ export function htmlHasEmptyI18nShells(html: string): boolean {
   return countEmptyDataI18nNodes(html) >= 3
 }
 
-export function formatI18nSanityHint(opts: { html?: string; js?: string }): string | null {
+export function formatI18nSanityHint(opts: {
+  html?: string
+  js?: string
+  jsPath?: string
+  userText?: string
+}): string | null {
   const html = opts.html ?? ''
   const js = opts.js ?? ''
   if (!html.trim() && !js.trim()) return null
+  if (looksLikeViteReactTask(opts.userText, html, opts.jsPath)) return null
+  if (isViteConfigPath(opts.jsPath ?? '')) return null
+  if (/\.(jsx|tsx)$/i.test(opts.jsPath ?? '')) return null
   const htmlReady = htmlReadyForI18nContract(html)
   const parts: string[] = []
   if (htmlReady && htmlHasEmptyI18nShells(html)) {
@@ -260,7 +270,7 @@ export function formatI18nSanityHint(opts: { html?: string; js?: string }): stri
   const missingKeys = missingI18nKeysInJs(html, js)
   const htmlKeys = extractDataI18nKeys(html)
   const foundKeys = htmlKeys.filter((k) => jsHasI18nKey(js, k)).length
-  if (htmlReady && htmlKeys.length >= 3 && foundKeys < 2) {
+  if (htmlReady && js.trim() && htmlKeys.length >= 3 && foundKeys < 2) {
     parts.push(
       `${I18N_SANITY_PREFIX} data-i18n keys missing from JS dict: ${missingKeys.slice(0, 8).join(', ')}. ` +
         'Keys may be identifiers (heroSubtitle:) not only quoted strings. Align HTML keys with js/main.js in ONE write. Do NOT node -e / tmp/check.js.'

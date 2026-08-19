@@ -73,11 +73,13 @@ import {
   pendingPlanWork,
   isFileWorkPlanStep,
   shouldNudgeRemainingFileWork,
+  reopenTodosForMissingViteReact,
   looksLikeOpenHtmlCommand,
   isLandingJsPath,
   looksLikeLandingBuildTask,
   looksLikeEmptyOrStubWriteContent,
   formatEmptyWriteError,
+  formatWriteRedirectChip,
   evaluateAcceptanceGate,
   userAskedForCliSmoke,
   fingerprintToolCall,
@@ -93,6 +95,8 @@ import {
   settlePlanAfterWork,
   isJunkPlanStep,
   isFalseSuccessProse,
+  preferUserFacingCloser,
+  looksTruncatedCloser,
   isRedundantPlanCompleteProse,
   isAgentChatNoise,
   detectProseStutter,
@@ -132,12 +136,24 @@ import { diffStatFromCodePreview } from '../../../shared/diffStat'
 import { isAfkllmInternalHtmlPath } from '../../../shared/localPreview'
 import { stubWriteFileArgs } from './loop/compactWrites'
 import { formatI18nCloserWhy, inventedI18nVerifierPath } from './loop/i18nSanity'
+import { formatEditSanityHint, isEditSanityFailure } from './loop/editSanity'
 import {
   formatScratchWriteFileHint,
   formatWriteFileRequiredError,
   formatLandingJsBeforeHtmlHint,
   isCappedLandingWritePath,
+  isLandingPageScriptPath,
+  isViteConfigPath,
   landingBundleReady,
+  looksLikeViteReactTask,
+  looksLikeViteReactFromScratch,
+  userAskedViteReactPreview,
+  looksLikeDevOrPreviewCommand,
+  shellResultOpenedPreview,
+  collectPathsFromTreeText,
+  viteReactScaffoldMissing,
+  formatViteReactScaffoldHint,
+  formatViteReactPreviewHint,
   shouldRequireWriteFileForApply
 } from './loop/landingWriteCap'
 import { AGENT_MAX_TOKENS, maxTokensForAgent } from './loop/ctxBudget'
@@ -476,6 +492,7 @@ The app first runs ONE THINK-ONLY completion, then PLAN_ONLY, then tools.
 2) PLAN_ONLY: <plan> with 3–6 atomic product steps. FORBIDDEN plan rows: "if patch fails rewrite whole file", tool names, CSS class dumps.
 This runs again for EVERY user message. Earlier reasoning in the conversation belongs to previous messages — it never exempts you from thinking about the current one.
 Within one message, after the prelude: NEVER open another <think> or <plan>. Call tools immediately.
+Execute-round notes (if any) and the closer MUST match the user's language. Russian user → Russian notes, not "CSS written successfully".
 Do NOT Start-Process / browser / done-summary until non-browser plan steps are done.
 `
 
@@ -835,9 +852,24 @@ function looksLikeClosingSummary(text: string): boolean {
     /что\s+изменил|как\s+проверить|what\s+changed|how\s+to\s+(verify|check)|file paths?|путь|paths?:/i.test(
       t
     ) ||
+    /превью\s+открыт|preview\s+opened|открыт[оа]\s+в\s+(браузер|приложении|AFKLLM)/i.test(t) ||
+    /npm run dev|localhost:\d+|dev server|файл[аы]?\s+создан|created \d+ files|port \d{4}/i.test(
+      t
+    ) ||
     (/^\s*[-*•\d]/m.test(t) &&
       /создан|измен|обнов|added|updated|edited|fixed|написан|готово|done\b/i.test(t))
   )
+}
+
+/** Status ↻ chatter may go; think + user-facing prose must stay in the transcript. */
+function isKeepableChatBubble(m: ChatMessage | undefined): boolean {
+  if (!m) return false
+  if (isClosingMessageId(m.id)) return true
+  const c = (m.content ?? '').trim()
+  if (!c) return false
+  if (/<\s*(?:think|thinking)\s*>/i.test(c)) return true
+  if (/^↻ /.test(c)) return false
+  return true
 }
 
 /** Persist the turn closing summary so later turns cannot splice/overwrite it away. */
@@ -850,7 +882,7 @@ function ensureClosingMessage(
   userMessageId: string,
   text: string
 ): void {
-  const content = text.trim()
+  const content = stripThinkBlocks(text).trim()
   if (!content || /^↻ /.test(content) || /^⏹ /.test(content)) return
   if (isAgentChatNoise(content) && content.length < 80) return
   const id = closingMessageId(userMessageId)
@@ -1023,6 +1055,7 @@ function isHtmlPreviewShell(cmd: string): boolean {
   const c = String(cmd ?? '')
   if (!c.trim()) return false
   if (looksLikeOpenHtmlCommand(c)) return true
+  if (/start\s+https?:\/\/(?:127\.0\.0\.1|localhost):\d+/i.test(c)) return true
   return (
     /\.html?\b/i.test(c) &&
     /Start-Process|Invoke-Item|\bii\b|explorer\.exe/i.test(c)
@@ -2016,9 +2049,17 @@ function statsFromResult(
 
 function sanitizeStreamAssistantText(raw: string): string {
   const stripped = stripPlanBlock(raw)
+  if (!stripped.trim()) return ''
   const prose = sanitizeThinkProse(stripped)
   if (thinkBodyLooksLikeCodeDump(stripped)) {
-    return prose ? wrapThinkForUi(prose) : ''
+    if (hasThinkBlock(stripped)) {
+      const rest = stripThinkBlocksLive(stripped).trim()
+      if (prose && rest) return `${wrapThinkForUi(prose)}\n\n${rest}`
+      if (prose) return wrapThinkForUi(prose)
+      // Fenced closer / file list — keep visible, do not empty the bubble.
+      return rest || stripped
+    }
+    return stripped
   }
   if (hasThinkBlock(stripped)) {
     const rest = stripPlanBlock(
@@ -2026,7 +2067,7 @@ function sanitizeStreamAssistantText(raw: string): string {
     ).trim()
     if (prose && rest) return `${wrapThinkForUi(prose)}\n\n${rest}`
     if (prose) return wrapThinkForUi(prose)
-    return rest
+    return rest || stripped
   }
   return promoteThinkOnlyAnswer(stripped)
 }
@@ -2161,6 +2202,7 @@ export async function runAgentTurn(params: {
 
   const turnStartedAt = Date.now()
   const turnFileChanges = new Map<string, TurnFileChange>()
+  const writtenOkPaths = new Set<string>()
 
   const commitTurnCheckpoint = (): void => {
     if (!params.sessionId || isPlan) return
@@ -2229,13 +2271,14 @@ export async function runAgentTurn(params: {
   let lastHtmlWrite = ''
   let lastHtmlWritePath = 'index.html'
   let lastJsWrite = ''
-  let lastJsWritePath = 'js/main.js'
+  let lastJsWritePath = ''
   let lastCssWrite = ''
-  let lastCssWritePath = 'styles.css'
+  let lastCssWritePath = ''
   let i18nSanityFailed = false
   let lastI18nHint = ''
   let i18nRecoveryEdits = 0
   let editSanityFailed = false
+  let truncatedCloserNudged = false
   const completeLandingWritesByPath = new Map<string, number>()
   const landingRecoveryUsedByPath = new Set<string>()
   const completeHtmlByPath = new Set<string>()
@@ -2326,6 +2369,8 @@ export async function runAgentTurn(params: {
   }
 
   let planFinishNudges = 0
+  let scaffoldFinishNudges = 0
+  let previewNudges = 0
   let sectionFillTried = true
   /** A mutating edit (write_file / apply_diff / apply_patch) succeeded this turn. */
   let mutatingEditOk = false
@@ -2366,7 +2411,7 @@ export async function runAgentTurn(params: {
         userText: params.userText,
         images: imageRefs,
         signal: params.signal,
-        keepLoaded: reuseVision || appSettings.visionKeepLoaded !== false,
+        keepLoaded: reuseVision || appSettings.visionKeepLoaded === true,
         directAnswer: imageQa
       })
       if (params.signal?.aborted) return finishStopped()
@@ -2876,7 +2921,9 @@ export async function runAgentTurn(params: {
         : 'PLAN_ONLY (tools still DISABLED). Output ONLY <plan>…</plan> with 3–9 ATOMIC steps from the user request ' +
             'and your prior <think> (what to create/change, in order). ' +
             'If the user asked CSS/JS/assets before index.html, list steps in that dependency order (folders/assets → CSS → JS → HTML → README → preview). ' +
-            'FORBIDDEN: tool names (execute_terminal_command, write_file, Start-Process, read_file, explore_subagent, web_search), CSS class names as steps, ' +
+            'If they asked a fact from the internet, include a step like «найти актуальную версию в интернете» (do not write the tool name web_search). ' +
+            'Edit/create steps BEFORE run/test. Summary last. ' +
+            'FORBIDDEN as step text: tool names (execute_terminal_command, write_file, Start-Process, read_file, explore_subagent, web_search), CSS class names as steps, ' +
             'syntax-check shells, GitHub curl/clone, «Закрыть», mega-steps, code, <think>. Stop after </plan>.'
     )
     apiMessages = normalizeApiMessages(apiMessages)
@@ -2986,6 +3033,10 @@ export async function runAgentTurn(params: {
         content: `<plan>\n${planFromPrelude.map((s) => `- [ ] ${s.text}`).join('\n')}\n</plan>`
       })
     }
+    const executeLangRule =
+      uiLang === 'ru'
+        ? ' Пиши заметки execute и заключение ПО-РУССКИ. Запрещён английский meta («CSS written successfully», «Now I need to write», «I should summarize in Russian») — сразу пиши текст для пользователя. Инструменты не комментируй (их показывают чипы). В заключении вставь реальный stdout, не только exit_code.'
+        : ' User-facing notes and the closer must match the UI language. Do not narrate tool calls — chips already show them. In the closer, paste real stdout, not only exit_code.'
     pushUserMessage(
       apiMessages,
       allowsComposerFullRewrite(params.userText)
@@ -2998,13 +3049,15 @@ export async function runAgentTurn(params: {
             'After styles.css exists, index.html MUST reuse its class names; inline SVG needs width/height; JS keys must match HTML data-i18n. ' +
             'After CSS+HTML+JS exist, Start-Process once and STOP. ' +
             'Do not Start-Process / browser / done-summary until non-browser plan steps are done. ' +
-            'If a tool edit fails, say so honestly — never claim "Сделано" / "done" when the change did not apply.'
+            'If a tool edit fails, say so honestly — never claim "Сделано" / "done" when the change did not apply.' +
+            executeLangRule
         : 'Think/plan already recorded. Do NOT output another <think> or <plan>. ' +
             'Call tools NOW to execute the plan IN ORDER. YOU decide: create missing files with write_file; ' +
             'edit existing HTML/CSS/JS with apply_diff instruction (or a short search_block) — never write_file overwrite a complete module. ' +
             'Do not Start-Process / browser / done-summary until non-browser plan steps are done — ' +
             'EXCEPT when index.html is already a complete landing on disk and the user wants it opened: then Start-Process first. ' +
-            'If a tool edit fails, say so honestly — never claim "Сделано" / "done" when the change did not apply.'
+            'If a tool edit fails, say so honestly — never claim "Сделано" / "done" when the change did not apply.' +
+            executeLangRule
     )
     apiMessages = normalizeApiMessages(apiMessages)
     thinkSatisfied = true
@@ -3412,7 +3465,9 @@ export async function runAgentTurn(params: {
     if (stats) params.onStats?.(stats)
     if (sIdx !== -1) {
       if (!result.text?.trim()) {
-        if (!isClosingMessageId(messages[sIdx]?.id) && !concludeAsked) {
+        if (isKeepableChatBubble(messages[sIdx])) {
+          messages[sIdx] = { ...messages[sIdx]!, streaming: false }
+        } else if (!isClosingMessageId(messages[sIdx]?.id) && !concludeAsked) {
           messages.splice(sIdx, 1)
         }
         if (stats) attachStatsToLastVisible(messages, stats)
@@ -3453,23 +3508,33 @@ export async function runAgentTurn(params: {
               stripPlanBlock(promoteThinkOnlyAnswer(result.text || rawBubble)).trim()
             if (salvaged && (concludeAsked || looksLikeClosingSummary(salvaged))) {
               lastClosingText = salvaged
-              const closeId = closingMessageId(userMessageId)
-              for (let i = messages.length - 1; i >= 0; i--) {
-                if (i === sIdx) continue
-                if (messages[i]?.id === closeId) messages.splice(i, 1)
-                else if (
-                  /^↻\s*(Пишу заключение|Writing closing)/i.test(
-                    messages[i]?.content ?? ''
-                  )
-                ) {
-                  messages.splice(i, 1)
+              const thinkInner = extractThinkInner(rawBubble)
+              if (thinkInner && thinkInner.trim().length >= 20) {
+                messages[sIdx] = {
+                  ...messages[sIdx]!,
+                  content: wrapThinkForUi(thinkInner),
+                  streaming: false
                 }
-              }
-              messages[sIdx] = {
-                ...messages[sIdx]!,
-                id: closeId,
-                content: salvaged,
-                streaming: false
+                ensureClosingMessage(messages, userMessageId, salvaged)
+              } else {
+                const closeId = closingMessageId(userMessageId)
+                for (let i = messages.length - 1; i >= 0; i--) {
+                  if (i === sIdx) continue
+                  if (messages[i]?.id === closeId) messages.splice(i, 1)
+                  else if (
+                    /^↻\s*(Пишу заключение|Writing closing)/i.test(
+                      messages[i]?.content ?? ''
+                    )
+                  ) {
+                    messages.splice(i, 1)
+                  }
+                }
+                messages[sIdx] = {
+                  ...messages[sIdx]!,
+                  id: closeId,
+                  content: salvaged,
+                  streaming: false
+                }
               }
             }
           }
@@ -3686,13 +3751,12 @@ export async function runAgentTurn(params: {
     let toolCalls = result.toolCalls
     if (!toolCalls?.length && looksLikeToolMarkupLeak(result.text ?? '')) {
       const salvaged = salvageLeakedToolCalls(result.text ?? '')
-      if (salvaged.length) {
-        toolCalls = salvaged
-        result.toolCalls = salvaged
-        result.text = stripLeakedToolMarkup(result.text ?? '')
+      const stripped = stripLeakedToolMarkup(result.text ?? '')
+      if (stripped !== (result.text ?? '')) {
+        result.text = stripped
         const si = messages.findIndex((m) => m.id === streamId)
         if (si !== -1) {
-          const cleaned = sanitizeStreamAssistantText(result.text)
+          const cleaned = sanitizeStreamAssistantText(stripped)
           messages[si] = {
             ...messages[si]!,
             content: cleaned || messages[si]!.content,
@@ -3700,6 +3764,10 @@ export async function runAgentTurn(params: {
           }
           params.onUpdate([...messages])
         }
+      }
+      if (salvaged.length) {
+        toolCalls = salvaged
+        result.toolCalls = salvaged
       }
     }
     logAgentToolEvent('round result', {
@@ -3819,19 +3887,14 @@ export async function runAgentTurn(params: {
         tool_calls: toolCalls
       })
 
-      // Clear sticky «Правлю…» / placeholder stream bubble once real tools start.
+      // Keep think / user-facing prose; only drop sticky «Правлю…» status.
       {
         const siClear = messages.findIndex((m) => m.id === streamId)
         if (siClear !== -1) {
-          const prev = messages[siClear]!
-          const placeholder =
-            prev.streaming === true &&
-            (/^↻\s*(Правлю|Editing|Пишу)/i.test((prev.content ?? '').trim()) ||
-              !(result.text ?? '').trim())
-          if (placeholder && !(result.text ?? '').trim()) {
+          if (isKeepableChatBubble(messages[siClear])) {
+            messages[siClear] = { ...messages[siClear]!, streaming: false }
+          } else {
             messages.splice(siClear, 1)
-          } else if (prev.streaming) {
-            messages[siClear] = { ...prev, streaming: false }
           }
         }
       }
@@ -4011,6 +4074,47 @@ export async function runAgentTurn(params: {
             id: call.id,
             name,
             ...budgeted
+          }
+        } else if (
+          name === 'execute_terminal_command' &&
+          looksLikeViteReactFromScratch(params.userText) &&
+          !looksLikeSurgicalFollowUp(params.userText) &&
+          looksLikeDevOrPreviewCommand(String(args.command ?? ''))
+        ) {
+          const cmd = String(args.command ?? '')
+          const missingNow = viteReactScaffoldMissing([
+            ...writtenOkPaths,
+            ...turnFileChanges.keys()
+          ])
+          if (missingNow.length) {
+            toolResult = {
+              id: call.id,
+              name,
+              ok: false,
+              content: '',
+              error: formatViteReactScaffoldHint(missingNow)
+            }
+          } else if (htmlPreviewOpened) {
+            toolLoopHits++
+            toolResult = {
+              id: call.id,
+              name,
+              ok: false,
+              content: '',
+              error:
+                'TOOL_LOOP: preview already opened this turn (PREVIEW_URL). ' +
+                'Write the closing summary as visible assistant text OUTSIDE <think>, then STOP. Do not rerun npm.'
+            }
+          } else {
+            toolResult = await window.api.agent.invoke({
+              id: call.id,
+              name,
+              arguments: args
+            })
+            syntheticResult = false
+            if (toolResult.ok && shellResultOpenedPreview(toolResult.content)) {
+              htmlPreviewOpened = true
+            }
           }
         } else if (
           name === 'execute_terminal_command' &&
@@ -4624,7 +4728,10 @@ export async function runAgentTurn(params: {
           ) {
             ranCliSmoke = true
           }
-          if (isHtmlPreviewShell(cmd) && toolResult.ok) {
+          if (
+            toolResult.ok &&
+            (isHtmlPreviewShell(cmd) || shellResultOpenedPreview(toolResult.content))
+          ) {
             htmlPreviewOpened = true
           }
         }
@@ -4720,6 +4827,7 @@ export async function runAgentTurn(params: {
             mutatingEditOk = true
             mutatingEditFailed = false
           }
+          if (wrotePath) writtenOkPaths.add(wrotePath)
         } else if (
           !toolResult.ok &&
           (name === 'write_file' || name === 'apply_diff' || name === 'apply_patch') &&
@@ -4745,15 +4853,13 @@ export async function runAgentTurn(params: {
           const wp =
             filePath ||
             (typeof args.relative_path === 'string' ? args.relative_path : '')
-          if (
-            /<html[\s>]|<!DOCTYPE/i.test(body) ||
-            contentLooksStructurallyComplete(body) ||
-            (wp && /\.html?$/i.test(wp))
-          ) {
+          const looksHtmlDoc =
+            /<!DOCTYPE\s+html|<html[\s>]/i.test(body) && /<\/html/i.test(body)
+          if (looksHtmlDoc || (wp && /\.html?$/i.test(wp))) {
             lastHtmlWrite = args.append ? `${lastHtmlWrite}${body}` : body
             if (wp) lastHtmlWritePath = wp
           }
-          if (wp && /\.jsx?$/i.test(wp)) {
+          if (wp && /\.(jsx?|tsx|mjs|cjs)$/i.test(wp) && !isViteConfigPath(wp)) {
             lastJsWrite = args.append ? `${lastJsWrite}${body}` : body
             lastJsWritePath = wp
           }
@@ -4761,6 +4867,7 @@ export async function runAgentTurn(params: {
             lastCssWrite = args.append ? `${lastCssWrite}${body}` : body
             lastCssWritePath = wp
           }
+          if (wp) writtenOkPaths.add(wp.replace(/\\/g, '/'))
           if (
             contentLooksStructurallyComplete(lastHtmlWrite)
           ) {
@@ -4802,7 +4909,8 @@ export async function runAgentTurn(params: {
         if (
           toolResult.ok &&
           (name === 'apply_diff' || name === 'apply_patch') &&
-          /\.jsx?$/i.test(filePath || String(args.relative_path ?? ''))
+          /\.(jsx?|tsx|mjs|cjs)$/i.test(filePath || String(args.relative_path ?? '')) &&
+          !isViteConfigPath(filePath || String(args.relative_path ?? ''))
         ) {
           const jsPath =
             filePath ||
@@ -4871,13 +4979,20 @@ export async function runAgentTurn(params: {
               /* ignore */
             }
           }
-          const body =
-            (typeof args.content === 'string' && args.content) ||
+          let body =
+            (typeof args.content === 'string' && name === 'write_file' ? args.content : '') ||
             (/\.html?$/i.test(written) ? lastHtmlWrite : '') ||
-            (/\.jsx?$/i.test(written) ? lastJsWrite : '') ||
+            (/\.(jsx?|tsx|mjs|cjs)$/i.test(written) ? lastJsWrite : '') ||
             (/\.css$/i.test(written) ? lastCssWrite : '') ||
-            lastJsWrite ||
-            lastHtmlWrite
+            ''
+          if (!body && written) {
+            try {
+              const disk = await window.api.workspace.readFile(written)
+              if (disk.ok && typeof disk.content === 'string') body = disk.content
+            } catch {
+              /* ignore */
+            }
+          }
           const capKey = loopPathKey(written)
           const writesBefore = capKey
             ? (completeLandingWritesByPath.get(capKey) ?? 0)
@@ -4890,13 +5005,52 @@ export async function runAgentTurn(params: {
           ) {
             completeLandingWritesByPath.set(capKey, writesBefore + 1)
           }
+          const sanity = formatEditSanityHint({
+            path: written,
+            content: body,
+            html: html || lastHtmlWrite,
+            js: lastJsWrite,
+            css: lastCssWrite,
+            cssPath: lastCssWritePath,
+            jsPath: lastJsWritePath,
+            userText: params.userText
+          })
+          if (sanity && isEditSanityFailure(sanity)) {
+            toolResult = {
+              ...toolResult,
+              content: `${toolResult.content || ''}\n${sanity}`.trim()
+            }
+            editSanityFailed = /EDIT_SANITY/i.test(sanity)
+            i18nSanityFailed = /I18N_SANITY/i.test(sanity)
+            if (i18nSanityFailed) lastI18nHint = sanity
+          } else {
+            editSanityFailed = false
+            i18nSanityFailed = false
+          }
           if (
-            /\.(js|mjs|cjs)$/i.test(written) &&
+            isLandingPageScriptPath(written) &&
+            !looksLikeViteReactTask(params.userText, lastHtmlWrite || html, written) &&
             !contentLooksStructurallyComplete(lastHtmlWrite || html || '', 'index.html')
           ) {
             toolResult = {
               ...toolResult,
               content: `${toolResult.content || ''}\n${formatLandingJsBeforeHtmlHint()}`.trim()
+            }
+          }
+          if (
+            looksLikeViteReactFromScratch(params.userText) &&
+            !looksLikeSurgicalFollowUp(params.userText)
+          ) {
+            const missingNow = viteReactScaffoldMissing([
+              ...writtenOkPaths,
+              ...turnFileChanges.keys(),
+              written
+            ])
+            if (missingNow.length) {
+              toolResult = {
+                ...toolResult,
+                content: `${toolResult.content || ''}\n${formatViteReactScaffoldHint(missingNow)}`.trim()
+              }
             }
           }
         }
@@ -5139,9 +5293,10 @@ export async function runAgentTurn(params: {
                   .replace(/\s+/g, ' ')
                   .slice(0, name === 'generate_image' ? 400 : 140)}`
               : softRedirect
-                ? uiLang === 'ru'
-                  ? ' — нужен apply_diff, не полная перепись'
-                  : ' — use apply_diff, not a full rewrite'
+                ? formatWriteRedirectChip(
+                    toolResult.error ?? toolResult.content ?? content,
+                    uiLang
+                  )
                 : ''
           messages[idx] = {
             ...messages[idx],
@@ -5280,9 +5435,11 @@ export async function runAgentTurn(params: {
         concludeAsked = true
         appendToolHint(
           apiMessages,
-          'STOP. Files were written and the preview is already open. ' +
-            'Do NOT Start-Process again, do NOT get_diagnostics, do NOT patch more. ' +
-            'Write a short closing summary (what changed, paths) and end the turn.'
+          uiLang === 'ru'
+            ? 'СТОП. Файлы записаны, превью уже открыто. Не вызывай Start-Process / get_diagnostics / патчи снова. Напиши краткое заключение на русском (что изменилось, пути) и закончи ход.'
+            : 'STOP. Files were written and the preview is already open. ' +
+              'Do NOT Start-Process again, do NOT get_diagnostics, do NOT patch more. ' +
+              'Write a short closing summary (what changed, paths) and end the turn.'
         )
         apiMessages = normalizeApiMessages(apiMessages)
         params.onUpdate([...messages])
@@ -5553,7 +5710,7 @@ export async function runAgentTurn(params: {
     }
 
     // Final assistant text must enter apiMessages before any follow-up user nudge
-    const rawFinal = (result.text ?? '').trim()
+    const rawFinal = preferUserFacingCloser((result.text ?? '').trim(), uiLang)
     const stuttered = streamAbortReason === 'prose_stutter' || detectProseStutter(rawFinal)
     const cleanFinal = stuttered ? dedupeStutteringProse(rawFinal) : rawFinal
 
@@ -5723,9 +5880,14 @@ export async function runAgentTurn(params: {
       planFrozen = true
       paintTodo(todoSteps, { afterId: thinkBubbleId ?? undefined })
     }
-    let finalText = stripPlanBlock(promoteThinkOnlyAnswer(cleanFinal))
+    let finalText = stripPlanBlock(
+      looksLikeFileEditRequest(params.userText) ||
+        looksLikeViteReactFromScratch(params.userText)
+        ? stripThinkBlocks(cleanFinal)
+        : promoteThinkOnlyAnswer(cleanFinal)
+    )
     const claimsEditSuccess =
-      /сделано|готово|исправлен|fixed|done\.|task completed|визуально проверен|файлы?\s+создан|files?\s+created/i.test(
+      /сделано|готово|исправлен|fixed|done\.|task completed|полностью работает|fully working|полностью готов|визуально проверен|файлы?\s+создан|files?\s+created/i.test(
         finalText
       )
     const claimsVisualOk = /визуально проверен|visually verified|проверено в (браузер|browser)|opened in.*browser/i.test(
@@ -5737,14 +5899,13 @@ export async function runAgentTurn(params: {
       ) &&
       /faq|accordion|т[её]мн|бел/i.test(params.userText)
     if (
-      looksLikeSurgicalFollowUp(params.userText) &&
-      mutatingEditOk &&
+      (htmlPreviewOpened || mutatingEditOk) &&
       !mutatingEditFailed &&
       !editSanityFailed
     ) {
       todoSteps = settlePlanAfterWork(todoSteps, {
         previewOpened: htmlPreviewOpened,
-        edited: true
+        edited: mutatingEditOk
       })
     }
     if (todoSteps.length > 0) {
@@ -5793,7 +5954,9 @@ export async function runAgentTurn(params: {
           isAgentTodoMessageId(m.id) ||
           m.id === AGENT_CHECKLIST_MSG_ID ||
           m.id === AGENT_PLAN_MSG_ID ||
-          isClosingMessageId(m.id)
+          isClosingMessageId(m.id) ||
+          m.id === thinkBubbleId ||
+          /<\s*(?:think|thinking)\s*>/i.test(m.content ?? '')
         ) {
           continue
         }
@@ -5817,6 +5980,27 @@ export async function runAgentTurn(params: {
           (finalText ? `${finalText} ` : '') +
           '(Browser preview was not opened — visual-verification claim removed.)'
       }
+    }
+
+    if (
+      looksTruncatedCloser(finalText) &&
+      !truncatedCloserNudged &&
+      round < maxRounds - 1
+    ) {
+      truncatedCloserNudged = true
+      pushUserMessage(
+        apiMessages,
+        uiLang === 'ru'
+          ? 'Заключение обрезано (обрыв URL или незакрытая кавычка). Допиши последнее предложение целиком. Без новых tool calls, если задача иначе готова.'
+          : 'The closing summary was truncated (cut URL or unmatched backtick). Finish the last sentence completely. No new tool calls if the work is otherwise done.'
+      )
+      apiMessages = normalizeApiMessages(apiMessages)
+      pushStatusBubble(
+        messages,
+        uiLang === 'ru' ? '↻ Дописываю заключение…' : '↻ Finishing truncated closer…'
+      )
+      params.onUpdate([...messages])
+      continue
     }
 
     if (finalText || cleanFinal) {
@@ -5849,13 +6033,115 @@ export async function runAgentTurn(params: {
       }
     }
 
+    const viteScratch =
+      looksLikeViteReactFromScratch(params.userText) &&
+      !looksLikeSurgicalFollowUp(params.userText)
+    const viteMissing = viteScratch
+      ? viteReactScaffoldMissing([
+          ...writtenOkPaths,
+          ...turnFileChanges.keys(),
+          ...collectPathsFromTreeText(await fetchProjectTreeDigest())
+        ])
+      : []
+    const previewWanted = viteScratch && userAskedViteReactPreview(params.userText)
+    const previewOk = !previewWanted || htmlPreviewOpened
+    const closerVisible = preferUserFacingCloser(finalText || cleanFinal, uiLang).trim()
+
+    const dropPrematureCloser = (): void => {
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const m = messages[i]
+        if (!m || m.role !== 'assistant' || m.toolName) continue
+        if (isClosingMessageId(m.id) || isAgentTodoMessageId(m.id)) continue
+        if (/^↻ /.test(m.content ?? '') || /^⏹ /.test(m.content ?? '')) continue
+        const visible = preferUserFacingCloser(m.content ?? '', uiLang)
+        if (looksLikeClosingSummary(visible)) {
+          messages.splice(i, 1)
+          break
+        }
+      }
+    }
+
+    if (
+      viteScratch &&
+      viteMissing.length > 0 &&
+      completedTools > 0 &&
+      scaffoldFinishNudges < 4 &&
+      round < maxRounds - 1
+    ) {
+      dropPrematureCloser()
+      scaffoldFinishNudges++
+      todoSteps = reopenTodosForMissingViteReact(todoSteps, viteMissing)
+      if (todoSteps.length > 0) {
+        paintTodo(todoSteps, { afterId: thinkBubbleId ?? undefined })
+      }
+      const tree = await fetchProjectTreeDigest()
+      pushUserMessage(apiMessages, formatViteReactScaffoldHint(viteMissing) + tree)
+      apiMessages = normalizeApiMessages(apiMessages)
+      pushStatusBubble(
+        messages,
+        uiLang === 'ru'
+          ? '↻ Vite+React ещё не собран — дописываю недостающие файлы…'
+          : '↻ Vite+React scaffold incomplete — writing missing files…'
+      )
+      params.onUpdate([...messages])
+      continue
+    }
+
+    const viteWorkDone =
+      (!viteScratch || viteMissing.length === 0) &&
+      previewOk &&
+      !mutatingEditFailed &&
+      !editSanityFailed
+
+    if (
+      viteWorkDone &&
+      closerVisible.length >= 48 &&
+      looksLikeClosingSummary(closerVisible)
+    ) {
+      lastClosingText = closerVisible
+      ensureClosingMessage(messages, userMessageId, closerVisible)
+      params.onUpdate([...messages])
+      return finishWithTiming(messages)
+    }
+
+    if (viteWorkDone && lastClosingText.trim()) {
+      ensureClosingMessage(messages, userMessageId, lastClosingText)
+      params.onUpdate([...messages])
+      return finishWithTiming(messages)
+    }
+
+    if (
+      previewWanted &&
+      viteMissing.length === 0 &&
+      !htmlPreviewOpened &&
+      mutatingEditOk &&
+      previewNudges < 1 &&
+      round < maxRounds - 1
+    ) {
+      dropPrematureCloser()
+      previewNudges++
+      pushUserMessage(apiMessages, formatViteReactPreviewHint())
+      apiMessages = normalizeApiMessages(apiMessages)
+      pushStatusBubble(
+        messages,
+        uiLang === 'ru'
+          ? '↻ Файлы есть — запускаю dev-сервер и превью…'
+          : '↻ Files are on disk — starting dev server and preview…'
+      )
+      params.onUpdate([...messages])
+      continue
+    }
+
     // After tools ran with no visible closing summary — only conclude when the plan is done.
     if (
       completedTools > 0 &&
       !finalText.trim() &&
+      !lastClosingText.trim() &&
       !concludeAsked &&
       round < maxRounds - 1 &&
-      pendingPlanWork(todoSteps).length === 0
+      pendingPlanWork(todoSteps).length === 0 &&
+      !(viteScratch && viteMissing.length > 0) &&
+      !(previewWanted && !htmlPreviewOpened)
     ) {
       concludeAsked = true
       const changedThisTurn = [...turnFileChanges.values()]
@@ -5874,8 +6160,8 @@ export async function runAgentTurn(params: {
             ? `Правка не удалась${lastMutatingFailDetail ? ` (${lastMutatingFailDetail})` : ''}. Напиши честное короткое заключение: что не применилось и почему. ${scopeNote} Без ложного «Сделано». Без новых tool calls, если больше нечего пробовать; иначе один corrective apply_diff.`
             : `The edit failed${lastMutatingFailDetail ? ` (${lastMutatingFailDetail})` : ''}. Write an honest short summary: what did not apply and why. ${scopeNote} Do not claim "done". No new tools if nothing left to try; otherwise one corrective apply_diff.`
           : uiLang === 'ru'
-            ? `Инструменты уже выполнены. Напиши краткое заключение (2–5 пунктов): что изменилось, пути файлов, как проверить. ${scopeNote} Без новых tool calls, если задача завершена; иначе один следующий tool, затем заключение.`
-            : `Tools already ran. Write a short closing summary (2–5 bullets): what changed, file paths, how to verify. ${scopeNote} No new tool calls if the task is done; otherwise one next tool, then the summary.`
+            ? `Инструменты уже выполнены. Напиши краткое заключение (2–5 пунктов) ОБЫЧНЫМ текстом, не внутри <think>: что изменилось, пути файлов, как проверить. Покажи реальный stdout терминала, не только exit_code. ${scopeNote} Если превью/dev уже с exit_code=0 — это успех: заключение один раз и STOP, не повторяй npm. Иначе один следующий tool, затем заключение.`
+            : `Tools already ran. Write a short closing summary (2–5 bullets) as visible text OUTSIDE <think>: what changed, file paths, how to verify. Paste real stdout, not only exit_code. ${scopeNote} If preview/dev already exited 0, that is success: one closer and STOP — do not rerun npm. Otherwise one next tool, then the summary.`
       pushUserMessage(apiMessages, concludeHint)
       apiMessages = normalizeApiMessages(apiMessages)
       pushStatusBubble(
@@ -6041,7 +6327,12 @@ export async function runAgentTurn(params: {
 
     if (
       (qaAnswerDone || isRedundantPlanCompleteProse(finalText)) &&
-      fileWorkLeft.length === 0
+      fileWorkLeft.length === 0 &&
+      !(
+        viteScratch &&
+        (viteMissing.length > 0 ||
+          (userAskedViteReactPreview(params.userText) && !htmlPreviewOpened))
+      )
     ) {
       if (todoSteps.length > 0) {
         todoSteps = todoSteps.map((s) =>
@@ -6162,7 +6453,12 @@ export async function runAgentTurn(params: {
       finalText = honest
       lastClosingText = honest
       ensureClosingMessage(messages, userMessageId, honest)
-    } else if (finalText.trim() && (concludeAsked || looksLikeClosingSummary(finalText))) {
+    } else if (
+      finalText.trim() &&
+      (concludeAsked ||
+        looksLikeClosingSummary(finalText) ||
+        (completedTools > 0 && finalText.trim().length >= 60))
+    ) {
       lastClosingText = finalText.trim()
       ensureClosingMessage(messages, userMessageId, lastClosingText)
     }

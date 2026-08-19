@@ -171,7 +171,7 @@ describe('llamaSlotPort', () => {
     assert.equal(llamaSlotPort(8080, 'vision', false), 8080)
     assert.deepEqual(llamaSlotPortsToDeny(8080).sort((a, b) => a - b), [8080, 8081, 8082])
     const { DEFAULT_SETTINGS } = await import('../src/shared/settings.ts')
-    assert.equal(DEFAULT_SETTINGS.visionKeepLoaded, true)
+    assert.equal(DEFAULT_SETTINGS.visionKeepLoaded, false)
   })
 })
 

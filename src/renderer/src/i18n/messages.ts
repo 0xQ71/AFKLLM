@@ -309,7 +309,7 @@ const en = {
     'Chat applies targeted edits. Load Chat — no second Apply GGUF.',
   'settings.model.visionKeep': 'Keep vision loaded',
   'settings.model.visionKeepHint':
-    'On: Load starts vision with chat (port+2) and leaves it in VRAM. Off: swap in on attach, unload after the description. Reload after changing.',
+    'Off (default): Load Chat starts one llama-server. Vision swaps in only when you attach a photo. On: a second llama-server (port+2) stays in VRAM with chat. Reload after changing.',
   'settings.model.visionKeepReuseHint':
     'Chat is already the VL GGUF — mmproj is attached to that one llama-server. A second copy is not started.',
   'settings.model.visionStatus': 'Vision status',
@@ -709,6 +709,7 @@ const en = {
   'activity.verb.explored': 'Explored',
   'activity.verb.editing': 'Editing',
   'activity.verb.edited': 'Edited',
+  'activity.verb.writeFailed': 'Write failed',
   'activity.verb.deleting': 'Deleting',
   'activity.verb.deleted': 'Deleted',
   'activity.verb.creating': 'Creating',
@@ -1070,7 +1071,7 @@ const ru: Record<MessageKey, string> = {
     'Точечные правки делает Chat. Загрузите Chat — второй Apply GGUF не нужен.',
   'settings.model.visionKeep': 'Держать vision в памяти',
   'settings.model.visionKeepHint':
-    'Вкл: Load поднимает vision вместе с chat (порт+2) и оставляет в VRAM. Выкл: подмена при attach фото, выгрузка после описания. После смены — Load снова.',
+    'Выкл (по умолчанию): Load Chat поднимает один llama-server. Vision подгружается только при вложении фото. Вкл: второй llama-server (порт+2) живёт в VRAM рядом с чатом. После смены — Load.',
   'settings.model.visionKeepReuseHint':
     'Chat уже VL GGUF — mmproj вешается на тот же llama-server. Вторая копия не стартует.',
   'settings.model.visionStatus': 'Статус Vision',
@@ -1471,6 +1472,7 @@ const ru: Record<MessageKey, string> = {
   'activity.verb.explored': 'Обошёл',
   'activity.verb.editing': 'Правлю',
   'activity.verb.edited': 'Правил',
+  'activity.verb.writeFailed': 'Запись не удалась',
   'activity.verb.deleting': 'Удаляю',
   'activity.verb.deleted': 'Удалил',
   'activity.verb.creating': 'Создаю',

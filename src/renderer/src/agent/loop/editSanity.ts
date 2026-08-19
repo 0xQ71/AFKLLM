@@ -1,6 +1,7 @@
 import { contentLooksStructurallyComplete } from '../../../../shared/completeness'
 import { looksLikeThemeToggleRequest, looksLikeNoCardDumpRequest } from '../agentPure'
 import { formatI18nSanityHint, I18N_SANITY_PREFIX } from './i18nSanity'
+import { looksLikeViteReactTask } from './landingWriteCap'
 
 export const EDIT_SANITY_PREFIX = 'EDIT_SANITY:'
 
@@ -143,6 +144,153 @@ export function htmlJsHasThemeControl(html: string, js: string): boolean {
   )
 }
 
+function isGameOrUiHandlerName(name: string): boolean {
+  return /^(cast|hook|strike|reel|bait|fish)/i.test(name) || /^(handle|on)[A-Z]\w*$/.test(name)
+}
+
+/**
+ * React/JSX: `castLine` / `handleClick` defined but never wired to onClick.
+ * Static — does not execute the component.
+ */
+export function unboundJsxClickHandlers(src: string): string[] {
+  const t = src ?? ''
+  if (!t.trim()) return []
+  const names: string[] = []
+  const defRe =
+    /(?:function\s+([A-Za-z_$][\w$]*)|const\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>)/g
+  let m: RegExpExecArray | null
+  while ((m = defRe.exec(t))) {
+    const n = m[1] || m[2]
+    if (n && isGameOrUiHandlerName(n) && !names.includes(n)) names.push(n)
+  }
+  return names.filter((n) => !jsxHandlerIsBound(t, n))
+}
+
+function jsxHandlerIsBound(src: string, name: string): boolean {
+  const esc = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  if (new RegExp(`\\bon[A-Z][A-Za-z]+\\s*=\\s*\\{[^}]*\\b${esc}\\b`).test(src)) {
+    return true
+  }
+  if (
+    new RegExp(
+      `addEventListener\\s*\\(\\s*['"](?:click|pointerdown|mousedown)['"]\\s*,\\s*${esc}\\b`,
+      'i'
+    ).test(src)
+  ) {
+    return true
+  }
+  return false
+}
+
+export function extractHtmlModuleScriptSrcs(html: string): string[] {
+  const out: string[] = []
+  const re = /<script\b[^>]*\bsrc\s*=\s*["']([^"']+)["']/gi
+  let m: RegExpExecArray | null
+  while ((m = re.exec(html))) {
+    const s = (m[1] ?? '').trim()
+    if (s && !out.includes(s)) out.push(s)
+  }
+  return out
+}
+
+function pathBasename(p: string): string {
+  return p.replace(/\\/g, '/').replace(/\/+$/, '').split('/').pop() ?? ''
+}
+
+export { looksLikeViteReactTask }
+
+/** Relative `import './foo.css'` specifiers in JS/JSX. */
+export function extractCssImportSpecs(js: string): string[] {
+  const out: string[] = []
+  const re = /import\s+['"]([^'"]+\.css)['"]/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(js ?? ''))) {
+    const s = (m[1] ?? '').trim()
+    if (s && !out.includes(s)) out.push(s)
+  }
+  return out
+}
+
+/** JSX imports a stylesheet that is not the CSS file already written this turn. */
+export function jsxMissingCssImports(js: string, knownCssPath?: string): string[] {
+  const known = pathBasename(knownCssPath ?? '').toLowerCase()
+  if (!known) return []
+  return extractCssImportSpecs(js).filter((spec) => pathBasename(spec).toLowerCase() !== known)
+}
+
+/**
+ * Vite React index.html should be a thin #root shell. Game UI in App.jsx.
+ * data-i18n / extra buttons inside #root is a landing dump (T06f).
+ */
+export function viteReactHtmlLooksLikePageDump(html: string): boolean {
+  if (!/<script[^>]+src=["'][^"']+\.(jsx|tsx)["']/i.test(html)) return false
+  if (/data-i18n\s*=/i.test(html)) return true
+  const buttons = html.match(/<button\b/gi)?.length ?? 0
+  const headings = html.match(/<h[1-3]\b/gi)?.length ?? 0
+  return buttons + headings >= 2
+}
+
+/** index.html script vs last React write. Vite main.jsx + App.jsx is not a mismatch. */
+export function viteHtmlEntryMismatch(html: string, jsPath?: string): string | null {
+  if (!html.trim() || !jsPath) return null
+  const srcs = extractHtmlModuleScriptSrcs(html)
+  if (!srcs.length) return null
+  const jsNorm = jsPath.replace(/\\/g, '/').replace(/^\.\//, '')
+  const jsBase = pathBasename(jsNorm)
+  if (!/\.(jsx?|tsx|mjs)$/i.test(jsBase)) return null
+  const htmlPointsAtJs = srcs.some((s) => {
+    const n = s.replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\//, '')
+    return n === jsNorm || n.endsWith(`/${jsBase}`) || pathBasename(n) === jsBase
+  })
+  if (htmlPointsAtJs) return null
+  const other = srcs.find((s) => /\.(jsx?|tsx|mjs)$/i.test(s))
+  if (!other) return null
+  const htmlBase = pathBasename(other)
+  if (htmlBase.toLowerCase() === jsBase.toLowerCase()) return null
+  if (/^main\.(jsx|tsx|js)$/i.test(htmlBase) && /^App\.(jsx|tsx|js)$/i.test(jsBase)) {
+    return null
+  }
+  if (/^App\.(jsx|tsx|js)$/i.test(htmlBase) && /^main\.(jsx|tsx|js)$/i.test(jsBase)) {
+    return null
+  }
+  return other
+}
+
+export function extractJsxClassTokens(src: string): string[] {
+  const out: string[] = []
+  const re = /className\s*=\s*["']([^"']+)["']/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(src ?? ''))) {
+    for (const tok of (m[1] ?? '').split(/\s+/)) {
+      const c = tok.trim()
+      if (c && !out.includes(c)) out.push(c)
+    }
+  }
+  return out
+}
+
+const UTIL_CLASS =
+  /^(flex|grid|hidden|block|inline|relative|absolute|fixed|sticky|sr-only|dark:|w-|h-|p-|m-|px-|py-|mx-|my-|pt-|pb-|pl-|pr-|mt-|mb-|text-|bg-|border|rounded|gap-|items-|justify-|overflow-|min-|max-|opacity-|shadow|cursor-|select-|font-|leading-|tracking-|whitespace-|break-|z-|top-|left-|right-|bottom-)/i
+
+/** JSX invented class names that the stylesheet never styles (zero overlap). */
+export function jsxCssClassMismatch(js: string, css: string): string[] {
+  if (!js.trim() || css.trim().length < 80) return []
+  const names = extractJsxClassTokens(js).filter((c) => !UTIL_CLASS.test(c))
+  if (names.length < 3) return []
+  const missing = names.filter((c) => !cssDefinesClass(css, c))
+  const overlap = names.length - missing.length
+  if (overlap === 0 && missing.length >= 3) return missing
+  return []
+}
+
+function jsImportsStylesheet(js: string, cssPath?: string): boolean {
+  if (/import\s+['"][^'"]+\.css['"]/.test(js)) return true
+  const base = (cssPath ?? '').replace(/\\/g, '/').split('/').pop()
+  if (!base) return false
+  const escaped = base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return new RegExp(`import\\s+['"][^'"]*${escaped}['"]`).test(js)
+}
+
 /**
  * Static post-write checks. Does not execute code.
  * Combines language-agnostic completeness with HTML/JS i18n and landing wiring.
@@ -154,10 +302,17 @@ export function formatEditSanityHint(opts: {
   js?: string
   css?: string
   cssPath?: string
+  jsPath?: string
   userText?: string
 }): string | null {
   const parts: string[] = []
-  const i18n = formatI18nSanityHint({ html: opts.html, js: opts.js })
+  const viteReact = looksLikeViteReactTask(opts.userText, opts.html, opts.path || opts.jsPath)
+  const i18n = formatI18nSanityHint({
+    html: opts.html,
+    js: opts.js,
+    jsPath: opts.jsPath,
+    userText: opts.userText
+  })
   if (i18n) parts.push(i18n)
   const path = (opts.path ?? '').trim()
   const content = opts.content ?? ''
@@ -166,37 +321,68 @@ export function formatEditSanityHint(opts: {
   const js = opts.js ?? ''
 
   if (html.trim() && /<html[\s>]|<!DOCTYPE\s+html/i.test(html)) {
-    if (!/<link\b[^>]*rel\s*=\s*["']stylesheet["']/i.test(html)) {
+    if (viteReactHtmlLooksLikePageDump(html) || (viteReact && /data-i18n\s*=/i.test(html))) {
+      parts.push(
+        `${EDIT_SANITY_PREFIX} Vite/React index.html must be a thin shell: empty <div id="root"></div> ` +
+          'and <script type="module" src="/src/main.jsx">. Put the game UI in App.jsx. ' +
+          'Do NOT dump data-i18n / buttons / headings into #root and do NOT write js/main.js. apply_diff index.html.'
+      )
+    }
+    const jsHasCssImport = jsImportsStylesheet(js, opts.cssPath)
+    const jsxEntry = /<script[^>]+src=["'][^"']+\.(jsx|tsx)["']/i.test(html)
+    if (
+      !viteReact &&
+      !jsxEntry &&
+      !/<link\b[^>]*rel\s*=\s*["']stylesheet["']/i.test(html) &&
+      !jsHasCssImport
+    ) {
       parts.push(
         `${EDIT_SANITY_PREFIX} index.html has no stylesheet <link>. ` +
           'Link styles.css (or the CSS you wrote) before claiming the page is done.'
       )
-    } else if (opts.cssPath && css.trim() && !htmlHasStylesheetLink(html, opts.cssPath)) {
+    } else if (
+      !viteReact &&
+      !jsxEntry &&
+      opts.cssPath &&
+      css.trim() &&
+      !jsHasCssImport &&
+      !htmlHasStylesheetLink(html, opts.cssPath)
+    ) {
       parts.push(
         `${EDIT_SANITY_PREFIX} "${opts.cssPath}" exists but index.html does not <link> it. ` +
           'Fix the href with apply_diff — do not rewrite the whole page.'
       )
     }
-    const missing = missingHtmlLayoutClassesInCss(html, css)
-    if (missing.length >= 4) {
-      parts.push(
-        `${EDIT_SANITY_PREFIX} HTML class names are not in CSS: ${missing.slice(0, 10).join(', ')}. ` +
-          'index.html must reuse class names from styles.css (e.g. .navbar .nav-links .hero-content) — ' +
-          'do not invent .site-header / .hero-inner. apply_diff HTML to match CSS, or add the missing CSS rules. ' +
-          'Do NOT Start-Process / claim the landing looks professional yet.'
-      )
+    if (!viteReact) {
+      const missing = missingHtmlLayoutClassesInCss(html, css)
+      if (missing.length >= 4) {
+        parts.push(
+          `${EDIT_SANITY_PREFIX} HTML class names are not in CSS: ${missing.slice(0, 10).join(', ')}. ` +
+            'index.html must reuse class names from styles.css (e.g. .navbar .nav-links .hero-content) — ' +
+            'do not invent .site-header / .hero-inner. apply_diff HTML to match CSS, or add the missing CSS rules. ' +
+            'Do NOT Start-Process / claim the landing looks professional yet.'
+        )
+      }
+      if (inlineSvgLooksUnsized(html, css)) {
+        parts.push(
+          `${EDIT_SANITY_PREFIX} header/logo <svg> has no width/height and CSS does not size it — it will fill the screen. ` +
+            'Set width="32" height="32" on the svg (or a CSS rule). apply_diff — do not claim done.'
+        )
+      }
+      if (navLooksUnstyled(html, css)) {
+        parts.push(
+          `${EDIT_SANITY_PREFIX} nav <ul> will render as a vertical bulleted list. ` +
+            'Give .nav-links / nav ul display:flex and list-style:none via apply_diff. ' +
+            'Do not claim the landing looks professional yet.'
+        )
+      }
     }
-    if (inlineSvgLooksUnsized(html, css)) {
+    const entrySrc = viteHtmlEntryMismatch(html, opts.jsPath)
+    if (entrySrc) {
       parts.push(
-        `${EDIT_SANITY_PREFIX} header/logo <svg> has no width/height and CSS does not size it — it will fill the screen. ` +
-          'Set width="32" height="32" on the svg (or a CSS rule). apply_diff — do not claim done.'
-      )
-    }
-    if (navLooksUnstyled(html, css)) {
-      parts.push(
-        `${EDIT_SANITY_PREFIX} nav <ul> will render as a vertical bulleted list. ` +
-          'Give .nav-links / nav ul display:flex and list-style:none via apply_diff. ' +
-          'Do not claim the landing looks professional yet.'
+        `${EDIT_SANITY_PREFIX} index.html <script src="${entrySrc}"> but the React file on disk is "${opts.jsPath}". ` +
+          'Point the module script at the file you wrote (e.g. /App.jsx) or add src/main.jsx that mounts it. ' +
+          'apply_diff — Vite cannot boot a missing /src/main.jsx.'
       )
     }
   }
@@ -223,6 +409,39 @@ export function formatEditSanityHint(opts: {
         'Do not claim the task is done. Finish this file (balanced braces / complete document) ' +
         'with write_file overwrite=true or apply_diff — do not start another file.'
     )
+  }
+
+  const jsxSrc =
+    /\.(jsx|tsx)$/i.test(path) && content.trim()
+      ? content
+      : /\.(jsx|tsx)$/i.test(opts.path ?? '') || /from\s+['"]react['"]/.test(js)
+        ? js
+        : ''
+  const checkSrc = jsxSrc || (/\.(jsx|tsx)$/i.test(path) ? content : '')
+  if (checkSrc) {
+    const unbound = unboundJsxClickHandlers(checkSrc)
+    if (unbound.length > 0) {
+      parts.push(
+        `${EDIT_SANITY_PREFIX} ${unbound.slice(0, 6).join(', ')} is defined but never bound to ` +
+          'onClick / onPointerDown. Wire the handler in JSX before claiming the UI works. ' +
+          'apply_diff — do not claim the game is playable yet.'
+      )
+    }
+    const cssMismatch = jsxCssClassMismatch(checkSrc, css)
+    if (cssMismatch.length > 0) {
+      parts.push(
+        `${EDIT_SANITY_PREFIX} JSX className tokens are not in CSS: ${cssMismatch.slice(0, 8).join(', ')}. ` +
+          'Reuse class names from the stylesheet (or add matching CSS rules). apply_diff — do not claim the UI is styled yet.'
+      )
+    }
+    const missingCss = jsxMissingCssImports(checkSrc, opts.cssPath)
+    if (missingCss.length > 0) {
+      parts.push(
+        `${EDIT_SANITY_PREFIX} "${path || 'JSX'}" imports ${missingCss.slice(0, 4).join(', ')} ` +
+          `but the CSS on disk is "${opts.cssPath}". Import that file (or write the missing stylesheet). ` +
+          'Vite cannot resolve a phantom index.css. apply_diff — do not claim the preview works.'
+      )
+    }
   }
   return parts.length ? parts.join('\n') : null
 }

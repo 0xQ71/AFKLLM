@@ -18,6 +18,7 @@ export {
   formatStubOnDiskHint,
   looksLikeEmptyOrStubWriteContent,
   formatEmptyWriteError,
+  formatWriteRedirectChip,
   isLandingWritePath
 } from '../../../shared/completeness'
 
@@ -281,6 +282,8 @@ export function stripCodeLeakFromThink(text: string): string {
   const at = findCodeLeakIndex(s)
   if (at >= 0) s = s.slice(0, at)
   return s
+    .replace(/<\s*web_search\s*>[\s\S]*?(?:<\s*\/\s*web_search\s*>|$)/gi, '')
+    .replace(/<\s*execute_terminal_command\s*>[\s\S]*?(?:<\s*\/\s*execute_terminal_command\s*>|$)/gi, '')
     .replace(/\n{3,}/g, '\n\n')
     .replace(/[ \t]+$/gm, '')
     .trim()
@@ -321,23 +324,34 @@ export function thinkLooksLikeChecklist(text: string | null | undefined): boolea
   return checklistish >= 2 && checklistish / lines.length >= 0.5
 }
 
-/** Prose-only think body for the UI fold. Empty if code dump or a plan checklist. */
+/** Think body for the UI fold. Keeps numbered lists; only drops code / tool dumps. */
 export function sanitizeThinkProse(text: string | null | undefined): string {
   let inner = extractThinkInner(text)
-  // Never fall back to the whole prelude (that pulled <plan> / 1. 2. 3. into «Думал»).
+  // Never fall back to the whole prelude (that pulled <plan> XML into «Думал»).
   if (!inner) return ''
   inner = stripPlanLeakFromThink(inner)
   inner = stripCodeLeakFromThink(inner)
-  if (!inner || thinkBodyLooksLikeCodeDump(`<think>${inner}</think>`)) return ''
+  if (!inner) return ''
+  if (thinkBodyLooksLikeCodeDump(`<think>${inner}</think>`)) {
+    inner = inner
+      .split(/\r?\n/)
+      .filter(
+        (l) =>
+          l.trim() &&
+          !/^\s*</.test(l) &&
+          !/write_file|```/.test(l)
+      )
+      .join('\n')
+      .trim()
+    if (!inner) return ''
+  }
   if (/^(Планирую:|Planning:)/i.test(inner.trim())) return inner
-  if (thinkLooksLikeChecklist(inner)) return ''
-  // Drop fenced code / obvious markup leftovers.
+  // Drop fenced code / obvious markup leftovers — keep 1) 2) 3) reasoning.
   inner = inner
     .replace(/```[\s\S]*?```/g, '')
     .replace(/```[\s\S]*$/g, '')
     .replace(/<write_file[\s\S]*$/i, '')
     .trim()
-  if (thinkLooksLikeChecklist(inner)) return ''
   if (isEllipsisOnly(inner)) return ''
   // Allow DeepThink-length reasoning in the fold (was capped at 800).
   if (inner.length > 6000) inner = inner.slice(0, 6000).trim()
@@ -368,25 +382,10 @@ export function displayThinkProse(text: string | null | undefined): string {
         (l) =>
           l.trim() &&
           !/^\s*</.test(l) &&
-          !/write_file|```/.test(l) &&
-          !/^(\d+[.)]\s+|[-*•]\s+)/.test(l.trim())
+          !/write_file|```/.test(l)
       )
       .join('\n')
       .trim()
-  }
-  if (thinkLooksLikeChecklist(inner)) {
-    const kept = inner
-      .split(/\r?\n/)
-      .map((l) => l.trim())
-      .filter(
-        (l) =>
-          l &&
-          !/^(\d+[.)]\s+|[-*•]\s+(\[[ xX]?\]\s+)?|\[\s*[xX ]?\]\s+)/.test(l)
-      )
-      .join(' ')
-      .trim()
-    if (kept.length >= 12 && !isEllipsisOnly(kept)) return kept.slice(0, 6000)
-    return ''
   }
   if (!inner || isEllipsisOnly(inner)) return ''
   return inner.length > 6000 ? inner.slice(0, 6000).trim() : inner
@@ -763,6 +762,7 @@ export function isResearchScavengerPlanStep(text: string): boolean {
   const t = text.trim()
   if (!t) return true
   if (/readme\.md/i.test(t) && /созда|напис|write|лендинг|landing/i.test(t)) return false
+  if (isPreviewHealthCheckPlanStep(t)) return false
   return (
     /explore_subagent|web_search|curl(\.exe)?|Invoke-WebRequest|raw\.githubusercontent|api\.github/i.test(
       t
@@ -907,13 +907,33 @@ export function sortPlanByUserDependencies(
   userText: string
 ): AgentTodoStep[] {
   if (!steps.length) return steps
-  if (!looksLikeLandingBuildTask(userText) && !looksLikeFromScratchTask(userText)) {
-    return steps
-  }
+  const rankFn = looksLikeLandingBuildTask(userText)
+    ? landingPlanDependencyRank
+    : codingPlanDependencyRank
   return steps
-    .map((s, i) => ({ s, i, rank: landingPlanDependencyRank(s.text) }))
+    .map((s, i) => ({ s, i, rank: rankFn(s.text) }))
     .sort((a, b) => (a.rank !== b.rank ? a.rank - b.rank : a.i - b.i))
     .map(({ s }) => s)
+}
+
+/** Edit before run, module before go run, summary last. */
+export function codingPlanDependencyRank(text: string): number {
+  const t = text.toLowerCase()
+  if (isMetaOrSummaryPlanStep(text) || /оформить|сводк|итогов|заключен/i.test(t)) return 90
+  if (isBrowserPlanStep(text)) return 80
+  if (
+    /(?:^|[^\p{L}])запустить|go\s+run|node\s+test|прогнать\s+(скрипт|тест)/iu.test(t) &&
+    !/заменить|исправить|починить|написать|создать|прочитать/.test(t)
+  ) {
+    return 55
+  }
+  if (/go\.mod|инициализир\w*\s+модул/i.test(t)) return 28
+  if (/прочитать|найти строку|read /i.test(t)) return 12
+  if (/заменить|исправить|починить|поправ|написать|создать|write|fix |patch/i.test(t)) {
+    return 22
+  }
+  if (/интернет|актуальн|версию/i.test(t)) return 16
+  return 40
 }
 
 /**
@@ -933,9 +953,7 @@ export function coerceProductPlan(
   if (!cleaned.length) return []
   const cap = opts?.surgical ? 4 : 10
   let sliced = cleaned.slice(0, cap)
-  if (opts?.userText) {
-    sliced = sortPlanByUserDependencies(sliced, opts.userText)
-  }
+  sliced = sortPlanByUserDependencies(sliced, opts?.userText ?? '')
   return sliced.map((s, i) => ({
     ...s,
     id: `s${i + 1}`,
@@ -1096,14 +1114,13 @@ export function splitCompoundPlanStep(text: string): string[] {
   return [t]
 }
 
-/** Index where a plan section starts (XML <plan> or markdown [Plan] / Plan:). */
+/** Index where a plan section starts (XML <plan> or markdown [Plan]). */
 export function findPlanLeakIndex(text: string): number {
   const s = text ?? ''
   const patterns = [
     /<\s*plan\b/i,
     /\[\s*plan\s*\]/i,
-    /\*{0,2}\[\s*plan\s*\]\*{0,2}/i,
-    /(?:^|\n)\s*#{0,3}\s*plan\s*:?\s*(?:\n|$)/i
+    /\*{0,2}\[\s*plan\s*\]\*{0,2}/i
   ]
   let best = -1
   for (const re of patterns) {
@@ -1159,6 +1176,12 @@ export function isFluffPlanStep(text: string): boolean {
     /отредактировать\s+при|подправить\s+при|доработать\s+при/i.test(t) ||
     /edit\s+if\s+necessary|if\s+necessary|as\s+needed|optional\s+(edit|polish|tweak)/i.test(t) ||
     /polish\s+if|tweaks?\s+if\s+needed|adjust\s+if\s+needed/i.test(t) ||
+    /если\s+есть\s+ошибк/i.test(t) ||
+    /исправить\s+и\s+перезапустить/i.test(t) ||
+    /ключев\p{L}*\s+ограничен/iu.test(t) ||
+    /^ограничен/iu.test(t) ||
+    /^план\s+действий/i.test(t) ||
+    /каждый\s+шаг\s+созда[её]т\s+файлы/i.test(t) ||
     /^(edit|fix|polish|review|проверить|поправить)\.?$/i.test(t)
   )
 }
@@ -1174,8 +1197,10 @@ export function isMetaOrSummaryPlanStep(text: string): boolean {
   if (isToolOrientedPlanStep(t)) return true
   return (
     /сводк|summary|заключен|отчёт|отчет|report\s+completion/i.test(t) ||
+    /подвест[\p{L}]*\s+итог|итог[ауе]?\s*:/iu.test(t) ||
     /подтвердить|валидац|отсутствие\s+ошибок|корректность\s+отображ/i.test(t) ||
-    /проверк\w*\s+(отсутств|ошибок|корректн|отображ|вёрст|верст|html|синтаксис)/i.test(t) ||
+    /провер[\p{L}]*\s+(отсутств|ошибок|корректн|отображ|вёрст|верст|html|синтаксис)/iu.test(t) ||
+    /убедить?ся,?\s+что/iu.test(t) ||
     /give\s+(a\s+)?brief|краткую\s+сводк|пользователю\s+на\s+(русск|english)/i.test(t) ||
     /кратко\s+сообщ|сообщ\S*\s+пользовател|inform\s+the\s+user|tell\s+the\s+user|о\s+результатах/i.test(
       t
@@ -1253,8 +1278,9 @@ export function isFalseSuccessProse(prose: string): boolean {
     /страница\s+открыта\s+в\s+браузер/i.test(t) ||
     /что\s+изменилось\s*:|как\s+проверить\s*:|what\s+changed\s*:/i.test(t) ||
     /заменен[ыао]\s+на\s+\w+.*(открыт|браузер|проверк)/i.test(t) ||
-    // Hallucinated progress without tools: "Создаю styles.css… Файлы созданы…"
-    /файлы?\s+создан|созданн\S*\s+файл/i.test(t) ||
+    // Hallucinated progress without tools — not a long post-tool closer.
+    (t.length < 160 && /файлы?\s+создан|созданн\S*\s+файл/i.test(t)) ||
+    /файлы?\s+создан(?:ы|о|а)?\s*:|созданн\S*\s+файл\s*:/i.test(t) ||
     /files?\s+(?:were\s+)?created|created\s+files?/i.test(t) ||
     /(?:создаю|пишу|writing|creating)\s+(?:компонент|component|styles\.css|js\/|index\.html|assets\/|navbar|навбар)/i.test(
       t
@@ -1262,6 +1288,63 @@ export function isFalseSuccessProse(prose: string): boolean {
     /обновляю\s+index\.html|updating\s+index\.html|без\s+полной\s+перепис/i.test(t) ||
     /(?:^|\n)\s*(?:созданные\s+файлы|обновления|структура|язык)\s*:/i.test(t)
   )
+}
+
+/**
+ * Drop model-to-self chatter so the user sees the real closer (RU when the UI is RU).
+ */
+export function preferUserFacingCloser(text: string, uiLang: 'ru' | 'en'): string {
+  let t = stripThinkBlocks(text ?? '').trim()
+  if (!t) return t
+  t = t
+    .replace(/The task is complete\.?\s*/gi, '')
+    .replace(
+      /I should (?:provide|write|give) a (?:short )?summary in Russian[^.]*\.?\s*/gi,
+      ''
+    )
+    .replace(/The user wants me to stop and write a closing summary in Russian[^.]*\.?\s*/gi, '')
+    .replace(/Let me compile what was done:\s*/gi, '')
+    .replace(/Let me summarize what was done:\s*/gi, '')
+    .replace(/Perfect!\s*/gi, '')
+    .replace(
+      /Now I need to write (?:the |a )?(?:closing |concise )?(?:Russian )?summary[^.]*\.?\s*/gi,
+      ''
+    )
+    .replace(
+      /Let me write a concise (?:Russian )?summary[^.]*\.?\s*/gi,
+      ''
+    )
+    .trim()
+  const metaPara =
+    /^(perfect!?|now i need to write.{0,80}summary|let me write a concise.{0,60}summary|the task is complete|the user wants me to stop|let me compile what was done)/i
+  t = t
+    .split(/\n{2,}/)
+    .map((b) => b.trim())
+    .filter((b) => b && !metaPara.test(b))
+    .join('\n\n')
+    .trim()
+  if (uiLang !== 'ru') return t
+  const blocks = t.split(/\n{2,}/).map((b) => b.trim()).filter(Boolean)
+  const ru = blocks.filter((b) => /[а-яё]/i.test(b) && !/\bI should\b/i.test(b))
+  if (ru.length > 0 && ru.join('\n\n').length >= 40) return ru.join('\n\n').trim()
+  if (!/[а-яё]/i.test(t) && /summary in Russian|compile what was done|The user wants me to stop/i.test(text)) {
+    return ''
+  }
+  return t
+}
+
+/** Closer cut mid-URL or mid-backtick — do not pin it as the final answer. */
+export function looksTruncatedCloser(text: string): boolean {
+  const t = (text ?? '').trim()
+  if (!t) return false
+  if (/https?:\/{0,2}$/i.test(t)) return true
+  const ticks = t.match(/`/g)?.length ?? 0
+  if (ticks % 2 === 1) {
+    const lastTick = t.lastIndexOf('`')
+    // Odd ticks in a long wrap-up are usually unclosed `command` mid-prose, not EOF truncation.
+    return lastTick >= 0 && t.length - lastTick < 120
+  }
+  return false
 }
 
 /**
@@ -1631,6 +1714,9 @@ export function looksLikeFromScratchTask(userText: string): boolean {
   const t = userText.trim()
   if (!t) return false
   if (looksLikeFinishMissingLandingFiles(t)) return true
+  if (/с\s*нуля|from\s+scratch/i.test(t) && /\bvite\b/i.test(t) && /\breact\b/i.test(t)) {
+    return true
+  }
   if (looksLikeLandingBuildTask(t) && (t.length > 400 || /с\s*нуля|from\s+scratch/i.test(t))) {
     return true
   }
@@ -1695,6 +1781,8 @@ export function isJunkPlanStep(text: string): boolean {
   if (/^секци[яюи]?\s*:\s*['"`]?[\w.-]+['"`]?\s*$/i.test(t) && isCssClassPlanStep(t)) return true
   // PLAN_ONLY instruction echoed as a todo ("План из 3–6 шагов:")
   if (/^план\s+из\s+\d/i.test(t)) return true
+  if (/^план\s+действий/i.test(t)) return true
+  if (/каждый\s+шаг\s+созда[её]т\s+файлы/i.test(t)) return true
   if (/^plan\s+of\s+\d/i.test(t)) return true
   if (/^\d+\s*[–-]\s*\d+\s+(atomic\s+)?(product\s+)?steps?\b/i.test(t)) return true
   if (/^\d+\s*[–-]\s*\d+\s+шагов?:?\s*$/i.test(t)) return true
@@ -1870,7 +1958,21 @@ export function isSoftLayoutPlanStep(text: string): boolean {
   )
 }
 
+/** curl -I localhost / «страница загрузилась» — preview health, not GitHub scrape. */
+export function isPreviewHealthCheckPlanStep(text: string): boolean {
+  const t = text.trim()
+  if (!t) return false
+  if (/\bcurl(\.exe)?\b|\bInvoke-WebRequest\b|\biwr\b/i.test(t) && /localhost|127\.0\.0\.1/i.test(t)) {
+    return true
+  }
+  if (/curl\s+-I/i.test(t)) return true
+  if (/страница\s+загрузил/i.test(t)) return true
+  if (/без\s+ошибок\s+загруз/i.test(t)) return true
+  return false
+}
+
 export function isBrowserPlanStep(text: string): boolean {
+  if (isPreviewHealthCheckPlanStep(text)) return true
   return /браузер|browser|открыт\w*\s+index|open\s+in\s+browser|visual|визуальн|превью|preview|glassmorphism|glass-?morph|бургер|burger|desktop\s*\+|mobile|проверк\w*\s+в[её]рст|проверк\w*\s+на\s+(desktop|mobile)|Start-Process.*index\.html/i.test(
     text
   )
@@ -1884,13 +1986,39 @@ export function settlePlanAfterWork(
   if (!steps.length) return steps
   return steps.map((s) => {
     if (s.status === 'done') return s
-    if (opts.previewOpened && isBrowserPlanStep(s.text)) {
+    if (isFluffPlanStep(s.text)) {
+      return { ...s, status: 'done' as const }
+    }
+    if (
+      opts.previewOpened &&
+      (isBrowserPlanStep(s.text) || isMetaOrSummaryPlanStep(s.text))
+    ) {
       return { ...s, status: 'done' as const }
     }
     if (opts.edited && (isMetaOrSummaryPlanStep(s.text) || isSoftLayoutPlanStep(s.text))) {
       return { ...s, status: 'done' as const }
     }
     return s
+  })
+}
+
+/** Plan ticked done but the named Vite+React file is still missing — reopen it. */
+export function reopenTodosForMissingViteReact(
+  steps: AgentTodoStep[],
+  missing: Array<'package.json' | 'vite.config' | 'index.html' | 'entry' | 'app'>
+): AgentTodoStep[] {
+  if (!steps.length || !missing.length) return steps
+  const testers: Record<string, RegExp> = {
+    'package.json': /package\.json/i,
+    'vite.config': /vite\.config/i,
+    'index.html': /index\.html/i,
+    entry: /main\.(jsx|tsx)|точка входа/i,
+    app: /App\.(jsx|tsx)|игровая механик/i
+  }
+  return steps.map((s) => {
+    const hit = missing.some((id) => testers[id]?.test(s.text))
+    if (!hit || s.status !== 'done') return s
+    return { ...s, status: 'in_progress' as const }
   })
 }
 
@@ -1920,6 +2048,7 @@ export function pendingPlanWork(steps: AgentTodoStep[]): AgentTodoStep[] {
 /** Plan row that still needs a file write/patch (not search / weather fluff). */
 export function isFileWorkPlanStep(text: string): boolean {
   const t = text ?? ''
+  if (isMetaOrSummaryPlanStep(t) || isFluffPlanStep(t)) return false
   if (/web_search|поиск\s+в\s+интернет|искать\s+в\s+интернет|погод|weather/i.test(t)) {
     return false
   }
@@ -2502,7 +2631,7 @@ export function evaluateAcceptanceGate(input: {
  */
 export function looksLikeToolMarkupLeak(text: string): boolean {
   if (!text) return false
-  return /<\/?tool_call\b|<\|tool_call\||\[:tool\b|\[:channel:|<\|channel\|>|call:write_file\b|call:create_directory\b|call:apply_(?:diff|patch)\b|<\s*function\s*=\s*[a-z_]+/i.test(
+  return /<\/?tool_call\b|<\|tool_call\||\[:tool\b|\[:channel:|<\|channel\|>|call:write_file\b|call:create_directory\b|call:apply_(?:diff|patch)\b|<\s*function\s*=\s*[a-z_]+|<\s*web_search\s*>/i.test(
     text
   )
 }
@@ -2512,7 +2641,8 @@ const SALVAGEABLE_TOOLS = new Set([
   'create_directory',
   'apply_diff',
   'apply_patch',
-  'execute_terminal_command'
+  'execute_terminal_command',
+  'verify_project'
 ])
 
 /**
@@ -2547,6 +2677,7 @@ export function salvageLeakedToolCalls(
     if (name === 'create_directory' && !args.relative_path && !args.path && !args.dir_path) {
       continue
     }
+    if (name === 'verify_project' && !args.mode && !args.command) continue
     n++
     out.push({
       id: `salvage-${n}`,
@@ -2562,6 +2693,8 @@ export function stripLeakedToolMarkup(text: string): string {
   return (text ?? '')
     .replace(/<\s*tool_call\b[\s\S]*?<\/\s*tool_call\s*>/gi, '')
     .replace(/<\s*function\s*=\s*[a-z_]+\s*>[\s\S]*?<\/\s*function\s*>/gi, '')
+    .replace(/<\s*tool_call\b[\s\S]*$/gi, '')
+    .replace(/<\s*function\s*=\s*[a-z_]+\s*>[\s\S]*$/gi, '')
     .replace(/\n{3,}/g, '\n\n')
     .trim()
 }

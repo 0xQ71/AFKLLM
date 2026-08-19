@@ -177,8 +177,9 @@ export class QueueManager {
               content:
                 'You name chat threads for a local coding IDE. ' +
                 `${lang}. Output ONLY a short title (2–5 words) in the nominative case. ` +
-                'Prefer TASK + artifact (e.g. «Python wordfreq», «Fix navbar»). ' +
-                'Use Landing/Лендинг only if the user asked for a landing page. ' +
+                'Prefer TASK + artifact (e.g. «Python wordfreq», «Fix total.js», «Go wordfreq»). ' +
+                'Use Landing/Лендинг only if the user asked for a landing page, never if they said not to. ' +
+                'Never output Thinking Process, User asks, or Пользователь просит. ' +
                 'Never use UI words as the brand (Icons, Features, Hero, Navbar, FAQ, SVG). ' +
                 'Ignore constraints («без…», forbidden items). No quotes, <think>, or markdown.'
             },

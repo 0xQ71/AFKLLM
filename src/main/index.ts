@@ -306,7 +306,7 @@ function runtimeStatus(): LlmRuntimeStatus {
     applyState = 'error'
   }
 
-  const keepVision = settings?.visionKeepLoaded !== false
+  const keepVision = settings?.visionKeepLoaded === true
   const reuseVision = settings
     ? visionReusesChatModel({
         chatPath: settings.modelPath,
@@ -379,7 +379,13 @@ function runtimeStatus(): LlmRuntimeStatus {
 function applyQueueSettings(settings: AppSettings): void {
   getLLMQueue(settings.baseUrl, 'local')
   const port = Number(settings.port) || 8080
-  terminals.setDenyPreviewPorts(llamaSlotPortsToDeny(port))
+  terminals.setDenyPreviewPorts(previewDenyPorts(port))
+}
+
+function previewDenyPorts(chatPort: number): number[] {
+  const ports = llamaSlotPortsToDeny(chatPort)
+  if (process.env.ELECTRON_RENDERER_URL) ports.push(5173)
+  return [...new Set(ports)]
 }
 
 function settingsToLlamaOpts(
@@ -393,7 +399,7 @@ function settingsToLlamaOpts(
     : llamaRuntime.resolveStatus(undefined, settings.llamaRuntimeVariant).binaryPath ||
       undefined
   const port = Number(settings.port) || 8080
-  const keepVision = settings.visionKeepLoaded !== false
+  const keepVision = settings.visionKeepLoaded === true
   let modelPath = settings.modelPath
   let portOut = llamaSlotPort(port, slot, keepVision)
   let ctxSize = settings.ctxSize
@@ -469,7 +475,7 @@ function initSlotOrchestrator(): void {
     setVisionLlama: (mgr) => {
       visionLlama = mgr
     },
-    keepVisionLoaded: () => settingsStore?.get().visionKeepLoaded !== false,
+    keepVisionLoaded: () => settingsStore?.get().visionKeepLoaded === true,
     visionReusesChat: () => {
       const s = settingsStore?.get()
       if (!s) return false
@@ -652,7 +658,7 @@ function registerIpc(): void {
       : null
     llama?.updateOptions(settingsToLlamaOpts(next, 'chat', chatMm))
     applyLlama?.updateOptions(settingsToLlamaOpts(next, 'apply'))
-    if (!reuse && next.visionKeepLoaded !== false) {
+    if (!reuse && next.visionKeepLoaded === true) {
       const mm = await findMmprojForModel(next.visionModelPath, next.visionMmprojPath)
       visionLlama?.updateOptions(settingsToLlamaOpts(next, 'vision', mm))
     }
@@ -665,7 +671,13 @@ function registerIpc(): void {
       mcpManager.setCwd(projectRoot)
       void mcpManager.applyConfig(next.mcpServers)
     }
-    if (isUiLanguage(next.uiLanguage)) setTrayLanguage(next.uiLanguage)
+    if (isUiLanguage(next.uiLanguage)) {
+      setTrayLanguage(next.uiLanguage)
+      if (chatStore) {
+        const snap = await chatStore.setUiLanguage(next.uiLanguage)
+        mainWindow?.webContents.send('chats:changed', snap)
+      }
+    }
     mainWindow?.webContents.send('settings:changed', next)
     return next
   })
@@ -1760,6 +1772,8 @@ app.whenReady().then(async () => {
 
   chatStore = new ChatStore()
   await chatStore.load()
+  const bootLang = settingsStore.get().uiLanguage
+  if (isUiLanguage(bootLang)) await chatStore.setUiLanguage(bootLang)
   await chatStore.setWorkspaceRoot('')
 
   checkpointStore = new CheckpointStore()
@@ -1806,7 +1820,9 @@ app.whenReady().then(async () => {
       mainWindow?.webContents.send('agent:apply-token', { path: relativePath, token })
     },
     getDiagnostics: () => diagnostics.getLast(),
-    runVisibleCommand: (command, cwd) => terminals.runVisibleCommand(command, cwd),
+    runVisibleCommand: (command, cwd, timeoutMs) =>
+      terminals.runVisibleCommand(command, cwd, timeoutMs),
+    hasLiveLocalServer: () => terminals.hasLiveLocalServer(),
     readTerminalScrollback: (maxChars) => terminals.getPrimaryScrollback(maxChars),
     confirmTerminal: async (command, cwd) => {
       if (settingsStore?.get().agentAutoApprove === true) return true
@@ -1859,7 +1875,7 @@ app.whenReady().then(async () => {
     },
     getDenyPreviewPorts: () => {
       const port = Number(settingsStore?.get().port) || 8080
-      return [port, 8080].filter((p, i, a) => a.indexOf(p) === i)
+      return previewDenyPorts(port)
     },
     generateImage: async (args) => {
       let settings = settingsStore?.get()

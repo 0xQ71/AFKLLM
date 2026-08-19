@@ -78,6 +78,30 @@ export const DEFAULT_WELCOME_MESSAGE: PersistedChatMessage = {
     'AFKLLM agent online. Ask me to edit files, search the repo, or explain code. Tools run locally.'
 }
 
+const WELCOME_MESSAGE_RU_CONTENT =
+  'Агент AFKLLM онлайн. Просите править файлы, искать по репозиторию или объяснить код. Инструменты работают локально.'
+
+export function welcomeMessageForLang(lang: 'en' | 'ru'): PersistedChatMessage {
+  return {
+    id: 'welcome',
+    role: 'assistant',
+    content: lang === 'ru' ? WELCOME_MESSAGE_RU_CONTENT : DEFAULT_WELCOME_MESSAGE.content
+  }
+}
+
+export function defaultChatTitleForLang(lang: 'en' | 'ru'): string {
+  return lang === 'ru' ? 'Новый агент' : 'New agent'
+}
+
+/** Stored welcome may be EN or RU; UI remaps via i18n when id is welcome. */
+export function isWelcomeChatMessage(m: { id?: string; content?: string }): boolean {
+  if (m.id === 'welcome') return true
+  const c = (m.content ?? '').trim()
+  return (
+    c === DEFAULT_WELCOME_MESSAGE.content.trim() || c === WELCOME_MESSAGE_RU_CONTENT
+  )
+}
+
 export const CHAT_MAX_MESSAGES = 200
 export const CHAT_MAX_CONTENT_CHARS = 12_000
 
@@ -225,7 +249,7 @@ function sanitizeStats(
   return Object.keys(out).length > 0 ? out : undefined
 }
 
-export function createEmptySession(): ChatSession {
+export function createEmptySession(lang: 'en' | 'ru' = 'en'): ChatSession {
   const now = Date.now()
   const id =
     typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
@@ -233,10 +257,10 @@ export function createEmptySession(): ChatSession {
       : `chat-${now.toString(36)}-${Math.random().toString(36).slice(2, 9)}`
   return {
     id,
-    title: 'New agent',
+    title: defaultChatTitleForLang(lang),
     createdAt: now,
     updatedAt: now,
-    messages: [{ ...DEFAULT_WELCOME_MESSAGE }]
+    messages: [welcomeMessageForLang(lang)]
   }
 }
 
@@ -247,11 +271,29 @@ export function isDefaultChatTitle(title: string | undefined | null): boolean {
   return /^(new agent|новый агент|new chat|новый чат)$/i.test(t)
 }
 
+/** Unused composer thread — New Agent should reuse this instead of stacking blanks. */
+export function isReusableEmptySession(s: {
+  title?: string
+  messages?: Array<{ role?: string }>
+}): boolean {
+  if (!isDefaultChatTitle(s.title)) return false
+  return !(s.messages ?? []).some((m) => m.role === 'user')
+}
+
 const TITLE_STOP =
-  /^(сделай|сделать|создай|создать|напиши|написать|добавь|добавить|исправь|исправить|простой|простую|простое|пожалуйста|please|make|create|build|write|add|fix|update|implement|a|an|the|для|на|по|и|или|с|от|из|в|к|о|об|with|from|this|that|into|about|одностраничный|одностраничную|page|сайт|сайта|файл|файлы|code|код|русском|english|продукта|product|без|не|запрет|запрещено)$/iu
+  /^(сделай|сделать|создай|создать|собери|собрать|напиши|написать|добавь|добавить|исправь|исправить|простой|простую|простое|пожалуйста|please|make|create|build|write|add|fix|update|implement|a|an|the|для|на|по|и|или|с|от|из|в|к|о|об|with|from|this|that|into|about|одностраничный|одностраничную|page|сайт|сайта|файл|файлы|папк[аеиу]|корне|нуля|этой|именно|code|код|русском|english|продукта|product|без|не|запрет|запрещено)$/iu
 
 const TITLE_BRAND_STOP =
-  /^(HTML|CSS|FAQ|CTA|CDN|API|IDE|LLM|HTTP|JSON|TODO|URL|SVG|PNG|JPG|Icon|Icons|Feature|Features|Hero|Navbar|Footer|Button|Buttons|Section|Sections|Mobile|Desktop|Editor|Bootstrap|Windows|JavaScript|TypeScript|North|South|East|West|How|Works|Social|Proof|Trust)$/i
+  /^(HTML|CSS|FAQ|CTA|CDN|API|IDE|LLM|HTTP|JSON|TODO|URL|SVG|PNG|JPG|Icon|Icons|Feature|Features|Hero|Navbar|Footer|Button|Buttons|Section|Sections|Mobile|Desktop|Editor|Bootstrap|Windows|JavaScript|TypeScript|React|Vite|GitHub|Github|North|South|East|West|How|Works|Social|Proof|Trust)$/i
+
+function extractPromptTheme(text: string): string | null {
+  const m = text.match(/тема\s*[—–:\-]\s*[«"']?([\p{L}][\p{L}\s-]{1,24})/u)
+  const raw = m?.[1]?.trim()
+  if (!raw) return null
+  const first = raw.split(/[\s,.;:]+/)[0] ?? ''
+  if (!first || TITLE_STOP.test(first) || TITLE_BRAND_STOP.test(first)) return null
+  return first
+}
 
 function capitalizeWord(w: string): string {
   if (!w) return w
@@ -266,9 +308,34 @@ function matchTaskNoun(text: string): string | null {
   return m?.[1] ?? null
 }
 
+function matchTaskNounSkipLanding(text: string): string | null {
+  const m = text.match(
+    /(?:^|[^\p{L}\p{N}_])(dashboard|дашборд|refactor|рефактор|баг|bug|игр[ауеы]?|game)(?=$|[^\p{L}\p{N}_])/iu
+  )
+  const raw = m?.[1]
+  if (!raw) return null
+  if (/^игр/i.test(raw)) return 'игра'
+  return raw
+}
+
+function brandLooksNegated(full: string, index: number): boolean {
+  const before = full.slice(Math.max(0, index - 40), index)
+  if (/(?:^|[\s,;:(«"'/])(?:не|без|not|no|don't|dont)\s+$/i.test(before)) return true
+  // «не ходи на GitHub» / «don't go to GitHub»
+  if (
+    /(?:^|[\s,;:(«"'/])(?:не|don't|dont|do\s+not)\s+\S+(?:\s+\S+){0,3}\s+(?:на|to|at|in)\s+$/i.test(
+      before
+    )
+  ) {
+    return true
+  }
+  return false
+}
+
 function scoreBrandCandidate(word: string, full: string, index: number): number {
   let score = 10
   if (TITLE_BRAND_STOP.test(word)) return -100
+  if (brandLooksNegated(full, index)) return -100
   if (/^[A-Z][a-z]+[A-Z]/.test(word)) score += 40 // Northline-style
   if (/^[A-Z][a-z]{3,}$/.test(word)) score += 15
   if (/^[A-Z]{2,}$/.test(word)) score -= 20 // FAQ, CTA
@@ -280,19 +347,28 @@ function scoreBrandCandidate(word: string, full: string, index: number): number 
   return score
 }
 
-/** Latin/brand token from the prompt (Northline) — not Icons/Features. */
+/** Quoted studio/product name — Latin or Cyrillic («Северная заводь»). */
+function extractQuotedBrand(text: string): string | null {
+  const quoted = text.match(/[«"\u201C]([^\n»"\u201D]{2,40})[»"\u201D]/)?.[1]?.trim()
+  if (!quoted) return null
+  if (/градиент|icon/i.test(quoted)) return null
+  if (/^(не|без|not|no)\s+/i.test(quoted)) return null
+  const first = quoted.split(/\s+/)[0] ?? ''
+  if (TITLE_BRAND_STOP.test(first)) return null
+  if (!/[\p{L}]/u.test(quoted)) return null
+  if (quoted.length <= 22) return quoted
+  const parts = quoted
+    .split(/\s+/)
+    .filter((w) => w.length > 1 && !/^(и|или|для|the|a|an|of)$/iu.test(w))
+  if (parts.length >= 2) return parts.slice(0, 2).join(' ')
+  return parts[0] || quoted.slice(0, 22)
+}
+
+/** Brand token from the prompt — quoted name wins; skip “не Northline”. */
 export function extractBrandFromPrompt(raw: string): string | null {
   const text = String(raw ?? '')
-  const quoted = text.match(/[«"\u201C]([^\n»"\u201D]{2,32})[»"\u201D]/)?.[1]?.trim()
-  if (
-    quoted &&
-    /[A-Za-z]/.test(quoted) &&
-    quoted.length <= 22 &&
-    !/градиент|icon/i.test(quoted) &&
-    !TITLE_BRAND_STOP.test(quoted.split(/\s+/)[0] ?? '')
-  ) {
-    return quoted.split(/\s+/)[0] ?? quoted
-  }
+  const quoted = extractQuotedBrand(text)
+  if (quoted) return quoted
 
   let best: { word: string; score: number } | null = null
   const re = /\b([A-Z][a-zA-Z0-9]{2,24})\b/g
@@ -312,11 +388,29 @@ export function isAwkwardChatTitle(title: string): boolean {
   if (!t) return true
   if (/\b(без|запрет|не\s+используй|don't|constraint)\b/i.test(t)) return true
   if (/\bдля\s+\S+$/i.test(t)) return true
+  if (/^(thinking(\s+process)?|думаю|думал|планирую|planning)\b/i.test(t)) return true
+  if (/^(пользователь|user)\s+(просит|хочет|asked|wants)/i.test(t)) return true
+  if (/^(react|vite|javascript|typescript)$/i.test(t)) return true
+  if (/собери|нуля|корне/i.test(t) && !/игр|game|лендинг|landing/i.test(t)) return true
   const parts = t.split(/[\s–—•·\-]+/).filter(Boolean)
   const last = parts[parts.length - 1] ?? ''
   if (/[а-яё]/i.test(last) && /(ов|ев|ей|ах|ях|ого|ому|ами)$/iu.test(last)) return true
   if (parts.length >= 2 && TITLE_BRAND_STOP.test(parts[parts.length - 1]!)) return true
   return false
+}
+
+/** True when the user asked for a landing — not “не делай лендинг”. */
+export function userAskedForLanding(text: string): boolean {
+  const t = String(text ?? '')
+  if (!/лендинг|landing/i.test(t)) return false
+  if (
+    /не\s+делай[^\n.]{0,80}(лендинг|landing)|не\s+html\s*[-/]?\s*(лендинг|landing)|не\s+делай\s+html\s*\/?\s*лендинг|без\s+(html\/)?лендинг|html\s*[-/]?\s*лендинг\s+запрещ|don't\s+(make|create|build)[^\n.]{0,40}landing|not\s+an?\s+html\s*[-/]?\s*landing|not\s+a\s+landing|no\s+landing/i.test(
+      t
+    )
+  ) {
+    return false
+  }
+  return true
 }
 
 /**
@@ -326,8 +420,7 @@ export function pickChatTitle(userPrompt: string, modelTitle: string): string {
   const heuristic = deriveChatTitle(userPrompt)
   const model = sanitizeModelChatTitle(modelTitle)
   if (!model || isAwkwardChatTitle(model)) return heuristic
-  const userAskedLanding = /лендинг|landing/i.test(userPrompt)
-  if (!userAskedLanding && /^(лендинг|landing)(?=$|[^\p{L}\p{N}_])/iu.test(model)) {
+  if (!userAskedForLanding(userPrompt) && /^(лендинг|landing)(?=$|[^\p{L}\p{N}_])/iu.test(model)) {
     return heuristic
   }
   const brand = extractBrandFromPrompt(userPrompt)
@@ -354,10 +447,38 @@ export function deriveChatTitle(raw: string): string {
     .trim()
 
   const brand = extractBrandFromPrompt(text)
-  const task = matchTaskNoun(cleaned)
+  const theme = extractPromptTheme(text)
+  const askedLanding = userAskedForLanding(text)
+  const fileHit = text.match(
+    /\b([\w.-]+\.(py|go|js|mjs|cjs|ts|tsx|jsx|java|cs|cpp|c|rs|rb))\b/i
+  )
+  if (fileHit && !askedLanding) {
+    const name = fileHit[1]!
+    const stem = name.replace(/\.[^.]+$/, '')
+    const lang =
+      /\.py$/i.test(name)
+        ? 'Python'
+        : /\.go$/i.test(name)
+          ? 'Go'
+          : /\.java$/i.test(name)
+            ? 'Java'
+            : /\.cs$/i.test(name)
+              ? 'C#'
+              : /\.(js|mjs|cjs)$/i.test(name)
+                ? 'JS'
+                : ''
+    if (/баг|исправ|почин|fix\b|bug\b/i.test(text)) return clipTitle(`Fix ${name}`)
+    return clipTitle(lang ? `${lang} ${stem}` : name)
+  }
+
+  const task =
+    (askedLanding ? matchTaskNoun(cleaned) : matchTaskNounSkipLanding(cleaned)) ||
+    matchTaskNounSkipLanding(cleaned) ||
+    matchTaskNounSkipLanding(text)
   if (task) {
     const titled = capitalizeWord(task.toLowerCase())
     if (brand) return clipTitle(`${titled} ${brand}`)
+    if (theme) return clipTitle(`${titled} ${capitalizeWord(theme)}`)
     return titled
   }
 

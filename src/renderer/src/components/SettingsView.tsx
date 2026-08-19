@@ -1077,7 +1077,7 @@ function ModelPage({
               ? t('settings.model.visionKeepReuseHint')
               : t('settings.model.visionKeepHint')
           }
-          checked={settings.visionKeepLoaded !== false}
+          checked={settings.visionKeepLoaded === true}
           onChange={(v) => {
             patch('visionKeepLoaded', v)
             void window.api.settings.save({ visionKeepLoaded: v })

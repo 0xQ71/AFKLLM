@@ -10,10 +10,16 @@ import {
   extractLocalPreviewUrl,
   extractOpenHtmlRelativePath,
   looksLikeLocalServerCommand,
+  looksLikeViteScaffoldCommand,
+  looksLikeLocalPreviewHealthCheck,
   looksLikeOpenHtmlCommand,
   normalizePreviewUrl,
-  pathToFileUrl
+  pathToFileUrl,
+  rewriteLocalDevServerCommand,
+  rewriteViteScaffoldCommand,
+  AFK_SAFE_VITE_PORT
 } from '../src/shared/localPreview'
+import { processKillRefusal } from '../src/shared/shellErrors'
 
 describe('shellNormalize', () => {
   it('rewrites && and || outside quotes', () => {
@@ -98,6 +104,10 @@ describe('localPreview', () => {
       extractLocalPreviewUrl('  ➜  Local:   http://localhost:8080/', { denyPorts: [8080] }),
       'http://localhost:8080/'
     )
+    assert.equal(
+      extractLocalPreviewUrl('  ➜  Local:   http://localhost:5173/', { denyPorts: [5173] }),
+      null
+    )
   })
 
   it('classifies file open vs Vite URL vs LLM mistake', () => {
@@ -148,5 +158,74 @@ describe('localPreview', () => {
     assert.equal(looksLikeLocalServerCommand('npx vite'), true)
     assert.equal(looksLikeLocalServerCommand('python -m http.server 8080'), true)
     assert.equal(looksLikeLocalServerCommand('javac Main.java'), false)
+  })
+
+  it('treats Vite Local: on port 3000 as a ready preview URL', () => {
+    const url = extractLocalPreviewUrl(
+      '  ➜  Local:   http://localhost:3000/\n  ➜  Network: use --host to expose'
+    )
+    assert.equal(url, 'http://localhost:3000/')
+  })
+
+  it('pins Vite npm run dev off 3000/5173/8080 when no --port', () => {
+    assert.equal(
+      rewriteLocalDevServerCommand('npm run dev'),
+      `npm run dev -- --host 127.0.0.1 --port ${AFK_SAFE_VITE_PORT}`
+    )
+    assert.equal(
+      rewriteLocalDevServerCommand('npm run dev -- --port 5174'),
+      'npm run dev -- --port 5174 --host 127.0.0.1'
+    )
+    assert.equal(
+      rewriteLocalDevServerCommand('npm run dev -- --host 127.0.0.1 --port 3000'),
+      `npm run dev -- --host 127.0.0.1 --port ${AFK_SAFE_VITE_PORT}`
+    )
+    assert.equal(
+      rewriteLocalDevServerCommand('npx vite --port 5173'),
+      `npx vite --port ${AFK_SAFE_VITE_PORT} --host 127.0.0.1`
+    )
+    assert.equal(rewriteLocalDevServerCommand('python -m http.server 8000'), 'python -m http.server 8000')
+  })
+
+  it('treats curl -I localhost as a preview health check', () => {
+    assert.equal(looksLikeLocalPreviewHealthCheck('curl -I http://localhost:4173'), true)
+    assert.equal(looksLikeLocalPreviewHealthCheck('Invoke-WebRequest http://127.0.0.1:4173'), true)
+    assert.equal(looksLikeLocalPreviewHealthCheck('curl https://github.com/foo'), false)
+    assert.equal(looksLikeLocalPreviewHealthCheck('npm run dev'), false)
+  })
+
+  it('does not treat create-vite as a local server or pin --port 4173', () => {
+    const create = 'npm create vite@latest fishing-game -- --template react'
+    assert.equal(looksLikeViteScaffoldCommand(create), true)
+    assert.equal(looksLikeLocalServerCommand(create), false)
+    assert.equal(
+      rewriteLocalDevServerCommand(create),
+      create
+    )
+    assert.equal(
+      rewriteViteScaffoldCommand(create),
+      'npx --yes create-vite@latest . --template react --no-interactive'
+    )
+    assert.equal(
+      looksLikeLocalServerCommand(rewriteViteScaffoldCommand(create)),
+      false
+    )
+    assert.equal(
+      rewriteViteScaffoldCommand(
+        'npm create vite@latest fishing-game -- --template react --host 127.0.0.1 --port 4173'
+      ),
+      'npx --yes create-vite@latest . --template react --no-interactive'
+    )
+    assert.equal(looksLikeLocalServerCommand('npm run dev'), true)
+    assert.equal(
+      rewriteLocalDevServerCommand('npm run dev'),
+      `npm run dev -- --host 127.0.0.1 --port ${AFK_SAFE_VITE_PORT}`
+    )
+  })
+
+  it('refuses taskkill / Stop-Process of arbitrary PIDs', () => {
+    assert.match(processKillRefusal('taskkill /PID 4192 /F') ?? '', /SHELL_REFUSED/)
+    assert.match(processKillRefusal('Stop-Process -Id 4192 -Force') ?? '', /SHELL_REFUSED/)
+    assert.equal(processKillRefusal('npm run dev'), null)
   })
 })

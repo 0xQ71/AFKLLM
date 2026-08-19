@@ -19,11 +19,14 @@ import { normalizeAgentShellCommand } from '../../shared/shellNormalize'
 import {
   extractErrorFocus,
   isUserInterruptExit,
+  isShellTimeoutExit,
+  AGENT_SHELL_HARD_TIMEOUT_MS,
   looksLikeGuiLaunchCommand,
   looksLikeShellFileMutation,
   powershellOperatorMisuse,
   powershellNodeEvalRefusal,
   recursiveListingRefusal,
+  processKillRefusal,
   POWERSHELL_UNALIAS_CURL
 } from '../../shared/shellErrors'
 import {
@@ -42,12 +45,17 @@ import { probeProjectStack } from '../context/StackProbe'
 import type { DiagnosticsSnapshot } from '../../shared/diagnostics'
 import {
   classifyBrowserOpenCommand,
+  extractHttpUrlFromOpenCommand,
   extractLocalPreviewUrl,
   extractOpenHtmlRelativePath,
   htmlDocumentComplete,
   isAfkllmInternalHtmlPath,
   looksLikeLocalServerCommand,
-  pathToFileUrl
+  looksLikeLocalPreviewHealthCheck,
+  pathToFileUrl,
+  rewriteLocalDevServerCommand,
+  rewriteViteScaffoldCommand,
+  looksLikeViteScaffoldCommand
 } from '../../shared/localPreview'
 import { contentLooksStructurallyComplete, contentLooksLikeSourceStub, formatStubOnDiskHint, looksLikeEmptyOrStubWriteContent, formatEmptyWriteError } from '../../shared/completeness'
 import { formatWriteFileRequiredError } from '../../shared/writeFileRequired'
@@ -55,6 +63,12 @@ import { fastApplyEdit } from '../llama/ApplyEditClient'
 import { locateApplyRegion, type ApplyRegion } from '../../shared/fastApply'
 
 const IGNORED_DIRS = new Set<string>([...DEFAULT_IGNORE_DIRS])
+
+/** Harness brief files the agent must not delete unless the user asked. */
+export function isProtectedHarnessFile(relativePath: string): boolean {
+  const base = relativePath.replace(/\\/g, '/').split('/').pop() ?? ''
+  return /^(PROMPT\.txt|TASK\.md|brief\.md)$/i.test(base)
+}
 
 type ToolHandler = (args: Record<string, unknown>) => Promise<AgentToolResult>
 
@@ -79,12 +93,15 @@ export interface AgentToolRegistryOptions {
    */
   runVisibleCommand?: (
     command: string,
-    cwd: string
+    cwd: string,
+    timeoutMs?: number
   ) => Promise<{ output: string; exitCode: number }>
   /** Read recent output from the visible IDE terminal scrollback */
   readTerminalScrollback?: (maxChars?: number) => string
   /** Open in-app browser when a local preview URL is known */
   onOpenPreview?: (url: string) => void
+  /** True while a Vite/dev server is still occupying the visible PTY. */
+  hasLiveLocalServer?: () => boolean
   /** Ports that must never auto-open as site preview (LLM server, default 8080) */
   getDenyPreviewPorts?: () => number[]
   /** Optional BM25 context index for search_codebase */
@@ -127,6 +144,7 @@ export class AgentToolRegistry {
   private runVisibleCommand?: AgentToolRegistryOptions['runVisibleCommand']
   private readTerminalScrollback?: AgentToolRegistryOptions['readTerminalScrollback']
   private onOpenPreview?: AgentToolRegistryOptions['onOpenPreview']
+  private hasLiveLocalServer?: AgentToolRegistryOptions['hasLiveLocalServer']
   private getDenyPreviewPorts?: () => number[]
   private contextIndex?: AgentToolRegistryOptions['contextIndex']
   private generateImageFn?: AgentToolRegistryOptions['generateImage']
@@ -147,6 +165,7 @@ export class AgentToolRegistry {
     this.runVisibleCommand = options.runVisibleCommand
     this.readTerminalScrollback = options.readTerminalScrollback
     this.onOpenPreview = options.onOpenPreview
+    this.hasLiveLocalServer = options.hasLiveLocalServer
     this.getDenyPreviewPorts = options.getDenyPreviewPorts
     this.contextIndex = options.contextIndex
     this.generateImageFn = options.generateImage
@@ -720,11 +739,11 @@ export class AgentToolRegistry {
       /\.html?$/i.test(relativePath) || /<!DOCTYPE\s+html|<html[\s>]/i.test(writtenBody)
         ? ` lines=${lineCount} closes_with_</body>=${closesBody ? 'yes' : 'no'} closes_with_</html>=${closesHtml ? 'yes' : 'no'}.` +
           (closesHtml
-            ? ' File looks finished — do not rewrite. Next missing file or STOP.'
+            ? ' File looks finished — do not rewrite. Next missing required file with write_file NOW (do not summarize yet).'
             : ' If incomplete, append=true on the SAME path (do not invent a new file).')
         : ` lines=${lineCount}.` +
           (sourceComplete
-            ? ' File looks finished — do not rewrite. Next missing file or STOP.'
+            ? ' File looks finished — do not rewrite. Next missing required file with write_file NOW (do not summarize yet).'
             : ' If incomplete, append=true on the SAME path (do not invent a new file).')
     return {
       id: '',
@@ -733,13 +752,23 @@ export class AgentToolRegistry {
       content:
         `${append ? 'Appended' : 'Wrote'} ${content.length} bytes to ${relativePath} (file now ${total} bytes).` +
         htmlHint +
-        ' Finish this file before starting another.',
+        ' This path is on disk now.',
       editReview: { path: pathKey, status: 'pending' },
       diffStat: diffStatFromBeforeAfter(existing, writtenBody)
     }
   }
 
   async deleteFile(relativePath: string): Promise<AgentToolResult> {
+    if (isProtectedHarnessFile(relativePath)) {
+      return {
+        id: '',
+        name: 'delete_file',
+        ok: false,
+        content: '',
+        error:
+          'PROTECTED_FILE: do not delete PROMPT.txt / TASK.md / brief.md unless the user asked to delete that file.'
+      }
+    }
     const abs = this.safeResolve(relativePath)
     let previous = ''
     let existed = false
@@ -1363,8 +1392,14 @@ export class AgentToolRegistry {
 
     const rawCwd = typeof args.cwd === 'string' ? args.cwd : '.'
     const normalized = normalizeAgentShellCommand(rawCommand, rawCwd)
-    const command = normalized.command
+    const afterScaffold = rewriteViteScaffoldCommand(normalized.command)
+    const scaffoldNote =
+      afterScaffold !== normalized.command
+        ? 'create-vite → current dir --no-interactive (not a subfolder; not a Vite dev server)'
+        : undefined
+    const command = rewriteLocalDevServerCommand(afterScaffold)
     const cwdRel = normalized.cwdRel
+    const normalizeNote = [normalized.note, scaffoldNote].filter(Boolean).join('; ')
 
     if (looksLikeShellFileMutation(command) || looksLikeShellFileMutation(rawCommand)) {
       return {
@@ -1415,6 +1450,17 @@ export class AgentToolRegistry {
       }
     }
 
+    const killRefuse = processKillRefusal(command) ?? processKillRefusal(rawCommand)
+    if (killRefuse) {
+      return {
+        id: '',
+        name: 'execute_terminal_command',
+        ok: false,
+        content: '',
+        error: killRefuse
+      }
+    }
+
     // Intercept preview opens: workspace .html → file://; Vite localhost → that URL;
     // LLM API port (e.g. :8080) → never open llama UI, use workspace HTML instead.
     const openKind =
@@ -1433,6 +1479,23 @@ export class AgentToolRegistry {
     }
     if (openKind?.kind === 'llm_mistake' || openKind?.kind === 'workspace_html') {
       return this.openWorkspaceHtmlPreview(command, cwdRel, openKind.kind === 'llm_mistake')
+    }
+
+    const healthCheck =
+      looksLikeLocalPreviewHealthCheck(command) || looksLikeLocalPreviewHealthCheck(rawCommand)
+    if (healthCheck && this.hasLiveLocalServer?.()) {
+      const hintUrl = extractLocalPreviewUrl(command) ?? extractHttpUrlFromOpenCommand(command)
+      if (hintUrl) this.onOpenPreview?.(hintUrl)
+      return {
+        id: '',
+        name: 'execute_terminal_command',
+        ok: true,
+        content:
+          'PREVIEW_OK: local dev server is already running in the terminal.\n' +
+          'Do not curl / Invoke-WebRequest localhost — that injects Ctrl+C into the PTY and kills Vite.\n' +
+          'Open the Local: URL with Start-Process if the in-app Browser is not showing the page.\n' +
+          'exit_code=0'
+      }
     }
 
     const cwd =
@@ -1464,13 +1527,51 @@ export class AgentToolRegistry {
     }
 
     if (this.runVisibleCommand) {
-      const result = await this.runVisibleCommand(command, cwd)
-      return this.formatShellResult(command, result.output, result.exitCode, normalized.note)
+      const isServer = looksLikeLocalServerCommand(command)
+      const timeoutMs = isServer ? 0 : AGENT_SHELL_HARD_TIMEOUT_MS
+      if (!isServer && this.hasLiveLocalServer?.()) {
+        const output = await this.runShell(command, cwd)
+        const merged = [output.stdout, output.stderr].filter((s) => s.trim()).join('\n')
+        return this.withViteScaffoldHint(
+          rawCommand,
+          command,
+          this.formatShellResult(command, merged, output.exitCode, normalizeNote)
+        )
+      }
+      const result = await this.runVisibleCommand(command, cwd, timeoutMs)
+      return this.withViteScaffoldHint(
+        rawCommand,
+        command,
+        this.formatShellResult(command, result.output, result.exitCode, normalizeNote)
+      )
     }
 
     const output = await this.runShell(command, cwd)
     const merged = [output.stdout, output.stderr].filter((s) => s.trim()).join('\n')
-    return this.formatShellResult(command, merged, output.exitCode, normalized.note)
+    return this.withViteScaffoldHint(
+      rawCommand,
+      command,
+      this.formatShellResult(command, merged, output.exitCode, normalizeNote)
+    )
+  }
+
+  private withViteScaffoldHint(
+    rawCommand: string,
+    command: string,
+    result: AgentToolResult
+  ): AgentToolResult {
+    if (result.ok) return result
+    if (!looksLikeViteScaffoldCommand(rawCommand) && !looksLikeViteScaffoldCommand(command)) {
+      return result
+    }
+    const hint =
+      'HINT: create-vite in a non-empty folder often exits 1. ' +
+      'write_file package.json, vite.config.js, index.html, src/main.jsx, src/App.jsx, src/App.css ' +
+      'in THIS workspace root — not a subfolder like fishing-game. Then npm install && npm run dev.'
+    return {
+      ...result,
+      content: `${result.content || ''}\n\n${hint}`.trim()
+    }
   }
 
   /** Resolve a repo HTML file and open it via file:// in the in-app Browser (no temp/shell). */
@@ -1554,7 +1655,7 @@ export class AgentToolRegistry {
     const fileUrl = pathToFileUrl(abs)
     this.onOpenPreview?.(fileUrl)
     const note = llmMistake
-      ? 'Note: that localhost port is the AFKLLM LLM API — opened workspace HTML instead. For Vite use the Local: URL from npm run dev (e.g. :5173).'
+      ? 'Note: that localhost port is the AFKLLM LLM API — opened workspace HTML instead. For Vite use the Local: URL from npm run dev (e.g. :4173), not the IDE renderer on :5173).'
       : 'Static HTML preview (file://). For Vite/dev servers, open the Local: URL from the serve command instead.'
     return {
       id: '',
@@ -1751,6 +1852,23 @@ export class AgentToolRegistry {
             : looksLikeLocalServerCommand(command)
               ? `\nNOTE: local server command — AFKLLM Browser opens when a Local/localhost URL appears in the terminal.`
               : '')
+      }
+    }
+    if (isShellTimeoutExit(exitCode)) {
+      return {
+        id: '',
+        name: 'execute_terminal_command',
+        ok: false,
+        content:
+          `SHELL_TIMEOUT: command did not exit (likely blocked on stdin or a hung child).\n` +
+          `command: ${command}\n` +
+          noteLine +
+          `\n${body}\n\n` +
+          `REQUIRED: do not rerun the same argv. Pipe input or pass a file path, e.g.\n` +
+          `  echo "one two one" | go run wordfreq.go\n` +
+          `  python wordfreq.py test_input.txt\n` +
+          `Then show the real stdout.`,
+        error: 'Timed out'
       }
     }
     if (isUserInterruptExit(exitCode)) {

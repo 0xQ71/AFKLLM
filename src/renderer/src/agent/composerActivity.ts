@@ -205,8 +205,13 @@ export function buildActivityFromTool(params: {
     case 'apply_diff':
       return {
         kind: 'edit',
-        verb: streaming ? 'Editing' : 'Edited',
+        verb: streaming ? 'Editing' : ok ? 'Edited' : 'Write failed',
         path,
+        detail:
+          !streaming && !ok
+            ? (params.resultContent ?? '').replace(/\s+/g, ' ').slice(0, 96) ||
+              undefined
+            : undefined,
         status
       }
     case 'delete_file':
@@ -275,14 +280,27 @@ export function buildActivityFromTool(params: {
         status: webStatus
       }
     }
-    case 'execute_terminal_command':
+    case 'execute_terminal_command': {
+      const stdout = !streaming
+        ? (params.resultContent ?? '')
+            .replace(/^note:.*$/gim, '')
+            .replace(/\n*exit_code=-?\d+\s*$/i, '')
+            .replace(/TERMINAL_ERROR:[\s\S]*$/i, '')
+            .replace(/SHELL_TIMEOUT:[\s\S]*$/i, '')
+            .trim()
+        : ''
+      const firstOut = stdout
+        .split(/\n/)
+        .map((l) => l.trim())
+        .find((l) => l && !/^> /.test(l) && l !== '(no output)')
       return {
         kind: 'shell',
         verb: streaming ? 'Running' : 'Ran',
         command,
-        detail: command ? friendlyShellLabel(command) : undefined,
+        detail: !streaming && firstOut ? firstOut.slice(0, 120) : undefined,
         status
       }
+    }
     case 'read_terminal':
       return {
         kind: 'shell',
@@ -367,14 +385,20 @@ export function formatActivityParts(activity: ComposerActivity): {
   if (activity.kind === 'edit' || activity.kind === 'delete' || activity.kind === 'mkdir') {
     const verbOut =
       activity.status === 'error'
-        ? `${verb} · failed`
+        ? /fail/i.test(verb)
+          ? verb
+          : `${verb} · failed`
         : activity.status === 'partial'
           ? `${verb} · partial`
           : verb
     return {
       verb: verbOut,
       pathLabel: path ? basename(path) : undefined,
-      target: path ? basename(path) : activity.status === 'error' ? '(no path)' : undefined
+      target: path ? basename(path) : activity.status === 'error' ? '(no path)' : undefined,
+      suffix:
+        activity.status === 'error' && detail
+          ? detail.replace(/\s+/g, ' ').slice(0, 80)
+          : undefined
     }
   }
   if (activity.kind === 'list') {
@@ -399,7 +423,10 @@ export function formatActivityParts(activity: ComposerActivity): {
     }
   }
   if (activity.kind === 'shell') {
-    return { verb, target: detail || (command ? friendlyShellLabel(command) : undefined) }
+    const cmd = command ? friendlyShellLabel(command) : undefined
+    const extra =
+      detail && detail !== cmd ? detail.replace(/\s+/g, ' ').slice(0, 80) : undefined
+    return { verb, target: cmd, suffix: extra }
   }
   return {
     verb,

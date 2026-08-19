@@ -50,7 +50,10 @@ import {
   pendingPlanWork,
   isFileWorkPlanStep,
   shouldNudgeRemainingFileWork,
+  reopenTodosForMissingViteReact,
   isBrowserPlanStep,
+  isPreviewHealthCheckPlanStep,
+  isFluffPlanStep,
   settlePlanAfterWork,
   isJunkPlanStep,
   isSoftLayoutPlanStep,
@@ -76,6 +79,7 @@ import {
   isResearchScavengerPlanStep,
   looksLikeEmptyOrStubWriteContent,
   formatEmptyWriteError,
+  formatWriteRedirectChip,
   looksLikeNoCardDumpRequest,
   allowsComposerFullRewrite,
   shouldBlockSurgicalOverwrite,
@@ -100,6 +104,8 @@ import {
   evaluateAcceptanceGate,
   userAskedForCliSmoke,
   stripCodeLeakFromThink,
+  preferUserFacingCloser,
+  looksTruncatedCloser,
   extractAssistantHtmlDump,
   looksLikeAssistantHtmlDump,
   isEllipsisOnly,
@@ -109,7 +115,7 @@ import {
   estimateContextUsage,
   estimateLocalContextSum
 } from '../src/renderer/src/agent/contextUsage'
-import { AgentToolRegistry } from '../src/main/agent/AgentToolRegistry'
+import { AgentToolRegistry, isProtectedHarnessFile } from '../src/main/agent/AgentToolRegistry'
 import { looksLikeShellFileMutation, powershellOperatorMisuse, POWERSHELL_UNALIAS_CURL, POWERSHELL_AGENT_PTY_INIT } from '../src/shared/shellErrors'
 import {
   CHAT_MAX_CONTENT_CHARS,
@@ -120,6 +126,10 @@ import {
   pickChatTitle,
   sanitizeModelChatTitle,
   sanitizePersistedMessages,
+  isReusableEmptySession,
+  userAskedForLanding,
+  welcomeMessageForLang,
+  createEmptySession,
   THREAD_SUMMARY_MSG_ID,
   type PersistedChatMessage
 } from '../src/shared/chats'
@@ -158,11 +168,21 @@ import {
   formatWriteOnceError,
   formatLandingJsBeforeHtmlHint,
   landingBundleReady,
+  looksLikeViteReactTask,
+  looksLikeViteReactFromScratch,
+  userAskedViteReactPreview,
+  looksLikeDevOrPreviewCommand,
+  shellResultOpenedPreview,
+  collectPathsFromTreeText,
+  viteReactScaffoldMissing,
+  formatViteReactScaffoldHint,
+  isLandingPageScriptPath,
+  isViteConfigPath,
   shouldRefuseLandingRewrite,
   shouldRequireWriteFileForApply
 } from '../src/renderer/src/agent/loop/landingWriteCap'
 import { maxTokensForAgent } from '../src/renderer/src/agent/loop/ctxBudget'
-import { formatEditSanityHint, navLooksUnstyled, htmlJsHasThemeControl, htmlCssLayoutMismatch, inlineSvgLooksUnsized, formatLandingCssContractHint, extractCssClassNames } from '../src/renderer/src/agent/loop/editSanity'
+import { formatEditSanityHint, navLooksUnstyled, htmlJsHasThemeControl, htmlCssLayoutMismatch, inlineSvgLooksUnsized, formatLandingCssContractHint, extractCssClassNames, unboundJsxClickHandlers, viteHtmlEntryMismatch, jsxCssClassMismatch, jsxMissingCssImports, viteReactHtmlLooksLikePageDump } from '../src/renderer/src/agent/loop/editSanity'
 import { stubWriteFileArgs } from '../src/renderer/src/agent/loop/compactWrites'
 import { formatSurgicalFollowUpHint, isHtmlOnlyStacks } from '../src/renderer/src/agent/loop/prompts'
 import { truncationGuardMessage, isWholeFileSearchBlock } from '../src/shared/writeThresholds'
@@ -203,6 +223,26 @@ describe('looksLikeToolMarkupLeak', () => {
     assert.doesNotMatch(stripped, /tool_call|function=write_file/)
     assert.match(liveThinkProse(leaked), /Now README/)
     assert.doesNotMatch(liveThinkProse(leaked), /tool_call|function=/)
+  })
+
+  it('salvages leaked verify_project XML and strips it from chat text', () => {
+    const leaked =
+      'Dev-сервер работает.\n' +
+      '<tool_call>\n<function=verify_project>\n' +
+      '<parameter=command>\nnpm test\n</parameter>\n' +
+      '<parameter=mode>\ntest\n</parameter>\n' +
+      '</function>\n</tool_call>'
+    assert.equal(looksLikeToolMarkupLeak(leaked), true)
+    const calls = salvageLeakedToolCalls(leaked)
+    assert.equal(calls.length, 1)
+    assert.equal(calls[0]!.function.name, 'verify_project')
+    const args = JSON.parse(calls[0]!.function.arguments) as { mode?: string; command?: string }
+    assert.equal(args.mode, 'test')
+    assert.equal(args.command, 'npm test')
+    const stripped = stripLeakedToolMarkup(leaked)
+    assert.match(stripped, /Dev-сервер/)
+    assert.doesNotMatch(stripped, /tool_call|function=verify_project/)
+    assert.equal(looksLikeToolMarkupLeak(stripped), false)
   })
 
   it('fingerprints identical mkdir / writes', () => {
@@ -292,10 +332,13 @@ describe('compact write_file args', () => {
     const args = JSON.parse(raw) as Record<string, unknown>
     assert.equal(args.relative_path, 'index.html')
     assert.equal(typeof args.content, 'string')
-    assert.match(String(args.content), /\[omitted/)
+    assert.match(String(args.content), /\[HISTORY_COMPACT\]/)
+    assert.doesNotMatch(String(args.content), /^\[omitted/)
+    assert.match(String(args.content), /NOT file contents/i)
     assert.equal(args.note, undefined)
     assert.equal(looksLikeEmptyOrStubWriteContent(args.content, 'index.html'), true)
     assert.match(formatEmptyWriteError('index.html'), /EMPTY_WRITE/)
+    assert.match(formatEmptyWriteError('index.html'), /HISTORY_COMPACT/)
   })
 })
 
@@ -1233,9 +1276,15 @@ describe('agent todo plan', () => {
       sanitizeThinkProse(
         '<think>\n1. Write index.html\n2. Open in browser\n3. Summarize\n</think>'
       ),
-      ''
+      '1. Write index.html\n2. Open in browser\n3. Summarize'
     )
     assert.equal(thinkLooksLikeChecklist('1. Write\n2. Open\n3. Summarize'), true)
+    assert.match(
+      displayThinkProse(
+        '<think>\nЦель: React-игра.\nПлан действий:\n1) Vite\n2) Компоненты\n3) Стили\n</think>'
+      ),
+      /1\) Vite/
+    )
     assert.equal(displayThinkProse('<think>\n…\n</think>'), '')
     assert.match(
       displayThinkProse('<think>\nЦель: лендинг Northline без AI-градиентов.\n</think>'),
@@ -1310,6 +1359,71 @@ describe('agent todo plan', () => {
     )
     assert.ok(dump && /<!DOCTYPE/i.test(dump))
     assert.equal(looksLikeAssistantHtmlDump('just prose about a landing'), false)
+  })
+
+  it('strips fake <web_search> markup from think', () => {
+    const leaked =
+      'Нужно найти LTS.\n<web_search>LTS Node.js version site:nodejs.org</web_search>\nПотом ответить.'
+    const clean = stripCodeLeakFromThink(leaked)
+    assert.doesNotMatch(clean, /<web_search>/i)
+    assert.match(clean, /Нужно найти LTS/)
+  })
+
+  it('drops English closer meta and keeps the Russian summary', () => {
+    const mixed =
+      'The task is complete. I should provide a short summary in Russian since the user wrote in Russian.\n\n' +
+      'Отлично! Исправление успешно применено и тесты проходят.\n\nБаг устранён точечно, проект не переписан.'
+    const out = preferUserFacingCloser(mixed, 'ru')
+    assert.doesNotMatch(out, /I should provide/)
+    assert.match(out, /Исправление успешно/)
+  })
+
+  it('drops Perfect/closing-summary English meta and detects truncated URLs', () => {
+    const mixed =
+      'Perfect! Now I need to write the closing summary in Russian.\n\n' +
+      'Игра готова. Превью: `http:/'
+    const out = preferUserFacingCloser(mixed, 'ru')
+    assert.doesNotMatch(out, /Perfect/)
+    assert.doesNotMatch(out, /closing summary/i)
+    assert.match(out, /Игра готова/)
+    assert.equal(looksTruncatedCloser(out), true)
+    assert.equal(looksTruncatedCloser('Игра готова: http://localhost:3000/'), false)
+    assert.equal(looksTruncatedCloser('See `App.jsx` and `main.jsx`.'), false)
+    const compile =
+      'The user wants me to stop and write a closing summary in Russian. Let me compile what was done:\n\nFiles created/modified: package.json'
+    assert.equal(preferUserFacingCloser(compile, 'ru'), '')
+    const inThink =
+      '<think>Let me summarize.</think>\n\nИгра готова. Превью открыто на http://127.0.0.1:4173/'
+    const outThink = preferUserFacingCloser(inThink, 'ru')
+    assert.doesNotMatch(outThink, /<think>/i)
+    assert.doesNotMatch(outThink, /Let me summarize/)
+    assert.match(outThink, /Игра готова/)
+    const longOdd =
+      'The terminal keeps showing `npm run dev -- --host 127.0.0.1 --port 3000 because the rewrite pinned a busy port. ' +
+      'Next I tried vite --port 5173 which is the IDE. Files: package.json, src/App.jsx.'
+    assert.equal(looksTruncatedCloser(longOdd), false)
+  })
+
+  it('orders replace before run on an edit plan', () => {
+    const coerced = coerceProductPlan(
+      [
+        {
+          id: '1',
+          text: 'Запустить node test.js и показать stdout.',
+          status: 'pending'
+        },
+        {
+          id: '2',
+          text: 'Заменить эту логику на умножение: сумма * (1 + taxRate).',
+          status: 'pending'
+        }
+      ],
+      { userText: 'Почини баг в total.js и запусти node test.js', surgical: true }
+    )
+    const iFix = coerced.findIndex((s) => /Заменить/i.test(s.text))
+    const iRun = coerced.findIndex((s) => /Запустить/i.test(s.text))
+    assert.ok(iFix >= 0 && iRun >= 0)
+    assert.ok(iFix < iRun)
   })
 
   it('does not tick plan rows from HTML shape alone (evidence required)', () => {
@@ -1462,6 +1576,67 @@ describe('agent todo plan', () => {
     assert.equal(pendingPlanWork(steps).length, 0)
   })
 
+  it('T05 verify/summary rows are meta — not leftover file work', () => {
+    const verify =
+      'Проверить корректность: убедиться, что все секции рендерятся, мобильный адаптив работает, нет синтаксических ошибок.'
+    const summary = 'Подвести итог: что создано, ключевые пути, как проверялся результат.'
+    assert.equal(isMetaOrSummaryPlanStep(verify), true)
+    assert.equal(isMetaOrSummaryPlanStep(summary), true)
+    assert.equal(isFileWorkPlanStep(verify), false)
+    const steps = [
+      { id: 's1', text: 'Создать styles.css', status: 'done' as const },
+      { id: 's2', text: 'Создать index.html', status: 'done' as const },
+      { id: 's3', text: verify, status: 'in_progress' as const },
+      { id: 's4', text: summary, status: 'pending' as const }
+    ]
+    assert.equal(pendingPlanWork(steps).length, 0)
+    const settled = settlePlanAfterWork(steps, { previewOpened: true, edited: true })
+    assert.ok(settled.every((s) => s.status === 'done'))
+  })
+
+  it('curl localhost / page-loaded plan rows are preview health — not leftover work', () => {
+    const curl = 'Проверить, что страница загрузилась без ошибок (curl -I http://localhost:4173)'
+    const errors = 'Если есть ошибки — исправить и перезапустить dev-сервер'
+    assert.equal(isPreviewHealthCheckPlanStep(curl), true)
+    assert.equal(isBrowserPlanStep(curl), true)
+    assert.equal(isResearchScavengerPlanStep(curl), false)
+    assert.equal(isFluffPlanStep(errors), true)
+    const constraints =
+      'Ключевые ограничения: React-игра, не HTML; все файлы в корне проекта; запрещён GitHub и чужие папки.'
+    assert.equal(isFluffPlanStep(constraints), true)
+    const steps = [
+      { id: 's1', text: 'Создать App.jsx', status: 'done' as const },
+      { id: 's2', text: curl, status: 'in_progress' as const },
+      { id: 's3', text: errors, status: 'pending' as const },
+      { id: 's4', text: constraints, status: 'in_progress' as const }
+    ]
+    assert.equal(pendingPlanWork(steps).length, 0)
+    const settled = settlePlanAfterWork(steps, { previewOpened: true })
+    assert.equal(settled.find((s) => s.id === 's2')?.status, 'done')
+    assert.equal(settled.find((s) => s.id === 's4')?.status, 'done')
+  })
+
+  it('EMPTY_WRITE chip is not the apply_diff rewrite warning', () => {
+    assert.match(formatWriteRedirectChip('EMPTY_WRITE: relative_path="index.html"', 'ru'), /пустая запись/i)
+    assert.doesNotMatch(
+      formatWriteRedirectChip('EMPTY_WRITE: relative_path="index.html"', 'ru'),
+      /apply_diff/
+    )
+    assert.match(formatWriteRedirectChip('FILE_COMPLETE: index.html', 'ru'), /apply_diff/)
+  })
+
+  it('long post-tool closer is not false-success prose', () => {
+    const closer =
+      'Превью открыто в браузере. Все файлы созданы и проверены. ' +
+      'Созданы index.html, styles.css и js/main.js для студии «Северная заводь». ' +
+      'Откройте превью в приложении и проверьте секции Navbar, Hero, lodges, FAQ и Footer на desktop и mobile.'
+    assert.equal(isFalseSuccessProse(closer), false)
+    assert.equal(
+      isFalseSuccessProse('Создаю styles.css с секцией .hero. Файлы созданы: Проверка: index.html'),
+      true
+    )
+  })
+
   it('detects redundant “plan already done in previous answer” prose', () => {
     assert.equal(
       isRedundantPlanCompleteProse(
@@ -1584,12 +1759,98 @@ describe('chat titles', () => {
     assert.equal(pickChatTitle(prompt, 'Лендинг Northline'), 'Лендинг Northline')
   })
 
+  it('uses quoted Cyrillic brand and ignores negated Northline', () => {
+    const prompt =
+      'Собери с нуля одностраничный лендинг рыболовной студии «Северная заводь» (lodges / рыбалка, не Northline и не чужой бренд).'
+    assert.equal(extractBrandFromPrompt(prompt), 'Северная заводь')
+    assert.match(deriveChatTitle(prompt), /Лендинг/i)
+    assert.match(deriveChatTitle(prompt), /Северная/)
+    assert.doesNotMatch(deriveChatTitle(prompt), /Northline/i)
+    assert.equal(pickChatTitle(prompt, 'Лендинг Northline'), deriveChatTitle(prompt))
+  })
+
+  it('does not title a React game chat as GitHub', () => {
+    const prompt =
+      'Собери с нуля в корне этой папки игру на React (Vite + React), тема — рыбалка. Не ходи на GitHub и не пиши в чужие папки.'
+    assert.notEqual(extractBrandFromPrompt(prompt), 'GitHub')
+    assert.doesNotMatch(deriveChatTitle(prompt), /GitHub/i)
+    assert.doesNotMatch(deriveChatTitle(prompt), /^(react|vite)$/i)
+    assert.match(deriveChatTitle(prompt), /игра/i)
+    assert.match(deriveChatTitle(prompt), /рыбалк/i)
+    assert.equal(isAwkwardChatTitle('React'), true)
+    assert.equal(isAwkwardChatTitle('Собери нуля корне'), true)
+    assert.match(pickChatTitle(prompt, 'React'), /игра/i)
+  })
+
+  it('does not treat «не HTML-лендинг» as a landing title', () => {
+    const prompt =
+      'Собери с нуля в корне этой папки игру на React (Vite + React), тема — рыбалка: крючок/поплавок, можно ловить рыбу, приятный UI.\n' +
+      'Это должна быть именно React-игра, не HTML-лендинг. Не ходи на GitHub и не пиши в чужие папки.'
+    assert.equal(userAskedForLanding(prompt), false)
+    assert.match(deriveChatTitle(prompt), /игра/i)
+    assert.match(deriveChatTitle(prompt), /рыбалк/i)
+    assert.doesNotMatch(deriveChatTitle(prompt), /собери|нуля|корне/i)
+  })
+
   it('does not title a Python script chat as a landing', () => {
     const prompt =
-      'Создай в корне проекта Python-скрипт wordfreq.py: считает частоту слов из аргумента-файла или stdin, без учёта регистра, печатает топ-10.'
+      'Создай в корне проекта Python-скрипт wordfreq.py: считает частоту слов из аргумента-файла или stdin, без учёта регистра, печатает топ-10. Не делай HTML/лендинг.'
+    assert.equal(userAskedForLanding(prompt), false)
     const titled = pickChatTitle(prompt, 'Лендинг Python')
     assert.doesNotMatch(titled, /лендинг/i)
     assert.doesNotMatch(titled, /landing/i)
+    assert.match(deriveChatTitle(prompt), /wordfreq/i)
+  })
+
+  it('rejects Thinking Process and User-asks titles; prefers Fix file', () => {
+    const edit =
+      'В total.js баг: налог должен считаться как сумма * (1 + taxRate). Почини точечно. Не делай HTML/лендинг.'
+    assert.equal(isAwkwardChatTitle('Thinking Process:'), true)
+    assert.equal(isAwkwardChatTitle('Пользователь просит исправить'), true)
+    assert.equal(pickChatTitle(edit, 'Thinking Process:'), deriveChatTitle(edit))
+    assert.match(deriveChatTitle(edit), /Fix total\.js/i)
+    assert.match(deriveChatTitle('Создай wordfreq.go: топ-10 слов, go run.'), /Go wordfreq/i)
+  })
+
+  it('reuses an empty New agent session instead of stacking blanks', () => {
+    assert.equal(
+      isReusableEmptySession({
+        title: 'New agent',
+        messages: [{ role: 'assistant' }]
+      }),
+      true
+    )
+    assert.equal(
+      isReusableEmptySession({
+        title: 'Fix total.js',
+        messages: [{ role: 'assistant' }]
+      }),
+      false
+    )
+    assert.equal(
+      isReusableEmptySession({
+        title: 'New agent',
+        messages: [{ role: 'user' }, { role: 'assistant' }]
+      }),
+      false
+    )
+  })
+
+  it('persists a Russian welcome for ru UI language', () => {
+    const ru = createEmptySession('ru')
+    assert.equal(ru.title, 'Новый агент')
+    assert.equal(ru.messages[0]?.id, 'welcome')
+    assert.match(ru.messages[0]?.content ?? '', /онлайн/i)
+    assert.match(welcomeMessageForLang('ru').content, /онлайн/i)
+    assert.equal(isReusableEmptySession(ru), true)
+  })
+
+  it('refuses deleting harness PROMPT.txt', () => {
+    assert.equal(isProtectedHarnessFile('PROMPT.txt'), true)
+    assert.equal(isProtectedHarnessFile('src/PROMPT.txt'), true)
+    assert.equal(isProtectedHarnessFile('TASK.md'), true)
+    assert.equal(isProtectedHarnessFile('brief.md'), true)
+    assert.equal(isProtectedHarnessFile('src/App.jsx'), false)
   })
 })
 
@@ -2788,6 +3049,194 @@ describe('Gemma 8k harness', () => {
 })
 
 describe('edit sanity + html-only stacks', () => {
+  it('flags unbound JSX click handlers before a playable closer', () => {
+    const src = `export default function App() {
+  const [cast, setCast] = useState(false)
+  const castLine = () => setCast(true)
+  return <div className="water">click the water</div>
+}`
+    assert.deepEqual(unboundJsxClickHandlers(src), ['castLine'])
+    assert.equal(
+      formatEditSanityHint({
+        path: 'package.json',
+        content: '{\n  "name": "fishing-game",\n  "scripts": { "dev": "vite" }\n}\n'
+      }),
+      null
+    )
+    assert.equal(
+      formatEditSanityHint({
+        path: 'package.json',
+        content:
+          'import React from "react"\nexport default function App(){return <button onClick={cast} />}'
+      }),
+      null
+    )
+    const hint = formatEditSanityHint({ path: 'src/App.jsx', content: src, js: src })
+    assert.ok(hint)
+    assert.match(hint!, /EDIT_SANITY/)
+    assert.match(hint!, /castLine/)
+    const wired = src.replace(
+      '<div className="water">click the water</div>',
+      '<div className="water" onClick={castLine}>click the water</div>'
+    )
+    assert.deepEqual(unboundJsxClickHandlers(wired), [])
+    assert.equal(
+      formatEditSanityHint({ path: 'src/App.jsx', content: wired, js: wired }),
+      null
+    )
+  })
+
+  it('flags Vite script src vs App.jsx and JSX/CSS class mismatch', () => {
+    const html =
+      '<!DOCTYPE html><html><head></head><body>' +
+      '<div id="root"></div>' +
+      '<script type="module" src="/src/main.jsx"></script>' +
+      '</body></html>'
+    const jsx =
+      'import React from "react"\n' +
+      'export default function App(){\n' +
+      '  return <div className="container"><div className="fishing-area"><span className="hook">hook</span></div></div>\n' +
+      '}\n'
+    const css =
+      '.game-container{display:flex}.hook-line{height:40px}.float-bobber{animation:bob 1s infinite}' +
+      '.score-board{color:#fff}.cast-btn{padding:8px}\n'
+    assert.equal(viteHtmlEntryMismatch(html, 'App.jsx'), null)
+    assert.equal(viteHtmlEntryMismatch(html.replace('/src/main.jsx', '/App.jsx'), 'App.jsx'), null)
+    assert.equal(viteHtmlEntryMismatch(html, 'src/game.jsx'), '/src/main.jsx')
+    const missing = jsxCssClassMismatch(jsx, css)
+    assert.ok(missing.includes('container'))
+    assert.ok(missing.includes('fishing-area'))
+    const hint = formatEditSanityHint({
+      path: 'index.html',
+      content: html,
+      html,
+      js: jsx,
+      jsPath: 'App.jsx',
+      css,
+      cssPath: 'App.css'
+    })
+    assert.ok(hint)
+    assert.doesNotMatch(hint!, /script src/)
+    assert.match(hint!, /className/)
+  })
+
+  it('does not treat Vite+React as an HTML landing; flags phantom index.css', () => {
+    const brief =
+      'Собери с нуля в корне этой папки игру на React (Vite + React), не HTML-лендинг.'
+    const dumpHtml =
+      '<!DOCTYPE html><html><body><div id="root">' +
+      '<h1 data-i18n="gameTitle">Рыбалка</h1><button data-i18n="castButton">Забросить</button>' +
+      '</div><script type="module" src="/src/main.jsx"></script></body></html>'
+    const viteCfg =
+      "import { defineConfig } from 'vite'\nimport react from '@vitejs/plugin-react'\nexport default defineConfig({ plugins: [react()] })\n"
+    const mainJsx =
+      "import { createRoot } from 'react-dom/client'\nimport './index.css'\nimport App from './App.jsx'\n"
+    assert.equal(looksLikeViteReactTask(brief), true)
+    assert.equal(isViteConfigPath('vite.config.js'), true)
+    assert.equal(isLandingPageScriptPath('vite.config.js'), false)
+    assert.equal(isLandingPageScriptPath('js/main.js'), true)
+    assert.equal(isLandingPageScriptPath('src/main.jsx'), false)
+    assert.equal(viteReactHtmlLooksLikePageDump(dumpHtml), true)
+    assert.equal(
+      formatI18nSanityHint({
+        html: dumpHtml,
+        js: viteCfg,
+        jsPath: 'vite.config.js',
+        userText: brief
+      }),
+      null
+    )
+    assert.equal(formatI18nSanityHint({ html: dumpHtml, userText: brief }), null)
+    const dumpHint = formatEditSanityHint({
+      path: 'index.html',
+      content: dumpHtml,
+      html: dumpHtml,
+      userText: brief
+    })
+    assert.ok(dumpHint)
+    assert.match(dumpHint!, /EDIT_SANITY/)
+    assert.match(dumpHint!, /thin shell|App\.jsx/i)
+    assert.doesNotMatch(dumpHint!, /I18N_SANITY/)
+    assert.deepEqual(jsxMissingCssImports(mainJsx, 'src/App.css'), ['./index.css'])
+    const cssHint = formatEditSanityHint({
+      path: 'src/main.jsx',
+      content: mainJsx,
+      js: mainJsx,
+      css: '.app{display:flex}\n.water{height:40vh}\n.cast-btn{padding:8px}\n',
+      cssPath: 'src/App.css',
+      userText: brief
+    })
+    assert.ok(cssHint)
+    assert.match(cssHint!, /index\.css/)
+    assert.equal(
+      isFluffPlanStep('План действий для сборки React-игры "Рыбалка" на Vite + React:'),
+      true
+    )
+    assert.equal(
+      isJunkPlanStep('Каждый шаг создаёт файлы в зависимости друг от друга: сначала конфигурация, потом HTML'),
+      true
+    )
+    const t06 =
+      'Собери с нуля в корне этой папки игру на React (Vite + React), тема — рыбалка. Запусти npm run dev или открой превью.'
+    assert.equal(looksLikeViteReactFromScratch(t06), true)
+    assert.equal(looksLikeFromScratchTask(t06), true)
+    assert.equal(userAskedViteReactPreview(t06), true)
+    assert.equal(looksLikeDevOrPreviewCommand('npm run dev'), true)
+    assert.equal(looksLikeDevOrPreviewCommand('npm install'), false)
+    assert.equal(
+      shellResultOpenedPreview(
+        'VITE ready\nLocal: http://127.0.0.1:4173/\nexit_code=0\nPREVIEW_URL: http://127.0.0.1:4173/ (opened in AFKLLM Browser)'
+      ),
+      true
+    )
+    assert.equal(shellResultOpenedPreview('npm install\nexit_code=0'), false)
+    assert.deepEqual(
+      jsxMissingCssImports("import './App.css'\nexport default function App(){return null}\n", ''),
+      []
+    )
+    assert.equal(
+      looksLikeViteReactFromScratch('Fix the broken hook in the existing Vite React game'),
+      false
+    )
+    assert.deepEqual(
+      viteReactScaffoldMissing([
+        'package.json',
+        'vite.config.js',
+        'src/App.css',
+        'src/main.jsx'
+      ]),
+      ['index.html', 'app']
+    )
+    assert.deepEqual(
+      viteReactScaffoldMissing([
+        'package.json',
+        'vite.config.ts',
+        'index.html',
+        'src/main.jsx',
+        'src/App.jsx'
+      ]),
+      []
+    )
+    assert.ok(
+      collectPathsFromTreeText('src/main.jsx\npackage.json\nvite.config.js').includes(
+        'src/main.jsx'
+      )
+    )
+    assert.match(formatViteReactScaffoldHint(['index.html', 'app']), /VITE_REACT_INCOMPLETE/)
+    assert.match(formatViteReactScaffoldHint(['index.html', 'app']), /App\.jsx/)
+    const reopened = reopenTodosForMissingViteReact(
+      [
+        { id: 's5', text: 'Создать index.html — пустой div #root', status: 'done' },
+        { id: 's7', text: 'Создать src/App.jsx — игровая механика', status: 'done' },
+        { id: 's4', text: 'Создать package.json', status: 'done' }
+      ],
+      ['index.html', 'app']
+    )
+    assert.equal(reopened[0]!.status, 'in_progress')
+    assert.equal(reopened[1]!.status, 'in_progress')
+    assert.equal(reopened[2]!.status, 'done')
+  })
+
   it('flags incomplete source and treats html-only stacks separately', () => {
     const hint = formatEditSanityHint({
       path: 'app.py',

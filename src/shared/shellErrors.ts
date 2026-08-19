@@ -5,8 +5,30 @@
 
 const CTRL_C_CODES = new Set([0xc000013a, -1073741510, 3221225786])
 
+/** GNU timeout / agent watchdog (stdin hang, stuck compile). */
+export const SHELL_TIMEOUT_EXIT = 124
+export const AGENT_SHELL_HARD_TIMEOUT_MS = 90_000
+export const AGENT_SHELL_IDLE_TIMEOUT_MS = 55_000
+
 export function isUserInterruptExit(exitCode: number): boolean {
   return exitCode === 130 || CTRL_C_CODES.has(exitCode)
+}
+
+export function isShellTimeoutExit(exitCode: number): boolean {
+  return exitCode === SHELL_TIMEOUT_EXIT
+}
+
+/** Hard wall, or silence after last PTY output (typical stdin block). */
+export function shellWatchdogFired(opts: {
+  now: number
+  startedAt: number
+  lastOutputAt: number
+  hardMs: number
+  idleMs: number
+}): 'hard' | 'idle' | null {
+  if (opts.hardMs > 0 && opts.now - opts.startedAt >= opts.hardMs) return 'hard'
+  if (opts.idleMs > 0 && opts.now - opts.lastOutputAt >= opts.idleMs) return 'idle'
+  return null
 }
 
 /** Launchers that often end because the user closed a window, not a compile error. */
@@ -136,4 +158,24 @@ export function looksLikeShellFileMutation(command: string): boolean {
   // `echo x > file` / `cmd >> log.txt`, but not `2>&1` / `>&2`
   if (/(^|[\s;|&])>{1,2}\s*(?!&)[^\s;&|]+/.test(c)) return true
   return false
+}
+
+/** Agent must not taskkill svchost / random PIDs from netstat. */
+export function processKillRefusal(command: string): string | null {
+  const c = command.trim()
+  if (!c) return null
+  if (
+    /\btaskkill\b/i.test(c) ||
+    /\bStop-Process\b/i.test(c) ||
+    /\bkillall\b/i.test(c) ||
+    /\bpkill\b/i.test(c) ||
+    /(?:^|[\s;|&])kill\s+(?:-\w+\s+)*\d+/i.test(c)
+  ) {
+    return (
+      'SHELL_REFUSED: do not kill processes by PID (taskkill / Stop-Process / kill). ' +
+      `If a port is busy, start the dev server on another port (vite --port ${4173}). ` +
+      'Do not target svchost or system PIDs.'
+    )
+  }
+  return null
 }

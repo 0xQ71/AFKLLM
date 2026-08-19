@@ -397,7 +397,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
 
   visionModelPath: '',
   visionMmprojPath: '',
-  visionKeepLoaded: true,
+  visionKeepLoaded: false,
   applyModelPath: '',
   applyCtxSize: 0,
   imageGenModelPath: '',

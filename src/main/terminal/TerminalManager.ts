@@ -2,9 +2,16 @@ import * as pty from 'node-pty'
 import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
+import { execFileSync } from 'node:child_process'
 import type { BrowserWindow } from 'electron'
-import { extractLocalPreviewUrl } from '../../shared/localPreview'
-import { POWERSHELL_AGENT_PTY_INIT } from '../../shared/shellErrors'
+import { extractLocalPreviewUrl, looksLikeLocalServerCommand } from '../../shared/localPreview'
+import {
+  AGENT_SHELL_HARD_TIMEOUT_MS,
+  AGENT_SHELL_IDLE_TIMEOUT_MS,
+  POWERSHELL_AGENT_PTY_INIT,
+  SHELL_TIMEOUT_EXIT,
+  shellWatchdogFired
+} from '../../shared/shellErrors'
 
 export interface TerminalSession {
   id: string
@@ -36,6 +43,8 @@ export class TerminalManager {
   private lastPreviewUrl: string | null = null
   private lastPreviewAt = 0
   private denyPreviewPorts: number[] = [8080]
+  /** Dev server still occupying the PTY after Local: URL (timeoutMs=0). */
+  private liveLocalServer = false
 
   setWindow(win: BrowserWindow | null): void {
     this.window = win
@@ -47,6 +56,10 @@ export class TerminalManager {
 
   setAutoConfirm(getter: (() => boolean) | null): void {
     this.autoConfirmGetter = getter
+  }
+
+  hasLiveLocalServer(): boolean {
+    return this.liveLocalServer
   }
 
   ensureOpen(): void {
@@ -224,12 +237,12 @@ export class TerminalManager {
 
   /**
    * Run in visible primary PTY until exit marker.
-   * @param timeoutMs 0 = wait until exit / interrupt (no soft timeout)
+   * @param timeoutMs 0 = wait until exit / interrupt (dev servers). Default agent hard timeout.
    */
   async runVisibleCommand(
     command: string,
     cwd: string,
-    timeoutMs = 0
+    timeoutMs: number = AGENT_SHELL_HARD_TIMEOUT_MS
   ): Promise<TerminalCommandResult> {
     if (this.activeCommandCancel) {
       this.activeCommandCancel()
@@ -239,6 +252,19 @@ export class TerminalManager {
     this.ensureOpen()
     const session = this.ensure(cwd)
     await sleep(200)
+
+    if (this.liveLocalServer && timeoutMs !== 0 && !looksLikeLocalServerCommand(command)) {
+      this.agentInputLocked = false
+      return {
+        output:
+          'NOTE: a local dev server is still running in this terminal. ' +
+          'Command was not injected (Ctrl+C would kill Vite). Open the Local: URL instead.',
+        exitCode: 0
+      }
+    }
+    if (looksLikeLocalServerCommand(command)) {
+      this.liveLocalServer = false
+    }
 
     const marker = `__AFK_EXIT_${Date.now().toString(36)}__`
     let buf = ''
@@ -262,11 +288,13 @@ export class TerminalManager {
 
     return new Promise((resolvePromise) => {
       let settled = false
+      const startedAt = Date.now()
+      let lastOutputAt = startedAt
       const finish = (exitCode: number): void => {
         if (settled) return
         settled = true
         this.agentInputLocked = false
-        if (timer) clearTimeout(timer)
+        if (watch) clearInterval(watch)
         if (this.activeCommandCancel === cancel) this.activeCommandCancel = null
         this.dataListeners.delete(onData)
         const plain = strip(buf)
@@ -276,23 +304,45 @@ export class TerminalManager {
         resolvePromise({ output: cleaned, exitCode })
       }
 
-      const cancel = (): void => {
+      const interruptTree = (): void => {
+        this.liveLocalServer = false
         this.write(session.id, '\x03')
+        const pid = this.sessions.get(session.id)?.pid
+        if (typeof pid === 'number' && pid > 0) killChildProcesses(pid)
         setTimeout(() => {
           if (!settled) this.write(session.id, '\x03')
         }, 120)
+      }
+
+      const cancel = (): void => {
+        interruptTree()
         finish(130)
       }
 
       const onData = (id: string, data: string): void => {
         if (id !== session.id) return
+        lastOutputAt = Date.now()
         buf += data
         const plain = strip(buf)
         const idx = plain.lastIndexOf(marker)
         if (idx >= 0) {
           const after = plain.slice(idx + marker.length)
           const m = after.match(/^(\d+)/)
-          if (m) finish(Number(m[1]))
+          if (m) {
+            this.liveLocalServer = false
+            finish(Number(m[1]))
+          }
+        }
+        // Dev servers never print the exit marker. Return once Local:/localhost is up
+        // so the agent can conclude; leave the process running in the PTY.
+        if (timeoutMs === 0 && !settled) {
+          const url = extractLocalPreviewUrl(plain, {
+            denyPorts: this.denyPreviewPorts
+          })
+          if (url) {
+            this.liveLocalServer = true
+            finish(0)
+          }
         }
         // Auto-confirm CLI y/n when agent has full rights (agentAutoApprove).
         if (
@@ -315,12 +365,23 @@ export class TerminalManager {
       this.dataListeners.add(onData)
       this.activeCommandCancel = cancel
 
-      const timer =
-        timeoutMs > 0
-          ? setTimeout(() => {
-              this.write(session.id, '\x03')
-              finish(124)
-            }, timeoutMs)
+      const hardMs = timeoutMs > 0 ? timeoutMs : 0
+      const idleMs =
+        timeoutMs > 0 ? Math.min(AGENT_SHELL_IDLE_TIMEOUT_MS, timeoutMs) : 0
+      const watch =
+        hardMs > 0 || idleMs > 0
+          ? setInterval(() => {
+              const hit = shellWatchdogFired({
+                now: Date.now(),
+                startedAt,
+                lastOutputAt,
+                hardMs,
+                idleMs
+              })
+              if (!hit) return
+              interruptTree()
+              finish(SHELL_TIMEOUT_EXIT)
+            }, 1000)
           : null
 
       const script = this.wrapCommand(command, marker)
@@ -383,4 +444,48 @@ function normalizePath(p: string): string {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms))
+}
+
+/** Kill descendants of the PTY shell — never the shell itself (that would drop the terminal). */
+export function killChildProcesses(rootPid: number): void {
+  if (!rootPid || rootPid < 1) return
+  if (process.platform === 'win32') {
+    const kids = windowsDescendantPids(rootPid)
+    for (const pid of kids) {
+      try {
+        execFileSync('taskkill', ['/F', '/PID', String(pid)], {
+          windowsHide: true,
+          timeout: 4000
+        })
+      } catch {
+        /* already gone */
+      }
+    }
+    return
+  }
+  try {
+    execFileSync('pkill', ['-P', String(rootPid)], { timeout: 3000 })
+  } catch {
+    /* no children */
+  }
+}
+
+function windowsDescendantPids(rootPid: number): number[] {
+  try {
+    const out = execFileSync(
+      'powershell.exe',
+      [
+        '-NoProfile',
+        '-Command',
+        `$root=${rootPid}; $all=@(); $q=[System.Collections.Queue]::new(); $q.Enqueue($root); while($q.Count){ $p=[int]$q.Dequeue(); Get-CimInstance Win32_Process -Filter ("ParentProcessId="+$p) -ErrorAction SilentlyContinue | ForEach-Object { $id=[int]$_.ProcessId; if($id -gt 0){ $all+=$id; $q.Enqueue($id) } } }; $all -join ' '`
+      ],
+      { windowsHide: true, timeout: 6000, encoding: 'utf8' }
+    )
+    return String(out)
+      .split(/\s+/)
+      .map((s) => Number(s))
+      .filter((n) => Number.isFinite(n) && n > 0 && n !== rootPid)
+  } catch {
+    return []
+  }
 }

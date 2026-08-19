@@ -80,6 +80,20 @@ describe('composerActivity', () => {
     assert.equal(formatActivityLabel(a), 'Editing ChatPanel.tsx')
   })
 
+  it('labels EMPTY_WRITE as Write failed not Edited', () => {
+    const a = buildActivityFromTool({
+      name: 'write_file',
+      args: { relative_path: 'src/App.css' },
+      ok: false,
+      resultContent:
+        'EMPTY_WRITE: relative_path="src/App.css" is not a write. Put the FULL file in the content argument.'
+    })
+    assert.equal(a.verb, 'Write failed')
+    assert.equal(a.status, 'error')
+    assert.match(formatActivityLabel(a), /Write failed/)
+    assert.doesNotMatch(formatActivityLabel(a), /^Edited /)
+  })
+
   it('formats Planning next moves', () => {
     const a = buildActivityFromTool({ name: '__planning__', streaming: true })
     assert.equal(formatActivityLabel(a), 'Planning next moves')

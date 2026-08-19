@@ -4,13 +4,18 @@ import { app } from 'electron'
 import {
   createEmptySession,
   DEFAULT_WELCOME_MESSAGE,
+  defaultChatTitleForLang,
   isDefaultChatTitle,
+  isReusableEmptySession,
+  isWelcomeChatMessage,
   sanitizePersistedMessages,
+  welcomeMessageForLang,
   type ChatSession,
   type ChatStoreSnapshot,
   type PersistedChatMessage
 } from '../../shared/chats'
 import { chatRootKey } from '../../shared/workspace'
+import { DEFAULT_UI_LANGUAGE, type UiLanguage } from '../../shared/i18n'
 
 export { chatRootKey, fsSafeRootKey } from '../../shared/workspace'
 
@@ -22,8 +27,8 @@ function blankSnapshot(): ChatStoreSnapshot {
 }
 
 /** Starter agent snapshot for a newly opened repo. */
-function emptySnapshot(): ChatStoreSnapshot {
-  const first = createEmptySession()
+function emptySnapshot(lang: UiLanguage = DEFAULT_UI_LANGUAGE): ChatStoreSnapshot {
+  const first = createEmptySession(lang)
   return { activeId: first.id, sessions: [first] }
 }
 
@@ -37,6 +42,7 @@ export class ChatStore {
   private roots: Record<string, ChatStoreSnapshot> = {}
   private cache: ChatStoreSnapshot
   private writeChain: Promise<void> = Promise.resolve()
+  private uiLang: UiLanguage = DEFAULT_UI_LANGUAGE
 
   private enqueueWrite<T>(fn: () => Promise<T>): Promise<T> {
     const run = this.writeChain.then(fn, fn)
@@ -49,7 +55,7 @@ export class ChatStore {
 
   constructor() {
     this.path = join(app.getPath('userData'), 'chats.json')
-    this.cache = emptySnapshot()
+    this.cache = emptySnapshot(this.uiLang)
     this.roots[this.activeRootKey] = this.cache
   }
 
@@ -60,11 +66,38 @@ export class ChatStore {
       this.hydrate(parsed)
     } catch {
       this.activeRootKey = '__none__'
-      this.cache = emptySnapshot()
+      this.cache = emptySnapshot(this.uiLang)
       this.roots = { [this.activeRootKey]: this.cache }
       await this.persist()
     }
     return this.get()
+  }
+
+  /** Persist welcome / default titles in the UI language. */
+  async setUiLanguage(lang: UiLanguage): Promise<ChatStoreSnapshot> {
+    return this.enqueueWrite(async () => {
+      this.uiLang = lang
+      this.stashCurrent()
+      const welcome = welcomeMessageForLang(lang)
+      const defaultTitle = defaultChatTitleForLang(lang)
+      let changed = false
+      for (const snap of Object.values(this.roots)) {
+        for (const s of snap.sessions) {
+          if (isDefaultChatTitle(s.title) && s.title !== defaultTitle) {
+            s.title = defaultTitle
+            changed = true
+          }
+          const w = s.messages.find((m) => m.id === 'welcome')
+          if (w && isWelcomeChatMessage(w) && w.content !== welcome.content) {
+            w.content = welcome.content
+            changed = true
+          }
+        }
+      }
+      this.cache = this.roots[this.activeRootKey] ?? this.cache
+      if (changed) await this.persist()
+      return this.get()
+    })
   }
 
   /** Switch chat bucket for a project root; persists previous first. */
@@ -82,7 +115,7 @@ export class ChatStore {
     }
     this.activeRootKey = key
     if (!this.roots[key]) {
-      this.roots[key] = emptySnapshot()
+      this.roots[key] = emptySnapshot(this.uiLang)
     }
     this.cache = this.roots[key]!
     this.trimRoots()
@@ -166,7 +199,17 @@ export class ChatStore {
 
   async create(): Promise<ChatStoreSnapshot> {
     return this.enqueueWrite(async () => {
-      const session = createEmptySession()
+      const unused = this.cache.sessions.find((s) => isReusableEmptySession(s))
+      if (unused) {
+        this.cache.activeId = unused.id
+        this.cache.sessions = [
+          unused,
+          ...this.cache.sessions.filter((s) => s.id !== unused.id)
+        ]
+        await this.persist()
+        return this.get()
+      }
+      const session = createEmptySession(this.uiLang)
       this.cache.sessions.unshift(session)
       this.cache.activeId = session.id
       this.trimSessions()
@@ -252,7 +295,7 @@ export class ChatStore {
         : Object.keys(this.roots)[0] || '__none__'
     this.activeRootKey = active
     if (!this.roots[this.activeRootKey]) {
-      this.roots[this.activeRootKey] = emptySnapshot()
+      this.roots[this.activeRootKey] = emptySnapshot(this.uiLang)
     }
     this.cache = this.roots[this.activeRootKey]!
   }
