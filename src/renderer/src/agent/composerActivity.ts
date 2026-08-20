@@ -432,7 +432,9 @@ export function formatActivityParts(activity: ComposerActivity): {
   if (activity.kind === 'shell') {
     const cmd = command ? friendlyShellLabel(command) : undefined
     const extra =
-      detail && detail !== cmd ? detail.replace(/\s+/g, ' ').slice(0, 80) : undefined
+      detail && detail !== cmd && !isAfkPtyChromeLine(detail)
+        ? detail.replace(/\s+/g, ' ').slice(0, 80)
+        : undefined
     return { verb, target: cmd, suffix: extra }
   }
   return {

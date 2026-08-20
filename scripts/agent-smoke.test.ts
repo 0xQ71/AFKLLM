@@ -16,7 +16,9 @@ import {
   salvageLeakedToolCalls,
   stripLeakedToolMarkup,
   coerceToolRelativePath,
+  inferPathFromPatchBody,
   inferWritePathFromContent,
+  clearShellLoopCountsAfterEdit,
   resolveWriteFilePath,
   normalizeApiMessages,
   parseComposerMentions,
@@ -49,6 +51,7 @@ import {
   extractThinkInner,
   pendingPlanWork,
   isFileWorkPlanStep,
+  isFileCreatePlanStep,
   shouldNudgeRemainingFileWork,
   reopenTodosForMissingViteReact,
   isBrowserPlanStep,
@@ -61,6 +64,7 @@ import {
   looksLikeToolOrientedPlan,
   isToolOrientedPlanStep,
   isMetaOrSummaryPlanStep,
+  isCliRunOrVerifyPlanStep,
   isRedundantPlanCompleteProse,
   isFalseSuccessProse,
   isAgentChatNoise,
@@ -87,6 +91,7 @@ import {
   cssLooksLikeRealStylesheet,
   contentLooksLikeSourceStub,
   formatStubOnDiskHint,
+  isLandingWritePath,
   shouldHandoffWriteToApply,
   shouldPersistIncompleteWrite,
   priorCompleteForWritePath,
@@ -154,9 +159,12 @@ import {
 import {
   maybeRecordToolEvidence,
   laterSuccessAfterFail,
+  collectCompileSourcePaths,
+  sourcePathsFromCompileCommand,
+  sourcePathsFromCompilerOutput,
   type StepEvidence
 } from '../src/renderer/src/agent/loop/evidence'
-import { fallbackWorkDoneCloser, honestClosingNote, resolveTurnCloser, closerMentionsPreview, isNextActionNarration } from '../src/renderer/src/agent/loop/report'
+import { fallbackWorkDoneCloser, honestClosingNote, resolveTurnCloser, closerMentionsPreview, isNextActionNarration, closerLooksLikeHangOrLoop } from '../src/renderer/src/agent/loop/report'
 import {
   formatI18nSanityHint,
   formatI18nCloserWhy,
@@ -331,6 +339,23 @@ describe('looksLikeToolMarkupLeak', () => {
       'D:/proj/index.html'
     )
     assert.equal(coerceToolRelativePath({ path: './styles.css' }), './styles.css')
+    assert.equal(
+      inferPathFromPatchBody('*** Update File: WordFreq.cs\n@@\n-a\n+b\n'),
+      'WordFreq.cs'
+    )
+    assert.equal(
+      coerceToolRelativePath({
+        patch: '--- a/WordFreq.cs\n+++ b/WordFreq.cs\n@@ -1 +1 @@\n-a\n+b\n'
+      }),
+      'WordFreq.cs'
+    )
+    const loopCounts = new Map<string, number>([
+      ['execute_terminal_command|x|10|csc WordFreq.cs|csc WordFreq.cs', 3],
+      ['execute_terminal_command|open_html_preview', 1]
+    ])
+    clearShellLoopCountsAfterEdit(loopCounts)
+    assert.equal(loopCounts.has('execute_terminal_command|open_html_preview'), true)
+    assert.equal(loopCounts.size, 1)
   })
 
   it('infers write path only for full HTML documents', () => {
@@ -1688,8 +1713,10 @@ describe('agent todo plan', () => {
       }
     ]
     assert.equal(isJunkPlanStep(steps[0]!.text), true)
-    assert.equal(isMetaOrSummaryPlanStep(steps[3]!.text), true)
-    assert.equal(isMetaOrSummaryPlanStep(steps[4]!.text), true)
+    assert.equal(isCliRunOrVerifyPlanStep(steps[3]!.text), true)
+    assert.equal(isCliRunOrVerifyPlanStep(steps[4]!.text), true)
+    assert.equal(isMetaOrSummaryPlanStep(steps[3]!.text), false)
+    assert.equal(isMetaOrSummaryPlanStep(steps[4]!.text), false)
     assert.equal(pendingPlanWork(steps).length, 0)
   })
 
@@ -1747,6 +1774,22 @@ describe('agent todo plan', () => {
     assert.equal(pendingPlanWork(steps).length, 0)
     const settled = settlePlanAfterWork(steps, { previewOpened: true, edited: true })
     assert.ok(settled.every((s) => s.status === 'done'))
+  })
+
+  it('CLI run/summary rows: резюме is meta; запустить needs cliVerified', () => {
+    assert.equal(isMetaOrSummaryPlanStep('Краткое резюме: что сделано'), true)
+    assert.equal(isCliRunOrVerifyPlanStep('Запустить WordFreq.exe и показать вывод'), true)
+    assert.equal(isMetaOrSummaryPlanStep('Запустить WordFreq.exe и показать вывод'), false)
+    const steps = [
+      { id: 's1', text: 'Написать WordFreq.cs', status: 'done' as const },
+      { id: 's2', text: 'Запустить программу через терминал', status: 'in_progress' as const },
+      { id: 's3', text: 'Краткое резюме', status: 'pending' as const }
+    ]
+    const afterEdit = settlePlanAfterWork(steps, { edited: true })
+    assert.equal(afterEdit.find((s) => s.id === 's2')?.status, 'in_progress')
+    assert.equal(afterEdit.find((s) => s.id === 's3')?.status, 'done')
+    const afterCli = settlePlanAfterWork(steps, { edited: true, cliVerified: true })
+    assert.equal(afterCli.find((s) => s.id === 's2')?.status, 'done')
   })
 
   it('curl localhost / page-loaded plan rows are preview health — not leftover work', () => {
@@ -1895,8 +1938,24 @@ describe('agent todo plan', () => {
     const t07Prompt =
       'Создай в корне проекта Go-программу wordfreq.go: считает частоту слов. Сразу после записи запусти её (go run) и покажи реальный вывод терминала.'
     assert.equal(looksLikeFromScratchRunTask(t07Prompt), true)
+    assert.equal(
+      looksLikeFromScratchRunTask(
+        'Создай в корне C++ программу wordfreq.cpp, скомпилируй и запусти, покажи вывод терминала.'
+      ),
+      true
+    )
+    assert.equal(
+      looksLikeFromScratchRunTask(
+        'Create a C# console app wordfreq.cs, compile it, run it, and show stdout.'
+      ),
+      true
+    )
     assert.equal(isCliVerifyCommand('echo "hello" | go run wordfreq.go'), true)
     assert.equal(isCliVerifyCommand('python -m http.server 4173'), false)
+    assert.equal(isCliVerifyCommand('.\\wordfreq.exe test.txt'), true)
+    assert.equal(isCliVerifyCommand('cl /EHsc wordfreq.cpp'), false)
+    assert.equal(isCliVerifyCommand('csc.exe Program.cs'), false)
+    assert.equal(isCliVerifyCommand('dotnet run'), true)
     assert.equal(
       cliVerifyLooksSuccessful(
         'go run ./wordfreq.go test_input.txt',
@@ -2788,6 +2847,21 @@ describe('honest evidence and truncation helpers', () => {
     assert.equal(recorded[0]!.kind, 'preview_ok')
   })
 
+  it('collects compile source paths from argv and compiler stderr', () => {
+    assert.deepEqual(sourcePathsFromCompileCommand('csc WordFreq.cs -out:WordFreq.exe'), [
+      'WordFreq.cs'
+    ])
+    assert.deepEqual(sourcePathsFromCompilerOutput('WordFreq.java:10: error: cannot find symbol'), [
+      'WordFreq.java'
+    ])
+    assert.ok(
+      collectCompileSourcePaths(
+        'javac WordFreq.java',
+        'WordFreq.java:10: error: cannot find symbol'
+      ).includes('WordFreq.java')
+    )
+  })
+
   it('honestClosingNote omits exit_code=? and drops the claim after a later shell/preview ok', () => {
     const failOnly: StepEvidence[] = [
       {
@@ -2843,6 +2917,13 @@ describe('honest evidence and truncation helpers', () => {
     assert.ok(closer.length >= 80)
     assert.equal(preferUserFacingCloser(closer, 'ru'), closer)
     assert.equal(isFalseSuccessProse(closer), false)
+    const staticCloser = fallbackWorkDoneCloser({
+      lang: 'ru',
+      paths: ['index.html', 'styles.css'],
+      previewOpened: true
+    })
+    assert.match(staticCloser, /Превью открыто в приложении/)
+    assert.doesNotMatch(staticCloser, /npm run dev/)
     const cliCloser = fallbackWorkDoneCloser({
       lang: 'ru',
       paths: ['wordfreq.go'],
@@ -2890,6 +2971,36 @@ describe('honest evidence and truncation helpers', () => {
     })
     assert.equal(isNextActionNarration(poisoned), false)
     assert.match(poisoned, /Файлы:/)
+  })
+
+  it('next-action / leaked tool markup / TOOL_LOOP are not usable closers', () => {
+    assert.equal(
+      isNextActionNarration(
+        'Тестовый файл создан. Теперь нужно запустить программу через терминал.'
+      ),
+      true
+    )
+    assert.equal(
+      closerLooksLikeHangOrLoop('csc зависает. TOOL_LOOP: identical execute_terminal_command'),
+      true
+    )
+    const markup = resolveTurnCloser({
+      lastClosingText:
+        'WordFreq.obj written.\n<tool_call>\n<function=execute_terminal_command>\n',
+      lang: 'ru',
+      paths: ['WordFreq.cs'],
+      previewOpened: false
+    })
+    assert.doesNotMatch(markup, /tool_call/)
+    assert.match(markup, /WordFreq\.cs/)
+    const hang = resolveTurnCloser({
+      lastClosingText: 'Компилятор csc зависает, повтор той же команды бесполезен.',
+      lang: 'ru',
+      paths: ['WordFreq.cs'],
+      previewOpened: false
+    })
+    assert.doesNotMatch(hang, /зависает/)
+    assert.match(hang, /чипе терминала/)
   })
 
   it('truncationGuardMessage fires below 70% and respects allow_full_rewrite', () => {
@@ -3397,6 +3508,20 @@ describe('Gemma 8k harness', () => {
       }),
       false
     )
+    assert.equal(isLandingWritePath('src/App.css'), false)
+    assert.equal(isLandingWritePath('styles.css'), true)
+    assert.equal(
+      shouldRequireWriteFileForApply({
+        fromScratch: true,
+        path: 'src/App.css',
+        completeWritesThisTurn: 0
+      }),
+      false
+    )
+    const keyframes =
+      '@keyframes bob {\n  0% { transform: translateY(0); }\n  50% { transform: translateY(8px); }\n  100% { transform: translateY(0); }\n}\n'
+    assert.equal(cssLooksLikeRealStylesheet(keyframes), true)
+    assert.equal(contentLooksStructurallyComplete(keyframes, 'src/App.css'), true)
   })
 })
 
@@ -4141,6 +4266,25 @@ describe('composer apply handoff', () => {
       }),
       false
     )
+  })
+
+  it('creating a named file is plan file-work even if the row mentions burger/preview', () => {
+    const js =
+      'Создать js/main.js — чистый vanilla JS с функциями toggleMobileMenu (бургер на мобильных) и toggleFAQItem (аккордеон для FAQ).'
+    assert.equal(isFileCreatePlanStep(js), true)
+    assert.equal(isBrowserPlanStep(js), false)
+    assert.equal(isFileWorkPlanStep(js), true)
+    assert.equal(
+      pendingPlanWork([{ id: 's4', text: js, status: 'in_progress' }]).length,
+      1
+    )
+    assert.equal(isBrowserPlanStep('Открыть превью index.html в браузере'), true)
+    assert.equal(isFileCreatePlanStep('Подтвердить, что все три файла существуют'), false)
+    assert.equal(
+      isFileCreatePlanStep('Написать wordfreq.go в корне проекта'),
+      true
+    )
+    assert.equal(isBrowserPlanStep('Написать wordfreq.go в корне проекта'), false)
   })
 })
 

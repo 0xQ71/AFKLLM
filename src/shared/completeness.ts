@@ -106,8 +106,16 @@ export function countCssRuleBlocks(css: string): number {
 /** Real stylesheet — not a comment stub or empty `:root {}`. */
 export function cssLooksLikeRealStylesheet(css: string): boolean {
   const t = (css ?? '').trim()
-  if (t.length < 400) return false
-  return countCssRuleBlocks(t) >= 3
+  if (!t || !bracesBalanced(t)) return false
+  const blocks = countCssRuleBlocks(t)
+  if (blocks < 1) return false
+  // A few @keyframes / @media rules are a finished sheet (surgical CSS).
+  if (/@(?:keyframes|font-face|import|layer|media)\b/i.test(t)) {
+    return t.length >= 40
+  }
+  if (t.length < 80) return false
+  if (t.length < 400) return blocks >= 2
+  return blocks >= 3
 }
 
 /** Drawn SVG — not `<svg></svg>` / a 6-line placeholder. */
@@ -135,13 +143,27 @@ export function formatStubOnDiskHint(relativePath: string, bytes: number): strin
   )
 }
 
+/**
+ * Vanilla landing CSS (styles.css next to index.html) — not React `src/App.css`.
+ */
+export function isLandingCssPath(relativePath: string): boolean {
+  const p = relativePath.replace(/\\/g, '/').replace(/^\.\//, '')
+  if (!/\.css$/i.test(p)) return false
+  if (/(?:^|\/)src\//i.test(p)) return false
+  if (/(?:^|\/)App\.css$/i.test(p)) return false
+  return (
+    /(?:^|\/)(?:styles|style|index|main)\.css$/i.test(p) ||
+    /(?:^|\/)css\/.+\.css$/i.test(p)
+  )
+}
+
 /** Landing HTML/CSS/JS (and SVG icons) need a real body — not a 5-byte stub. */
 export function isLandingWritePath(relativePath: string): boolean {
   const p = relativePath.replace(/\\/g, '/').replace(/^\.\//, '')
   if (isLandingJsPath(p)) return true
   if (/(?:^|\/)index\.html?$/i.test(p)) return true
-  if (/\.css$/i.test(p)) return true
-  if (/\.svg$/i.test(p)) return true
+  if (isLandingCssPath(p)) return true
+  if (/\.svg$/i.test(p) && !/(?:^|\/)src\//i.test(p)) return true
   return false
 }
 

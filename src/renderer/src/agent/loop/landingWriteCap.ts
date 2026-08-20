@@ -3,6 +3,7 @@
  * path; overwrites of a complete file are allowed.
  */
 
+import { isLandingWritePath } from '../../../../shared/completeness'
 import {
   WRITE_FILE_REQUIRED_PREFIX,
   formatWriteFileRequiredError
@@ -42,7 +43,10 @@ export function landingSourceKind(
 }
 
 export function isCappedLandingWritePath(relativePath: string): boolean {
-  return landingSourceKind(relativePath) !== null
+  const p = (relativePath ?? '').replace(/\\/g, '/').replace(/^\.\//, '')
+  if (!p) return false
+  if (isLandingWritePath(p)) return true
+  return /(?:^|\/)README\.md$/i.test(p)
 }
 
 /** Overwrite of a complete landing file is allowed. */

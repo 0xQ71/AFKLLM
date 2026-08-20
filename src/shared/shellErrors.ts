@@ -186,29 +186,31 @@ export function processKillRefusal(command: string): string | null {
   return null
 }
 
-const COMPILER_INSTALL_MSG =
-  'SHELL_REFUSED: do not install or download a C/C++ compiler (winget/choco/MinGW/7z toolchain). ' +
-  'g++ may be missing; on Windows run MSVC if present: cl /EHsc /Fe:wordfreq wordfreq.cpp ' +
-  'then .\\wordfreq.exe test.txt. If cl is also missing, say so and stop — do not fetch archives.'
+const TOOLCHAIN_INSTALL_MSG =
+  'SHELL_REFUSED: do not install or download compilers, SDKs, or toolchains ' +
+  '(winget/choco/scoop/curl archives). Use whatever is already on PATH. ' +
+  'If nothing works, name the missing tool and stop — do not fetch installers.'
 
 /**
- * Installing MinGW because `g++` is not on PATH burns the turn on 100MB downloads.
- * The host already has `cl` when vcvars was imported — try that instead.
+ * Machine-level installs burn the turn (MinGW, VS Build Tools, JDKs, …).
+ * Project-local deps (`npm install`, `pip`, `go mod`, `dotnet restore`) stay allowed.
  */
 export function compilerInstallRefusal(command: string): string | null {
   const c = command.trim()
   if (!c) return null
-  const pkgMgr = /\b(winget|choco|chocolatey|scoop)\s+install\b/i.test(c)
-  const compilerPkg = /mingw|msys2?|\bgcc\b|\bg\+\+|llvm|visualstudio|buildtools|\bclang\b/i.test(c)
-  if (pkgMgr && compilerPkg) return COMPILER_INSTALL_MSG
+  if (/\b(winget|choco|chocolatey|scoop)\s+install\b/i.test(c)) return TOOLCHAIN_INSTALL_MSG
   if (/niXman\/mingw-builds|mstorsjo\/gcc-mingw|mingw-builds-binaries|MinGW\.GCC/i.test(c)) {
-    return COMPILER_INSTALL_MSG
+    return TOOLCHAIN_INSTALL_MSG
   }
   const download = /\b(curl|wget|Invoke-WebRequest|\biwr\b)\b/i.test(c)
-  const compilerArchive =
-    /mingw-builds|gcc-mingw|mingw\.7z|msys2|gcc\.tar|\.(?:7z|tar\.xz)\b/i.test(c) ||
+  const toolchainArchive =
+    /mingw-builds|gcc-mingw|mingw\.7z|msys2|gcc\.tar|\.(?:7z|tar\.xz|msi)\b/i.test(c) ||
     (/7-?zip\.org|sevenzip|7za\.exe|7z\d+-x64\.exe/i.test(c) &&
       /OutFile|\s-o\s|--output\b|-OutFile/i.test(c))
-  if (download && compilerArchive) return COMPILER_INSTALL_MSG
+  if (download && toolchainArchive) return TOOLCHAIN_INSTALL_MSG
   return null
+}
+
+export function looksLikeCommandNotFound(output: string): boolean {
+  return /не распознано|not recognized|CommandNotFoundException/i.test(output ?? '')
 }

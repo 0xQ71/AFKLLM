@@ -10,7 +10,11 @@ import {
   isHtmlOnlyStacks
 } from './loop/prompts'
 import { honestClosingNote, isNextActionNarration, resolveTurnCloser } from './loop/report'
-import { type StepEvidence } from './loop/evidence'
+import {
+  collectCompileSourcePaths,
+  looksLikeCompileShellCommand,
+  type StepEvidence
+} from './loop/evidence'
 import { advanceTodosOnEvidence } from './loop/plan'
 import {
   inferredVerifyMode,
@@ -20,6 +24,7 @@ import {
 } from './loop/verify'
 import { THREAD_SUMMARY_MSG_ID, isAgentClosingMessageId, relocateAgentCloser, withoutCloserToolChrome, type PersistedChatMessage } from '../../../shared/chats'
 import { visionReusesChatModel } from '../../../shared/visionDetect'
+import { looksLikeCommandNotFound } from '../../../shared/shellErrors'
 import {
   DEFAULT_UI_LANGUAGE,
   isUiLanguage,
@@ -72,6 +77,7 @@ import {
   todosAllDone,
   pendingPlanWork,
   isFileWorkPlanStep,
+  isFileCreatePlanStep,
   shouldNudgeRemainingFileWork,
   reopenTodosForMissingViteReact,
   looksLikeOpenHtmlCommand,
@@ -90,6 +96,8 @@ import {
   salvageLeakedToolCalls,
   stripLeakedToolMarkup,
   coerceToolRelativePath,
+  inferPathFromPatchBody,
+  clearShellLoopCountsAfterEdit,
   resolveWriteFilePath,
   inferWritePathFromContent,
   extractAssistantHtmlDump,
@@ -2609,6 +2617,8 @@ export async function runAgentTurn(params: {
   let ranCliSmoke = false
   const incompleteAppendsByPath = new Map<string, number>()
   const identicalToolCounts = new Map<string, number>()
+  /** Compile-failed sources this turn — FILE_COMPLETE must not block the rewrite. */
+  const compileBrokenPaths = new Set<string>()
   /** Failed apply_patch / apply_diff counts per path — unlock overwrite after 4. */
   const patchFailsByPath = new Map<string, number>()
   /** Pathless patch failures (parse/format errors) — bound the endless loop. */
@@ -3169,7 +3179,8 @@ export async function runAgentTurn(params: {
       if (!mutatingEditFailed && !editSanityFailed && !i18nSanityFailed) {
         todoSteps = settlePlanAfterWork(todoSteps, {
           previewOpened: htmlPreviewOpened,
-          edited: mutatingEditOk
+          edited: mutatingEditOk,
+          cliVerified: ranCliSmoke
         })
       }
       if (todoSteps.length > 0) {
@@ -3970,12 +3981,16 @@ export async function runAgentTurn(params: {
           const pk = loopPathKey(resolvedPath)
           const fails = pk ? (patchFailsByPath.get(pk) ?? 0) : 0
           const isHtml = /\.html?$/i.test(resolvedPath)
+          const compileBroken = pk ? compileBrokenPaths.has(pk) : false
           if (
             allowsComposerFullRewrite(params.userText) ||
+            compileBroken ||
             (!isHtml && fails >= MAX_PATCH_FAILS_BEFORE_OVERWRITE)
           ) {
             args.allow_full_rewrite = true
-            if (allowsComposerFullRewrite(params.userText)) args.overwrite = true
+            if (allowsComposerFullRewrite(params.userText) || compileBroken) {
+              args.overwrite = true
+            }
           }
         }
 
@@ -3994,8 +4009,7 @@ export async function runAgentTurn(params: {
         const filePath =
           resolvedPath ??
           (typeof args.patch === 'string'
-            ? (args.patch.match(/\*\*\* (?:Update|Add|Delete) File:\s*(\S+)/)?.[1] ??
-              undefined)
+            ? inferPathFromPatchBody(args.patch) ?? undefined
             : undefined)
 
         let statusId = toolMsgByIndex.get(index)
@@ -4675,9 +4689,11 @@ export async function runAgentTurn(params: {
                 }
               }
             } else if (landingRewrite || pathInFlight || stubReplace) {
-              const priorComplete =
-                bufferCompleteForPath(pathStr) ||
-                (await pathLooksCompleteOnDisk(pathStr))
+              const compileBroken = Boolean(pathKey && compileBrokenPaths.has(pathKey))
+              const priorComplete = compileBroken
+                ? false
+                : bufferCompleteForPath(pathStr) ||
+                  (await pathLooksCompleteOnDisk(pathStr))
               const priorBody = /\.html?$/i.test(pathStr)
                 ? lastHtmlWrite
                 : /\.(jsx?|mjs|cjs)$/i.test(pathStr)
@@ -4694,6 +4710,7 @@ export async function runAgentTurn(params: {
                 : 0
               const allowFull =
                 allowsComposerFullRewrite(params.userText) ||
+                compileBroken ||
                 (patchFails >= MAX_PATCH_FAILS_BEFORE_OVERWRITE &&
                   !/\.html?$/i.test(pathStr))
               if (
@@ -4789,6 +4806,18 @@ export async function runAgentTurn(params: {
           }
           if (toolResult.ok && isCliVerifyCommand(cmd)) {
             ranCliSmoke = cliVerifyLooksSuccessful(cmd, toolResult.content, toolResult.ok)
+          }
+          if (looksLikeCompileShellCommand(cmd)) {
+            const srcs = collectCompileSourcePaths(
+              cmd,
+              `${toolResult.content ?? ''}\n${toolResult.error ?? ''}`
+            )
+            for (const p of srcs) {
+              const key = loopPathKey(p)
+              if (!key) continue
+              if (toolResult.ok) compileBrokenPaths.delete(key)
+              else compileBrokenPaths.add(key)
+            }
           }
           if (
             isHtmlPreviewShell(cmd) ||
@@ -4897,6 +4926,7 @@ export async function runAgentTurn(params: {
             mutatingEditFailed = false
           }
           if (wrotePath) writtenOkPaths.add(wrotePath)
+          clearShellLoopCountsAfterEdit(identicalToolCounts)
         } else if (
           !toolResult.ok &&
           (name === 'write_file' || name === 'apply_diff' || name === 'apply_patch') &&
@@ -5495,7 +5525,8 @@ export async function runAgentTurn(params: {
         if (!mutatingEditFailed && !editSanityFailed && !i18nSanityFailed) {
           todoSteps = settlePlanAfterWork(todoSteps, {
             previewOpened: htmlPreviewOpened,
-            edited: mutatingEditOk
+            edited: mutatingEditOk,
+            cliVerified: ranCliSmoke
           })
         }
         if (todoSteps.length > 0) {
@@ -5561,7 +5592,7 @@ export async function runAgentTurn(params: {
             apiMessages,
             /GO_SPLIT/i.test(tc)
               ? 'GO_SPLIT: regexp.Split(s, n) — n=0 returns nil (no words). Use n=-1 to split all. Then re-run. Do not stop.'
-              : 'CLI_EMPTY: exit_code=0 but stdout has no counted words. Fix the tokenizer and re-run go run / python. Do not write a closing summary yet.'
+              : 'CLI_EMPTY: exit_code=0 but stdout has no useful program output. Fix the program and re-run. Do not write a closing summary yet.'
           )
         } else if (/I18N_SANITY|EDIT_SANITY|LANDING_CONTRACT/i.test(tc)) {
           appendToolHint(
@@ -5601,13 +5632,16 @@ export async function runAgentTurn(params: {
               'Call write_file overwrite=true with the FULL content. Do not apply_diff the stub.'
           )
         } else if (/FILE_COMPLETE/i.test(tc)) {
+          const nextCreate = pendingPlanWork(todoSteps).filter(
+            (s) => isFileCreatePlanStep(s.text) || isFileWorkPlanStep(s.text)
+          )
           appendToolHint(
             apiMessages,
-            allowsComposerFullRewrite(params.userText)
-              ? 'FILE_COMPLETE: this is a from-scratch / full rebuild. Do NOT retry Apply. ' +
-                'Call write_file overwrite=true allow_full_rewrite=true with the COMPLETE file content for that path.'
+            nextCreate.length > 0
+              ? 'FILE_COMPLETE: that path is already on disk. Do NOT rewrite it. ' +
+                `write_file the next open plan file now: ${nextCreate[0]!.text.slice(0, 160)}`
               : 'FILE_COMPLETE: that file is already on disk and looks finished. Do NOT write_file / overwrite / rewrite it. ' +
-                'Call apply_diff with a short instruction (or a unique search_block). Then verify or summarize.'
+                'Call apply_diff with a short instruction (or a unique search_block), or continue remaining work.'
           )
         } else if (/SMART_APPLY_FAIL|APPLY_UNAVAILABLE/i.test(tc)) {
           appendToolHint(
@@ -5666,16 +5700,11 @@ export async function runAgentTurn(params: {
             apiMessages,
             'PROCESS_ENDED: the user closed the app or it finished normally. Do NOT rewrite or relaunch. Stop and wait for the user.'
           )
-        } else if (
-          /COMPILER_MISSING/i.test(tc) ||
-          (/не распознано|not recognized|CommandNotFoundException/i.test(tc) &&
-            /\bg\+\+|gcc(?:\.exe)?/i.test(tc))
-        ) {
+        } else if (/COMMAND_NOT_FOUND|COMPILER_MISSING/i.test(tc) || looksLikeCommandNotFound(tc)) {
           appendToolHint(
             apiMessages,
-            'COMPILER_MISSING: g++ is not in PATH. Do not winget, choco, or download MinGW/7z. ' +
-              'Run MSVC: cl /EHsc /Fe:wordfreq wordfreq.cpp then .\\wordfreq.exe test.txt. ' +
-              'If cl is missing, stop and say so.'
+            'COMMAND_NOT_FOUND: that executable is not on PATH. Do not winget, choco, scoop, or download a toolchain. ' +
+              'Use a tool already on PATH, or stop and name what is missing.'
           )
         } else if (/TERMINAL_ERROR|ERROR_FOCUS|Traceback \(most recent call last\)/i.test(tc)) {
           appendToolHint(
@@ -5764,7 +5793,8 @@ export async function runAgentTurn(params: {
           if (!mutatingEditFailed && !editSanityFailed && !i18nSanityFailed) {
             todoSteps = settlePlanAfterWork(todoSteps, {
               previewOpened: htmlPreviewOpened,
-              edited: mutatingEditOk
+              edited: mutatingEditOk,
+              cliVerified: ranCliSmoke
             })
           }
           if (todoSteps.length > 0) {
@@ -5995,7 +6025,8 @@ export async function runAgentTurn(params: {
     ) {
       todoSteps = settlePlanAfterWork(todoSteps, {
         previewOpened: htmlPreviewOpened,
-        edited: mutatingEditOk
+        edited: mutatingEditOk,
+        cliVerified: ranCliSmoke
       })
     }
     if (todoSteps.length > 0) {
@@ -6133,7 +6164,7 @@ export async function runAgentTurn(params: {
           ...collectPathsFromTreeText(await fetchProjectTreeDigest())
         ])
       : []
-    const previewWanted = viteScratch && userAskedViteReactPreview(params.userText)
+    const previewWanted = userAskedViteReactPreview(params.userText)
     const previewOk = !previewWanted || htmlPreviewOpened
     const closerVisible = preferUserFacingCloser(finalText || cleanFinal, uiLang).trim()
 
@@ -6191,6 +6222,7 @@ export async function runAgentTurn(params: {
 
     if (
       viteWorkDone &&
+      !planStillOpen &&
       !(looksLikeFromScratchRunTask(params.userText) && !ranCliSmoke)
     ) {
       if (closerVisible.length >= 48) lastClosingText = closerVisible
@@ -6202,6 +6234,7 @@ export async function runAgentTurn(params: {
     if (
       previewWanted &&
       viteMissing.length === 0 &&
+      !planStillOpen &&
       !htmlPreviewOpened &&
       mutatingEditOk &&
       previewNudges < 1 &&
@@ -6556,6 +6589,7 @@ export async function runAgentTurn(params: {
     if (
       previewWanted &&
       viteMissing.length === 0 &&
+      !planStillOpen &&
       !htmlPreviewOpened &&
       mutatingEditOk &&
       previewNudges < 2 &&

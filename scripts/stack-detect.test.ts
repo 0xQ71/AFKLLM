@@ -278,7 +278,7 @@ describe('shell honesty', () => {
     )
   })
 
-  it('SHELL_TIMEOUT is ok:false with a pipe hint', async () => {
+  it('SHELL_TIMEOUT is ok:false with a stdin/pipe hint', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'afkllm-timeout-'))
     try {
       const reg = new AgentToolRegistry({
@@ -296,7 +296,7 @@ describe('shell honesty', () => {
       })
       assert.equal(r.ok, false)
       assert.match(r.content, /SHELL_TIMEOUT/)
-      assert.match(r.content, /echo/)
+      assert.match(r.content, /pipe input|file argument/i)
     } finally {
       await fs.rm(root, { recursive: true, force: true })
     }
@@ -369,6 +369,8 @@ describe('shell honesty', () => {
       assert.match(r.content, /TERMINAL_ERROR/)
       assert.doesNotMatch(r.content, /PROCESS_ENDED/)
       assert.match(r.content, /не распознано/)
+      assert.match(r.content, /COMMAND_NOT_FOUND/)
+      assert.doesNotMatch(r.content, /Fe:wordfreq|MinGW|g\+\+ is not in PATH/i)
     } finally {
       await fs.rm(root, { recursive: true, force: true })
     }
@@ -681,6 +683,8 @@ describe('evidence-gated plan', () => {
     assert.equal(looksLikeCompileShellCommand('where.exe cl.exe'), false)
     assert.equal(looksLikeCompileShellCommand('cl /EHsc /Fe:wordfreq wordfreq.cpp'), true)
     assert.equal(looksLikeCompileShellCommand('g++ -O2 -o wordfreq wordfreq.cpp'), true)
+    assert.equal(looksLikeCompileShellCommand('csc.exe /nologo Program.cs'), true)
+    assert.equal(looksLikeCompileShellCommand('dotnet build'), true)
     assert.equal(
       evidenceSupportsStep('Собрать программу g++ (если есть), иначе cl.', whereCl),
       false

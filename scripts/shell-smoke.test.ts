@@ -5,8 +5,13 @@ import {
   peelLeadingCd,
   rewriteBashOperators,
   rewriteWhereAlias,
+  rewriteWhichCommand,
+  rewriteCompilerHelpProbe,
+  rewriteBashHeredoc,
   stripAfkPtyChrome,
-  cliStdoutLooksVacuous
+  isAfkPtyChromeLine,
+  cliStdoutLooksVacuous,
+  isCliVerifyCommand
 } from '../src/shared/shellNormalize'
 import {
   classifyBrowserOpenCommand,
@@ -27,10 +32,17 @@ import { processKillRefusal, compilerInstallRefusal } from '../src/shared/shellE
 
 describe('shellNormalize', () => {
   it('rewrites && and || outside quotes', () => {
-    assert.equal(rewriteBashOperators('javac A.java && java A'), 'javac A.java; java A')
+    assert.equal(
+      rewriteBashOperators('javac A.java && java A'),
+      'javac A.java; if ($?) { java A }'
+    )
     assert.equal(
       rewriteBashOperators('echo "a && b" && true'),
-      'echo "a && b"; true'
+      'echo "a && b"; if ($?) { true }'
+    )
+    assert.equal(
+      rewriteBashOperators('test -f x && echo yes || echo no'),
+      'test -f x; if ($?) { echo yes }; if (-not $?) { echo no }'
     )
   })
 
@@ -119,6 +131,9 @@ describe('shellNormalize', () => {
 
     const cl = normalizeAgentShellCommand('cl.exe /EHsc wordfreq.cpp', '.', 'win32')
     assert.match(cl.command, /^cl\.exe /)
+    assert.equal(isCliVerifyCommand('cl.exe /EHsc wordfreq.cpp'), false)
+    assert.equal(isCliVerifyCommand('.\\wordfreq.exe test.txt'), true)
+    assert.equal(isCliVerifyCommand('dotnet run -- project.csproj'), true)
   })
 
   it('rewrites PowerShell where alias to where.exe', () => {
@@ -130,12 +145,36 @@ describe('shellNormalize', () => {
     assert.equal(rewriteWhereAlias('where.exe gcc'), 'where.exe gcc')
   })
 
-  it('refuses MinGW/compiler scavenger hunts', () => {
+  it('rewrites which / compiler /? / bash heredoc for PowerShell', () => {
+    assert.equal(rewriteWhichCommand('which cl'), 'where.exe cl')
+    const which = normalizeAgentShellCommand('which csc', '.', 'win32')
+    assert.equal(which.command, 'where.exe csc')
+    assert.equal(rewriteCompilerHelpProbe('cl /? | Select-Object -First 3'), 'where.exe cl')
+    const help = normalizeAgentShellCommand('csc /?', '.', 'win32')
+    assert.equal(help.command, 'where.exe csc')
+    const heredoc = rewriteBashHeredoc("cat > WordFreq.java <<'EOF'\nclass A {}\nEOF")
+    assert.match(heredoc, /Set-Content/)
+    assert.match(heredoc, /class A \{\}/)
+    assert.equal(isAfkPtyChromeLine('ErrorAction SilentlyContinue'), true)
+    assert.equal(isAfkPtyChromeLine('ntinue'), true)
+    const crumb = stripAfkPtyChrome(
+      'Remove-Item -LiteralPath x -Force -ErrorAction SilentlyContinue\n1. hello 3\n'
+    )
+    assert.doesNotMatch(crumb, /SilentlyContinue|ntinue/i)
+    assert.match(crumb, /1\. hello 3/)
+  })
+
+  it('refuses machine package-manager toolchain installs, not project deps', () => {
     assert.match(
       compilerInstallRefusal('winget install --id MinGW.GCC') ?? '',
       /SHELL_REFUSED/
     )
     assert.match(compilerInstallRefusal('choco install mingw -y') ?? '', /SHELL_REFUSED/)
+    assert.match(compilerInstallRefusal('winget install Python.Python.3.12') ?? '', /SHELL_REFUSED/)
+    assert.match(
+      compilerInstallRefusal('winget install Microsoft.DotNet.SDK.8') ?? '',
+      /SHELL_REFUSED/
+    )
     assert.match(
       compilerInstallRefusal(
         "Invoke-WebRequest -Uri 'https://github.com/niXman/mingw-builds-binaries/releases/latest' -OutFile release.json"
@@ -147,6 +186,8 @@ describe('shellNormalize', () => {
       /SHELL_REFUSED/
     )
     assert.equal(compilerInstallRefusal('cl /EHsc /Fe:wordfreq wordfreq.cpp'), null)
+    assert.equal(compilerInstallRefusal('npm install'), null)
+    assert.equal(compilerInstallRefusal('dotnet restore'), null)
     assert.equal(compilerInstallRefusal('curl -I http://localhost:4173'), null)
     assert.equal(processKillRefusal('npm run dev'), null)
   })

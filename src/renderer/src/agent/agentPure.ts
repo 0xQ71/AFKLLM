@@ -3,7 +3,7 @@
  */
 
 import { looksLikeOpenHtmlCommand } from '../../../shared/localPreview'
-import { cliStdoutLooksVacuous } from '../../../shared/shellNormalize'
+import { cliStdoutLooksVacuous, isCliVerifyCommand } from '../../../shared/shellNormalize'
 import {
   contentLooksStructurallyComplete as contentLooksStructurallyCompleteV2,
   isLandingJsPath,
@@ -12,7 +12,13 @@ import {
 } from './loop/completeness'
 import { advanceTodosOnEvidence } from './loop/plan'
 
-export { looksLikeOpenHtmlCommand, isLandingJsPath, isSourcePath, cssLooksLikeRealStylesheet }
+export {
+  looksLikeOpenHtmlCommand,
+  isLandingJsPath,
+  isSourcePath,
+  cssLooksLikeRealStylesheet,
+  isCliVerifyCommand
+}
 export {
   svgLooksLikeRealGraphic,
   contentLooksLikeSourceStub,
@@ -1188,6 +1194,31 @@ export function isFluffPlanStep(text: string): boolean {
 }
 
 /**
+ * Compile / run / show-stdout plan rows — evidence from a successful CLI, not from a write.
+ */
+export function isCliRunOrVerifyPlanStep(text: string): boolean {
+  const t = text.trim()
+  if (!t) return false
+  if (isBrowserPlanStep(t)) return false
+  if (
+    /сводк|резюме|заключен|summary|summariz|отчёт|отчет|напиши\s+итог/i.test(t) &&
+    !/запустить|stdout|вывод|exit\s*code|код\s+возврата|\.exe\b/i.test(t)
+  ) {
+    return false
+  }
+  return (
+    /(?:^|[^\p{L}])запустить|прогнать\s+(программ|тест|файл)|выполнить\s+(программ|файл|сборк)/iu.test(
+      t
+    ) ||
+    /показать\s+(реальн\w+\s+)?вывод|show\s+(the\s+)?(real\s+)?(terminal\s+)?output|вывод\s+терминала/i.test(
+      t
+    ) ||
+    /confirm\s+(exit|output|stdout)|код\s+возврата|exit\s+code/i.test(t) ||
+    /\b(?:java|javac|csc|go\s+run|python3?|\.exe)\b/i.test(t)
+  )
+}
+
+/**
  * Verify/summary plan rows are NOT real tool work — they blocked Start-Process forever
  * ("Подтвердить отсутствие ошибок", "Дать краткую сводку…").
  */
@@ -1195,9 +1226,10 @@ export function isMetaOrSummaryPlanStep(text: string): boolean {
   const t = text.trim()
   if (!t) return true
   if (isBrowserPlanStep(t)) return false
+  if (isCliRunOrVerifyPlanStep(t)) return false
   if (isToolOrientedPlanStep(t)) return true
   return (
-    /сводк|summary|summarizing|суммируя|заключен|отчёт|отчет|report\s+completion/i.test(t) ||
+    /сводк|summary|summarizing|суммируя|кратко[еое]?\s+резюме|brief\s+summary|заключен|отчёт|отчет|report\s+completion/i.test(t) ||
     /подвест[\p{L}]*\s+итог|итог[ауе]?\s*:/iu.test(t) ||
     /подтвердить|валидац|отсутствие\s+ошибок|корректность\s+отображ/i.test(t) ||
     /провер[\p{L}]*\s+(отсутств|ошибок|корректн|отображ|вёрст|верст|html|синтаксис)/iu.test(t) ||
@@ -1988,6 +2020,23 @@ const PLAN_CONTENT_RULES: PlanContentRule[] = [
   }
 ]
 
+/**
+ * Creating/writing a named source file. Beats preview/burger wording on the same row
+ * ("write js/main.js with a burger menu" is file work, not "open the browser").
+ */
+export function isFileCreatePlanStep(text: string): boolean {
+  const t = text ?? ''
+  if (!t.trim()) return false
+  if (
+    !/\.(js|mjs|cjs|ts|tsx|jsx|css|html?|py|go|cpp|cxx|cc|cs|java|rs|json)\b|js\/main\.js|package\.json|vite\.config/i.test(
+      t
+    )
+  ) {
+    return false
+  }
+  return /созда(ть|й|ётся)|напис|write_file|\bwrite\s+|add\s+(the\s+)?file|new\s+file/i.test(t)
+}
+
 /** Soft layout leftovers after a full landing write — do not force rewrite loops. */
 export function isSoftLayoutPlanStep(text: string): boolean {
   const t = text.trim()
@@ -2018,6 +2067,7 @@ export function isPreviewHealthCheckPlanStep(text: string): boolean {
 }
 
 export function isBrowserPlanStep(text: string): boolean {
+  if (isFileCreatePlanStep(text)) return false
   if (isPreviewHealthCheckPlanStep(text)) return true
   return /браузер|browser|открыт\w*\s+index|open\s+in\s+browser|visual|визуальн|превью|preview|glassmorphism|glass-?morph|бургер|burger|desktop\s*\+|mobile|проверк\w*\s+в[её]рст|проверк\w*\s+на\s+(desktop|mobile)|Start-Process.*index\.html/i.test(
     text
@@ -2027,13 +2077,17 @@ export function isBrowserPlanStep(text: string): boolean {
 /** Close leftover visual / preview rows once the page was opened or files were written. */
 export function settlePlanAfterWork(
   steps: AgentTodoStep[],
-  opts: { previewOpened?: boolean; edited?: boolean }
+  opts: { previewOpened?: boolean; edited?: boolean; cliVerified?: boolean }
 ): AgentTodoStep[] {
   if (!steps.length) return steps
   return steps.map((s) => {
     if (s.status === 'done') return s
     if (isFluffPlanStep(s.text)) {
       return { ...s, status: 'done' as const }
+    }
+    if (isCliRunOrVerifyPlanStep(s.text)) {
+      if (opts.cliVerified) return { ...s, status: 'done' as const }
+      return s
     }
     if (
       opts.previewOpened &&
@@ -2087,6 +2141,7 @@ export function pendingPlanWork(steps: AgentTodoStep[]): AgentTodoStep[] {
       !isJunkPlanStep(s.text) &&
       !isBrowserPlanStep(s.text) &&
       !isMetaOrSummaryPlanStep(s.text) &&
+      !isCliRunOrVerifyPlanStep(s.text) &&
       !isFluffPlanStep(s.text) &&
       !isSoftLayoutPlanStep(s.text)
   )
@@ -2095,6 +2150,7 @@ export function pendingPlanWork(steps: AgentTodoStep[]): AgentTodoStep[] {
 /** Plan row that still needs a file write/patch (not search / weather fluff). */
 export function isFileWorkPlanStep(text: string): boolean {
   const t = text ?? ''
+  if (isFileCreatePlanStep(t)) return true
   if (isMetaOrSummaryPlanStep(t) || isFluffPlanStep(t)) return false
   if (/web_search|поиск\s+в\s+интернет|искать\s+в\s+интернет|погод|weather/i.test(t)) {
     return false
@@ -2601,28 +2657,22 @@ export function userAskedForCliSmoke(text: string): boolean {
   return false
 }
 
-/** From-scratch CLI (wordfreq.go / .py): write the file, run it, show stdout — then stop. */
+/** From-scratch CLI: write a program, run it, show stdout — then stop. Any language. */
 export function looksLikeFromScratchRunTask(text: string): boolean {
   const t = text ?? ''
   const write = /создай|create|напиши|write|сделай/i.test(t)
   const prog =
-    /\.go\b|\.py\b|wordfreq|программ[ауеы]?|go-программ|python-скрипт/i.test(t)
-  const run = /go\s+run|python3?|запусти|run it|покажи.{0,48}вывод|show.{0,40}(stdout|output|вывод)/i.test(
-    t
-  )
+    /\.(go|py|cpp|cxx|cc|c|cs|java|rs)\b|wordfreq|программ[ауеы]?|(?:python|go)[-\s]?скрипт|console\s*app|консольн/i.test(
+      t
+    )
+  const run =
+    /go\s+run|python3?|dotnet\s+run|cargo\s+run|javac|csc\b|\bcl\b|g\+\+|запусти|скомпилир|compile|run it|покажи.{0,48}вывод|show.{0,40}(stdout|output|вывод)/i.test(
+      t
+    )
   return write && prog && run
 }
 
-/** Successful host verify for a from-scratch CLI — not a Vite preview server. */
-export function isCliVerifyCommand(command: string): boolean {
-  const c = command ?? ''
-  if (/python\s+-m\s+http\.server|npm\s+run\s+dev|\bvite\b/i.test(c)) return false
-  return /\bgo\s+run\b|\bpython3?\s+\S+\.py\b|\bpy\s+\S+\.py\b|\bdotnet\s+run\b|\bcargo\s+run\b/i.test(
-    c
-  )
-}
-
-/** True when go/python run exited 0 AND printed real output (not empty-wordfreq). */
+/** True when a program-run exited 0 AND printed real output (not empty stdout). */
 export function cliVerifyLooksSuccessful(
   command: string,
   resultContent: string,
@@ -2869,6 +2919,18 @@ export function fingerprintToolCall(
   }
 }
 
+/** After a successful edit, the next compile/run is a new action — not TOOL_LOOP. */
+export function clearShellLoopCountsAfterEdit(counts: Map<string, number>): void {
+  for (const k of [...counts.keys()]) {
+    if (
+      k.startsWith('execute_terminal_command|') &&
+      k !== 'execute_terminal_command|open_html_preview'
+    ) {
+      counts.delete(k)
+    }
+  }
+}
+
 /**
  * Models often emit path / file / file_path instead of relative_path.
  * Returns a cleaned workspace-relative path, or null if missing.
@@ -2895,6 +2957,34 @@ export function coerceToolRelativePath(
     // Keep Windows/UNC absolutes — main-process safeResolve rebases into the project.
     if (/^[a-zA-Z]:\//.test(t) || t.startsWith('//')) return t
     const cleaned = t.replace(/^\/+/, '')
+    if (cleaned) return cleaned
+  }
+  const patch =
+    typeof args.patch === 'string'
+      ? args.patch
+      : typeof args.content === 'string'
+        ? args.content
+        : ''
+  return inferPathFromPatchBody(patch)
+}
+
+/**
+ * Salvage a workspace path from an apply_patch body when relative_path was omitted.
+ */
+export function inferPathFromPatchBody(text: string): string | null {
+  const t = text ?? ''
+  if (!t.trim()) return null
+  const patterns = [
+    /^\*\*\*\s*(?:Update|Add|Delete)\s+File:\s*([^\n*]+)/im,
+    /^diff --git a\/(.+?) b\//m,
+    /^(?:---|\+\+\+)\s+[ab]\/(\S+)/m,
+    /^---\s+(\S+\.\w+)\s*$/m
+  ]
+  for (const re of patterns) {
+    const m = t.match(re)
+    const raw = (m?.[1] ?? '').trim().replace(/\\/g, '/')
+    if (!raw || raw === '/dev/null' || raw === 'dev/null') continue
+    const cleaned = raw.replace(/^\/+/, '')
     if (cleaned) return cleaned
   }
   return null

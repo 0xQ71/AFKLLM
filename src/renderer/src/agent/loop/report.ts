@@ -1,3 +1,4 @@
+import { preferUserFacingCloser, stripLeakedToolMarkup } from '../agentPure'
 import type { StepEvidence } from './evidence'
 import { lastVerifyOk, laterSuccessAfterFail } from './evidence'
 
@@ -38,16 +39,36 @@ export function closerMentionsPreview(text: string): boolean {
   return /превью\s+открыт|preview is open in the app/i.test(text ?? '')
 }
 
-/** Mid-turn "next I will npm install / run dev" — not a user-facing closer. */
+/** Mid-turn "next I will compile / run" — not a user-facing closer. */
 export function isNextActionNarration(text: string): boolean {
   const t = (text ?? '').trim()
   if (!t) return false
   return (
-    /now I (need to|will|should) (run|start|call|execute|write)|let me (start|run|call|write)|I(?:['’]ll| will) (now )?(run|start)|going to run/i.test(
+    /now I (need to|will|should) (run|start|call|execute|write|compile|launch)|let me (start|run|call|write|compile)|I(?:['’]ll| will) (now )?(run|start|compile)|going to run|I need to (compile|run|launch|execute)/i.test(
       t
     ) ||
+    /The (?:test )?file (?:is |was )(?:created|ready).{0,80}(?:compile|run|launch)/i.test(t) ||
+    /теперь нужно запустить|теперь запущу|сейчас нужно запустить|сейчас надо запустить/i.test(t) ||
+    /файл создан.{0,80}запуст/i.test(t) ||
     /теперь запускаю|сейчас запущу|сейчас запускаю|осталось запустить|сейчас вызову|начну с npm|запускаю (npm|vite|dev[- ]сервер)/i.test(
       t
+    )
+  )
+}
+
+export function closerLooksLikeHangOrLoop(text: string): boolean {
+  const t = (text ?? '').trim()
+  if (!t) return false
+  return (
+    /<\s*tool_call\b|<\s*function\s*=/i.test(t) ||
+    /TOOL_LOOP|SHELL_TIMEOUT|зависает|timed?\s*out/i.test(t)
+  )
+}
+
+function looksLikeViteOrNpmApp(paths: string[]): boolean {
+  return paths.some((p) =>
+    /(?:^|\/)package\.json$|(?:^|\/)vite\.config\.|(?:^|\/)src\/App\.(jsx|tsx)$/i.test(
+      p.replace(/\\/g, '/')
     )
   )
 }
@@ -70,17 +91,24 @@ export function fallbackWorkDoneCloser(opts: {
     : ru
       ? 'Файлы записаны.'
       : 'Files were written.'
-  const previewBit = opts.previewOpened
-    ? ru
-      ? ' Превью открыто в приложении — вкладка Browser (npm run dev).'
-      : ' Preview is open in the app Browser tab (npm run dev).'
-    : looksLikeCliPaths(opts.paths)
+  let previewBit: string
+  if (opts.previewOpened) {
+    previewBit = looksLikeViteOrNpmApp(opts.paths)
       ? ru
-        ? ' Программа записана и запущена — вывод в чипе терминала.'
-        : ' Program written and run — see the terminal chip.'
+        ? ' Превью открыто в приложении — вкладка Browser (npm run dev).'
+        : ' Preview is open in the app Browser tab (npm run dev).'
       : ru
-        ? ' Можно открыть превью через npm run dev.'
-        : ' Open the preview with npm run dev.'
+        ? ' Превью открыто в приложении — вкладка Browser.'
+        : ' Preview is open in the app Browser tab.'
+  } else if (looksLikeCliPaths(opts.paths)) {
+    previewBit = ru
+      ? ' Программа записана и запущена — вывод в чипе терминала.'
+      : ' Program written and run — see the terminal chip.'
+  } else {
+    previewBit = ru
+      ? ' Можно открыть превью через npm run dev.'
+      : ' Open the preview with npm run dev.'
+  }
   return `${fileBit}${previewBit}`.trim()
 }
 
@@ -98,11 +126,16 @@ export function resolveTurnCloser(opts: {
   paths: string[]
   previewOpened: boolean
 }): string {
-  const existing = (opts.lastClosingText ?? '').trim()
+  const stripped = stripLeakedToolMarkup(opts.lastClosingText ?? '')
+  const existing = preferUserFacingCloser(
+    stripped,
+    opts.lang === 'ru' ? 'ru' : 'en'
+  ).trim()
   const usable =
     existing.length >= 48 &&
     !/^[↻⏹]/.test(existing) &&
     !isNextActionNarration(existing) &&
+    !closerLooksLikeHangOrLoop(existing) &&
     (!opts.previewOpened || closerMentionsPreview(existing))
   if (usable) return existing
   return fallbackWorkDoneCloser(opts)

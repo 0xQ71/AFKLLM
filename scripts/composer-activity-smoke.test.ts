@@ -103,6 +103,20 @@ describe('composerActivity', () => {
     assert.match(label, /Top 10/)
   })
 
+  it('shell chip skips ErrorAction SilentlyContinue crumbs', () => {
+    const a = buildActivityFromTool({
+      name: 'execute_terminal_command',
+      args: { command: 'where.exe cl' },
+      resultContent:
+        'ErrorAction SilentlyContinue\nntinue\n> where.exe cl\nC:\\Windows\\cl.exe\n\nexit_code=0',
+      ok: true
+    })
+    const label = formatActivityLabel(a)
+    assert.doesNotMatch(label, /ntinue/i)
+    assert.doesNotMatch(label, /SilentlyContinue/i)
+    assert.match(label, /cl\.exe/)
+  })
+
   it('formats Editing basename', () => {
     const a = buildActivityFromTool({
       name: 'apply_patch',

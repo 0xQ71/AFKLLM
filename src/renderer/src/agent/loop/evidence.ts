@@ -81,15 +81,58 @@ export function looksLikeCompileShellCommand(command: string): boolean {
   if (!c.trim()) return false
   if (
     /\bwhere(?:\.exe)?\b|\bGet-Command\b|\bTest-Path\b/i.test(c) &&
-    !/\b(?:g\+\+|gcc|cl(?:\.exe)?)\s+[-/]|\bjavac\s+\S/i.test(c)
+    !/\b(?:g\+\+|gcc|cl(?:\.exe)?|csc(?:\.exe)?)\s+[-/]|\bjavac\s+\S/i.test(c)
   ) {
     return false
   }
   return (
-    /\bg\+\+\s|\bgcc\s+-|\bclang(?:\+\+)?\s|\bjavac\s+\S|\bcargo\s+build|\bgo\s+build|\bdotnet\s+build|\bnpm\s+run\s+build|\bmvn\s|\bgradle\s|\bcmake\s/i.test(
+    /\bg\+\+\s|\bgcc\s+-|\bclang(?:\+\+)?\s|\bjavac\s+\S|\bcsc(?:\.exe)?\s|\bcargo\s+build|\bgo\s+build|\bdotnet\s+build|\bnpm\s+run\s+build|\bmvn\s|\bgradle\s|\bcmake\s/i.test(
       c
     ) || /\bcl(?:\.exe)?\s+(\/|\S)/i.test(c)
   )
+}
+
+const COMPILE_SRC_EXT = 'java|cs|cpp|cc|cxx|c|go|rs|py|kt'
+
+/** Source files named on a compile argv (`javac Foo.java`, `csc WordFreq.cs`). */
+export function sourcePathsFromCompileCommand(command: string): string[] {
+  const c = command ?? ''
+  const out: string[] = []
+  const re = new RegExp(
+    `(?:^|[\\s;"'\`/=:])((?:[\\w.-]+[\\\\/])*?[\\w.-]+\\.(?:${COMPILE_SRC_EXT}))\\b`,
+    'gi'
+  )
+  let m: RegExpExecArray | null
+  while ((m = re.exec(c))) {
+    const p = (m[1] ?? '').replace(/\\/g, '/')
+    if (p && !out.includes(p)) out.push(p)
+  }
+  return out
+}
+
+/** Paths compilers print on stderr (`Foo.java:12: error`, `Bar.cs(3,1): error CS`). */
+export function sourcePathsFromCompilerOutput(content: string): string[] {
+  const t = content ?? ''
+  const out: string[] = []
+  const re =
+    /(?:^|[\s/`'"])((?:[\w.-]+[\\/])*[\w.-]+\.(?:java|cs|cpp|cc|cxx|c|h|go|rs|kt|py))\s*(?::\d+|\(\d+)/gi
+  let m: RegExpExecArray | null
+  while ((m = re.exec(t))) {
+    const p = (m[1] ?? '').replace(/\\/g, '/')
+    if (p && !out.includes(p)) out.push(p)
+  }
+  return out
+}
+
+export function collectCompileSourcePaths(command: string, content?: string): string[] {
+  const seen = new Set<string>()
+  for (const p of [
+    ...sourcePathsFromCompileCommand(command),
+    ...sourcePathsFromCompilerOutput(content ?? '')
+  ]) {
+    seen.add(p)
+  }
+  return [...seen]
 }
 
 function parseExitCode(content?: string): number | undefined {

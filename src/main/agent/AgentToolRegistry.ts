@@ -15,7 +15,12 @@ import {
   formatApplyPatchResult,
   parseApplyPatch
 } from '../../shared/applyPatch'
-import { normalizeAgentShellCommand, stripAfkPtyChrome, cliStdoutLooksVacuous } from '../../shared/shellNormalize'
+import {
+  normalizeAgentShellCommand,
+  stripAfkPtyChrome,
+  cliStdoutLooksVacuous,
+  isCliVerifyCommand
+} from '../../shared/shellNormalize'
 import {
   extractErrorFocus,
   isUserInterruptExit,
@@ -28,6 +33,7 @@ import {
   recursiveListingRefusal,
   processKillRefusal,
   compilerInstallRefusal,
+  looksLikeCommandNotFound,
   POWERSHELL_UNALIAS_CURL
 } from '../../shared/shellErrors'
 import {
@@ -1896,18 +1902,13 @@ export class AgentToolRegistry {
       /regex(?:p)?\.Split|not enough arguments in call to regex\.Split/i.test(body)
         ? '\nGO_SPLIT: regexp.Split(s, n) — n=0 returns nil (empty word list). Use n=-1 to split all.'
         : ''
-    const compilerMissing =
-      /не распознано|not recognized|CommandNotFoundException/i.test(body) &&
-      /\bg\+\+|gcc(?:\.exe)?\b/i.test(command)
-        ? '\nCOMPILER_MISSING: g++/gcc is not in PATH. Do not winget/choco/download MinGW. ' +
-          'Run: cl /EHsc /Fe:wordfreq wordfreq.cpp then .\\wordfreq.exe <file>. ' +
-          'If cl fails, say so — do not download compilers.'
-        : ''
+    const commandNotFound = looksLikeCommandNotFound(body)
+      ? '\nCOMMAND_NOT_FOUND: this executable is not on PATH. Do not winget/choco/scoop or download a toolchain. ' +
+        'Use a tool already on PATH, or stop and name what is missing.'
+      : ''
     const cliEmpty =
-      exitCode === 0 &&
-      /\bgo\s+run\b/i.test(command) &&
-      cliStdoutLooksVacuous(body)
-        ? '\nCLI_EMPTY: exit_code=0 but stdout has no counted words. Fix tokenizer (Go regexp.Split n=-1, not 0). Re-run. Do not stop.'
+      exitCode === 0 && isCliVerifyCommand(command) && cliStdoutLooksVacuous(body)
+        ? '\nCLI_EMPTY: exit_code=0 but stdout has no useful program output. Fix the program and re-run. Do not stop.'
         : ''
     if (exitCode === 0) {
       return {
@@ -1935,10 +1936,7 @@ export class AgentToolRegistry {
           `command: ${command}\n` +
           noteLine +
           `\n${body}\n\n` +
-          `REQUIRED: do not rerun the same argv. Pipe input or pass a file path, e.g.\n` +
-          `  echo "one two one" | go run wordfreq.go\n` +
-          `  python wordfreq.py test_input.txt\n` +
-          `Then show the real stdout.`,
+          `REQUIRED: do not rerun the same argv. If it waits for stdin, pass a file argument or pipe input, then show the real stdout.`,
         error: 'Timed out'
       }
     }
@@ -1991,7 +1989,7 @@ export class AgentToolRegistry {
       `\n` +
       `ERROR_FOCUS (read and fix THIS — do not guess):\n${focusOrTail}\n` +
       goSplit +
-      compilerMissing +
+      commandNotFound +
       `\n` +
       `FULL_OUTPUT:\n${body}\n\n` +
       `REQUIRED: open the file/line named in the traceback (read_file), apply_diff to fix the stated cause, then re-run the SAME command (use cwd=… instead of bash &&). Do not rewrite the whole project or drop the tech stack.`

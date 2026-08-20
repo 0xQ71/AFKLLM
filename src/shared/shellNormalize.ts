@@ -10,38 +10,63 @@ export interface NormalizedShell {
   note?: string
 }
 
-/** Replace && / || outside quotes with `;` for PowerShell. */
-export function rewriteBashOperators(command: string): string {
-  let out = ''
+/** Split on bash && / || outside quotes (left-associative). */
+function splitBashLogicalOps(command: string): {
+  parts: string[]
+  ops: Array<'&&' | '||'>
+} {
+  const parts: string[] = []
+  const ops: Array<'&&' | '||'> = []
+  let cur = ''
   let quote: '"' | "'" | '`' | null = null
   for (let i = 0; i < command.length; i++) {
     const c = command[i]!
     const next = command[i + 1]
-
     if (quote) {
-      out += c
+      cur += c
       if (c === quote && command[i - 1] !== '\\') quote = null
       continue
     }
     if (c === '"' || c === "'" || c === '`') {
       quote = c
-      out += c
+      cur += c
       continue
     }
     if (c === '&' && next === '&') {
-      out += '; '
+      parts.push(cur.trim())
+      ops.push('&&')
+      cur = ''
       i++
       continue
     }
     if (c === '|' && next === '|') {
-      // PS5 has no || — approximate with `;`
-      out += '; '
+      parts.push(cur.trim())
+      ops.push('||')
+      cur = ''
       i++
       continue
     }
-    out += c
+    cur += c
   }
-  return out.replace(/\s*;\s*/g, '; ').trim()
+  parts.push(cur.trim())
+  return { parts, ops }
+}
+
+/**
+ * Replace bash && / || outside quotes with PowerShell `if ($?)` / `if (-not $?)`
+ * so `test -f x && echo y || echo n` keeps short-circuit semantics.
+ */
+export function rewriteBashOperators(command: string): string {
+  const { parts, ops } = splitBashLogicalOps(command)
+  if (ops.length === 0) return command.trim()
+  let out = parts[0] ?? ''
+  for (let i = 0; i < ops.length; i++) {
+    const next = parts[i + 1] ?? ''
+    if (!next) continue
+    out +=
+      ops[i] === '&&' ? `; if ($?) { ${next} }` : `; if (-not $?) { ${next} }`
+  }
+  return out.replace(/\s+; /g, '; ').trim()
 }
 
 /**
@@ -98,10 +123,57 @@ export function rewriteUnixismsForPowerShell(command: string): string {
     cmd = `Write-Output -- ${payload} | ${lhs}`
   }
 
+  cmd = rewriteBashHeredoc(cmd)
+  cmd = rewriteWhichCommand(cmd)
+  cmd = rewriteCompilerHelpProbe(cmd)
   cmd = rewriteWhereAlias(cmd)
   cmd = rewriteBareWindowsExe(cmd)
 
   return cmd.trim()
+}
+
+/**
+ * bash `which foo` is not a PowerShell command. `where.exe` locates binaries
+ * without expanding to `-ErrorAction SilentlyContinue` (that leaks into the chip).
+ */
+export function rewriteWhichCommand(command: string): string {
+  return command.replace(
+    /(^|[\s;|&(])which(?!\.exe\b)(\s+)(?!\{)([A-Za-z0-9._*?-]+)/gi,
+    '$1where.exe$2$3'
+  )
+}
+
+/**
+ * `cl /?` / `csc /?` (often piped to Select-Object -First) hangs the PTY.
+ * Locating the binary is the probe the model actually needs.
+ */
+export function rewriteCompilerHelpProbe(command: string): string {
+  return command.replace(
+    /(^|[\s;|&])(cl|csc|link)(\.exe)?(\s+\/\?)(\s*\|\s*Select-Object\s+-First\s+\d+)?(?=[\s;]|$)/gi,
+    '$1where.exe $2'
+  )
+}
+
+/**
+ * `cat > file <<'EOF' … EOF` and `cmd <<TAG … TAG` → PowerShell here-string.
+ */
+export function rewriteBashHeredoc(command: string): string {
+  const cat = command.match(
+    /^cat\s+>\s*(?:"([^"]+)"|'([^']+)'|(\S+))\s+<<\s*['"]?(\w+)['"]?\s*\r?\n([\s\S]*?)\r?\n\4\s*$/
+  )
+  if (cat) {
+    const dest = cat[1] || cat[2] || cat[3] || ''
+    const body = cat[5] ?? ''
+    return `@'\n${body}\n'@ | Set-Content -Encoding utf8 -LiteralPath ${JSON.stringify(dest)}`
+  }
+  const pipe = command.match(/^([\s\S]+?)\s+<<\s*['"]?(\w+)['"]?\s*\r?\n([\s\S]*?)\r?\n\2\s*$/)
+  if (pipe) {
+    const lhs = pipe[1]!.trim()
+    if (/\bcat\s+>/.test(lhs)) return command
+    const body = pipe[3] ?? ''
+    return `@'\n${body}\n'@ | ${lhs}`
+  }
+  return command
 }
 
 /**
@@ -116,7 +188,7 @@ export function rewriteWhereAlias(command: string): string {
   )
 }
 
-/** PowerShell will not run `wordfreq.exe` from cwd; `.\wordfreq.exe` will. Skip toolchain names on PATH. */
+/** PowerShell will not run a cwd `.exe` without `.\`; skip toolchain names already on PATH. */
 const WINDOWS_TOOLCHAIN_EXE =
   /^(cl|link|csc|msbuild|python|pythonw|node|go|java|javac|git|npm|npx|cmd|powershell|pwsh|rustc|cargo|dotnet|cmake|ninja|gcc|g\+\+|clang|clang\+\+|nmake|dumpbin|where)\.exe$/i
 
@@ -130,6 +202,26 @@ export function rewriteBareWindowsExe(command: string): string {
   )
 }
 
+/**
+ * A program-run that can prove a from-scratch CLI — not a compiler, installer, or dev server.
+ * Language-agnostic: go/python/dotnet/cargo/java/node, or a cwd `.exe` that is not a toolchain.
+ */
+export function isCliVerifyCommand(command: string): boolean {
+  const c = command ?? ''
+  if (!c.trim()) return false
+  if (/python\s+-m\s+http\.server|npm\s+run\s+dev|\bvite\b/i.test(c)) return false
+  if (
+    /\bgo\s+run\b|\bpython3?\s+\S+\.py\b|\bpy\s+\S+\.py\b|\bdotnet\s+run\b|\bcargo\s+run\b/i.test(c)
+  ) {
+    return true
+  }
+  if (/\bjava\s+(?!-version\b)[A-Za-z_$]/i.test(c)) return true
+  if (/\bnode\s+\S+\.(mjs|cjs|js)\b/i.test(c) && !/\s-e\b/.test(c)) return true
+  const exe = c.match(/(?:^|[\s;|&])(?:\.\\|\.\/)?([A-Za-z0-9][A-Za-z0-9._-]*\.exe)\b/i)
+  if (exe && !WINDOWS_TOOLCHAIN_EXE.test(exe[1]!)) return true
+  return false
+}
+
 /** PTY echo of the temp wrapper (`& '...\afk-run-….ps1'; Remove-Item…`) or leftover exit marker. */
 export function isAfkPtyChromeLine(line: string): boolean {
   const t = line.trim()
@@ -138,8 +230,9 @@ export function isAfkPtyChromeLine(line: string): boolean {
   if (/__AFK_EXIT_[a-z0-9]+__/i.test(t) && !/^> /.test(t)) return true
   if (/^PROCESS_ENDED:/i.test(t)) return true
   if (/^Do NOT rewrite or relaunch/i.test(t)) return true
-  if (/ErrorActionPreference/i.test(t)) return true
-  if (/^(Continue|SilentlyContinue|ontinue)$/i.test(t)) return true
+  if (/ErrorAction(?:Preference)?/i.test(t)) return true
+  if (/^(Continue|SilentlyContinue|ontinue|ntinue)$/i.test(t)) return true
+  if (/\bSilentlyContinue\b/i.test(t) && t.length < 120) return true
   return false
 }
 
@@ -150,7 +243,11 @@ export function stripAfkPtyChrome(output: string): string {
     .split(/\r?\n/)
     .flatMap((line) => {
       if (!isAfkPtyChromeLine(line)) return [line]
-      const leftover = line.replace(/__AFK_EXIT_[a-z0-9]+__\d*/gi, '').trim()
+      const leftover = line
+        .replace(/__AFK_EXIT_[a-z0-9]+__\d*/gi, '')
+        .replace(/\s*-ErrorAction\s+\w+/gi, '')
+        .replace(/\bSilentlyContinue\b/gi, '')
+        .trim()
       if (leftover && !isAfkPtyChromeLine(leftover)) return [leftover]
       return []
     })
@@ -159,7 +256,7 @@ export function stripAfkPtyChrome(output: string): string {
     .replace(/\n+$/, '')
 }
 
-/** exit_code=0 but no real program output (T07f: «Нет слов для анализа.» after Split n=0). */
+/** exit_code=0 but no real program output (empty tokenizer, "no words", blank stdout). */
 export function cliStdoutLooksVacuous(resultContent: string): boolean {
   const t = stripAfkPtyChrome(resultContent ?? '')
     .replace(/^note:.*$/gim, '')
@@ -218,7 +315,7 @@ export function normalizeAgentShellCommand(
     const beforeOps = cmd
     cmd = rewriteBashOperators(cmd)
     if (cmd !== beforeOps) {
-      notes.push('rewrote bash &&/|| to PowerShell ;')
+      notes.push('rewrote bash &&/|| to PowerShell if ($?)')
     }
     const beforeUnix = cmd
     cmd = rewriteUnixismsForPowerShell(cmd)
