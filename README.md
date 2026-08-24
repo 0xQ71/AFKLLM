@@ -28,9 +28,13 @@
 
 **Local AI coding IDE for Windows** — Electron + Monaco + llama.cpp.
 
+**Current line: `0.3.0-20260825-alpha` (pre-release).** Stable public installers remain **0.2.0-20260811** until 0.3 is promoted.
+
 </div>
 
 AFKLLM is an agent-first desktop IDE: chat and tools on the left, editor / browser / terminal on the right. The core loop — chat, file tools, terminal, search, git — runs on your machine with local GGUF models. Optional **vision attach** and **local FLUX image generation** (`sd-cli`) stay on-device too. No cloud account required for everyday coding.
+
+**0.3 alpha — the host owns “done”.** The agent executes leaked tool XML, keeps Think/stats, patches the stack that is actually on disk (Python / Go / Node / C++ / Java / C#, not “everything is a landing”), and only pins a user-visible closer when there is evidence: a real in-app preview, real compiler output, real CLI stdout. A file path on disk, a plan row, or “I’ll fix the import next” is not success. Static `index.html` is not `npm run dev`. See [release notes](docs/releases/v0.3.0-20260825-alpha.md).
 
 👏 Feedback & bugs → [GitHub Issues](https://github.com/0xQ71/AFKLLM/issues) · docs → [Development](docs/guides/development.md)
 
@@ -63,11 +67,18 @@ AFKLLM is an agent-first desktop IDE: chat and tools on the left, editor / brows
 1. **Local coding agent**
 
 - Local GGUF agent with tools: read / write / patch files, terminal, codebase search, git, web search
-- Composer message queue, Think mode, auto-approve, checkpoints / rewind
+- Composer message queue, Think mode (streamed live), auto-approve, checkpoints / rewind
 - MCP (stdio) servers as extra tools (`mcp__…`)
 - Context usage gauge, project rules, codebase index / `@codebase`
 - Auto-named agent chats from the first prompt
 - Soft guards for tool loops and truncated writes; small-file overwrite + fuzzy patches
+- **Host loop (0.3):** leaked `<tool_call>` XML is executed; Think + generation stats stay in the thread; history compact only at 99% of real context
+- **`apply_diff` / Ctrl+K on the Chat GGUF** — no second Apply model in VRAM
+- **Stack-agnostic edits:** Python / Go / Node / C++ / Java / C# get surgical patches and stack verify — not a rewritten HTML landing
+- **Evidence closers:** Vite/React after a real Browser preview; CLI after stdout in the terminal chip; compile ticks only on real `cl` / `g++` / `go build` / `javac` / `csc`
+- **Completeness gates:** stub/missing CSS/HTML cannot FILE_COMPLETE; failed compile unlocks rewrite; EN/RU in a landing brief is i18n, not a site clone; GitHub scavenger hunts blocked when the brief already has facts
+- **Windows shell:** `&&` / `||` → PowerShell `if ($?)`; `which` → `where.exe`; heredocs / `nul`; PTY chrome stripped; TOOL_LOOP reset after a successful edit
+- Vision: coresident VL or reuse chat-VL; 8k cap on agent completions so a describe cannot skip writes
 
 2. **Editor & IDE shell**
 

@@ -76,4 +76,5 @@ publish:
   - provider: github
     owner: 0xQ71
     repo: AFKLLM
-    releaseType: release
+    # Alpha/beta tags: GitHub pre-release. Switch back to `release` for a stable 0.3.0.
+    releaseType: prerelease

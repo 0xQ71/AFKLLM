@@ -6,7 +6,31 @@ Canonical copy for each tag lives in [`docs/releases/`](docs/releases/).
 That text is what AFKLLM shows in the post-update “What's new” modal
 (and is mirrored in-app under Help → Version).
 
-## 0.2.0-20260811 — build 2026-08-11 (current)
+## 0.3.0-20260825-alpha — build 2026-08-25 (**current, pre-release**)
+
+**Alpha.** Host-owned completeness: leaked tools execute, Think/stats stay, from-scratch
+Python / Vite+React / Go / C++ / Java / C# close only on evidence (real preview, real
+stdout, real compiler). Leftover “I’ll fix it” is not a closer. Static HTML is not npm.
+
+Canonical notes (long form):
+[`docs/releases/v0.3.0-20260825-alpha.md`](docs/releases/v0.3.0-20260825-alpha.md).
+
+### Agent host
+
+- Execute leaked `<tool_call>` XML; keep every Think + stats chip; live Think stream
+- Compact history only at 99% of real ctx; pin closer before a successful preview stop
+- Stack-agnostic patches (do not rewrite a backend bug into a landing)
+- `apply_diff` / Ctrl+K on Chat GGUF (no second Apply model)
+- Vision coresident / reuse chat VL; 8k agent completion cap
+- FILE_COMPLETE does not block rewrite after a failed compile
+- CLI closer only when `cliVerified` (run + stdout); next-action narration is not done
+- PowerShell: `&&`/`||`, `which`, heredoc, `nul`, PTY chrome strip, TOOL_LOOP reset after edit
+
+### Installer
+
+- `AFKLLM-0.3.0-20260825-alpha-x64-setup.exe` (GitHub **pre-release**; 0.2 will not auto-update to this)
+
+## 0.2.0-20260811 — build 2026-08-11
 
 **Full 0.2 line vs public 0.1.0 / 0.1.0-20260807.** Canonical notes:
 [`docs/releases/v0.2.0-20260811.md`](docs/releases/v0.2.0-20260811.md).
@@ -97,3 +121,6 @@ MIT © 0xQ71 — see `LICENSE`, `NOTICE`, and `THIRD_PARTY_NOTICES.md`
 3. Push tag `vX.Y.Z` (runs [`.github/workflows/release.yml`](.github/workflows/release.yml))
    or `GH_TOKEN=… npm run dist:publish` locally
 4. Keep in-app `changelog.releaseNotes` in sync for the modal fallback
+5. For `-alpha` / `-beta` / `-rc` tags, GitHub Release is **pre-release**
+   (`electron-builder.yml` `releaseType: prerelease`; workflow `prerelease: true`).
+   Switch `releaseType` back to `release` for a stable 0.3.0.

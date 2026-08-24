@@ -95,7 +95,8 @@ jobs:
           name: AFKLLM ${{ steps.tag.outputs.version }}
           body: ${{ steps.notes.outputs.body }}
           draft: false
-          make_latest: true
+          prerelease: ${{ contains(steps.tag.outputs.version, 'alpha') || contains(steps.tag.outputs.version, 'beta') || contains(steps.tag.outputs.version, 'rc') }}
+          make_latest: ${{ !(contains(steps.tag.outputs.version, 'alpha') || contains(steps.tag.outputs.version, 'beta') || contains(steps.tag.outputs.version, 'rc')) }}
           files: |
             release/AFKLLM-*-x64-setup.exe
             release/*.blockmap
