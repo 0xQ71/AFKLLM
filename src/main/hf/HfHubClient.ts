@@ -230,10 +230,10 @@ export async function searchHfGgufModels(
     sp.set('search', q || 'Qwen3-4B OR Mistral-Small-3.2')
   } else if (target === 'mmproj') {
     sp.set('filter', 'gguf')
-    sp.set('search', q || 'Qwen3-VL MiniCPM-V gemma-3 VL vision')
+    sp.set('search', q || 'Ornith Qwen3-VL MiniCPM-V gemma-3 VL vision mmproj')
   } else if (target === 'vision') {
     sp.set('filter', 'gguf')
-    sp.set('search', q || 'Qwen3-VL MiniCPM-V gemma-3 VL vision')
+    sp.set('search', q || 'Ornith Qwen3-VL MiniCPM-V gemma-3 VL vision')
   } else {
     sp.set('filter', 'gguf')
     if (q) sp.set('search', q)

@@ -101,14 +101,16 @@ const en = {
   'onboarding.welcome.title': 'Welcome to AFKLLM',
   'onboarding.welcome.body':
     'AFKLLM is a local coding agent for your desktop. It edits files, searches the repo, runs shell commands, and can optionally generate images — all on your machine, without a cloud agent account.',
-  'onboarding.modes.title': 'Choose how you want to work',
-  'onboarding.modes.body': 'Pick one or both. You can change this later in Settings.',
+  'onboarding.modes.title': 'How you want to work',
+  'onboarding.modes.body':
+    'The coding agent is always on. Image generation is optional — you can change it later in Settings.',
   'onboarding.modes.coding': 'Coding agent',
   'onboarding.modes.codingHint':
     'Read/write project files, search code, run terminal commands, MCP tools.',
+  'onboarding.modes.codingOn': 'Always on',
   'onboarding.modes.image': 'Image generation (experimental)',
   'onboarding.modes.imageHint':
-    'Lets the agent call generate_image (FLUX / SD via sd-cli). Needs extra models.',
+    'Lets the agent call generate_image (FLUX / SD via sd-cli). Needs extra models on top of Chat.',
   'onboarding.modes.required': 'Select at least one mode to continue.',
   'onboarding.models.title': 'Models',
   'onboarding.models.body':
@@ -125,11 +127,16 @@ const en = {
   'onboarding.models.openImageStore': 'Open image Store',
   'onboarding.models.visionTitle': 'Vision model (optional)',
   'onboarding.models.visionBody':
-    'If Chat is already a VL GGUF, pick “Same as chat” (one process + mmproj). Otherwise choose a separate vision GGUF; it loads with Chat when you press Load.',
+    'Optional separate VL GGUF for photo attach. It loads with Chat when you press Load. If Chat is already VL, use “Same as chat” instead.',
+  'onboarding.models.visionBodyOrnith':
+    'Ornith 1M is already a VL GGUF. Keep “Same as chat” and download mmproj-ornith-9b-f16.gguf — one llama-server, not a second vision model.',
+  'onboarding.models.visionBodyCoresident':
+    'Chat is already a VL GGUF. Keep “Same as chat” and attach a matching mmproj — one llama-server. Don’t download a second vision GGUF.',
   'onboarding.models.visionGguf': 'Vision GGUF',
   'onboarding.models.visionSkip': 'Skip — set later in Settings',
   'onboarding.models.visionClear': 'Clear',
   'onboarding.models.openVisionStore': 'Open vision Store',
+  'onboarding.models.openMmprojStore': 'Open mmproj Store',
   'onboarding.tip.title': 'Set up models anytime',
   'onboarding.tip.body':
     'You skipped model install for now. AFKLLM works once a chat GGUF is selected and loaded.',
@@ -861,14 +868,16 @@ const ru: Record<MessageKey, string> = {
   'onboarding.welcome.title': 'Добро пожаловать в AFKLLM',
   'onboarding.welcome.body':
     'AFKLLM — локальный coding-агент на вашем ПК. Он правит файлы, ищет по репозиторию, запускает команды в терминале и при желании генерирует изображения — без облачного аккаунта агента.',
-  'onboarding.modes.title': 'Выберите режим работы',
-  'onboarding.modes.body': 'Можно отметить один или оба. Позже это меняется в настройках.',
+  'onboarding.modes.title': 'Как вы хотите работать',
+  'onboarding.modes.body':
+    'Coding-агент всегда включён. Генерация изображений — опция сверху, позже меняется в настройках.',
   'onboarding.modes.coding': 'Coding-агент',
   'onboarding.modes.codingHint':
     'Чтение/запись файлов проекта, поиск по коду, терминал, MCP-инструменты.',
+  'onboarding.modes.codingOn': 'Всегда включён',
   'onboarding.modes.image': 'Генерация изображений (experimental)',
   'onboarding.modes.imageHint':
-    'Агент может вызывать generate_image (FLUX / SD через sd-cli). Нужны отдельные модели.',
+    'Агент может вызывать generate_image (FLUX / SD через sd-cli). Нужны отдельные модели поверх Chat.',
   'onboarding.modes.required': 'Отметьте хотя бы один режим, чтобы продолжить.',
   'onboarding.models.title': 'Модели',
   'onboarding.models.body':
@@ -885,11 +894,16 @@ const ru: Record<MessageKey, string> = {
   'onboarding.models.openImageStore': 'Открыть Store изображений',
   'onboarding.models.visionTitle': 'Vision-модель (необязательно)',
   'onboarding.models.visionBody':
-    'Если Chat уже VL GGUF — выберите «Та же что и Chat» (один процесс + mmproj). Иначе укажите отдельный vision GGUF; он поднимется вместе с Chat по Load.',
+    'Отдельный VL GGUF для attach фото. Поднимется вместе с Chat по Load. Если Chat уже VL — лучше «Та же что и Chat».',
+  'onboarding.models.visionBodyOrnith':
+    'Ornith 1M уже VL GGUF. Оставьте «Та же что Chat» и скачайте mmproj-ornith-9b-f16.gguf — один llama-server, без второй vision-модели.',
+  'onboarding.models.visionBodyCoresident':
+    'Chat уже VL GGUF. Оставьте «Та же что Chat» и прикрепите парный mmproj — один llama-server. Не качайте второй vision GGUF.',
   'onboarding.models.visionGguf': 'Vision GGUF',
   'onboarding.models.visionSkip': 'Пропустить — позже в Настройках',
   'onboarding.models.visionClear': 'Очистить',
   'onboarding.models.openVisionStore': 'Открыть Store vision',
+  'onboarding.models.openMmprojStore': 'Открыть Store mmproj',
   'onboarding.tip.title': 'Модели можно выбрать позже',
   'onboarding.tip.body':
     'Вы пропустили установку моделей. AFKLLM заработает после выбора и загрузки chat GGUF.',

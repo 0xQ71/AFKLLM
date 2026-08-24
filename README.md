@@ -92,6 +92,7 @@ AFKLLM is an agent-first desktop IDE: chat and tools on the left, editor / brows
 3. **Models, vision & image generation**
 
 - Hugging Face store with GPU-aware picks (chat GGUF, vision, FLUX / SD sidecars)
+- **Staff pick:** [Ornith 9B 1M GGUF](https://huggingface.co/satgeze/Ornith-1.0-9B-1M-GGUF) — MTP Q4_K_M for chat; same GGUF + `mmproj-ornith-9b-f16.gguf` for vision (Same as chat)
 - Thin installer: CPU / CUDA 12 / CUDA / Vulkan packs from [official llama.cpp Releases](https://github.com/ggml-org/llama.cpp/releases)
 - First-run onboarding — coding and/or image mode; `.gguf` / diffusion weights are **not** bundled
 - Per-model Performance / Memory / Generation profiles; Load / Unload from Settings or status bar
@@ -126,6 +127,17 @@ Installers for **Windows x64** are on the [Releases](https://github.com/0xQ71/AF
 | `AFKLLM-*-x64-setup.exe` | NSIS installer (choose install folder, shortcuts, Start Menu) |
 
 AFKLLM is a **thin client**: CUDA / llama-server packs download on first **Load**. Bring your own `.gguf` (or download from the in-app store).
+
+### Recommended models (staff picks)
+
+In-app store → **Staff picks**. Default coding + vision pair from the same repo:
+
+| Slot | Model | Files |
+|------|--------|--------|
+| **Chat** | [satgeze/Ornith-1.0-9B-1M-GGUF](https://huggingface.co/satgeze/Ornith-1.0-9B-1M-GGUF) | `ornith-1.0-9b-1M-MTP-Q4_K_M.gguf` (~5.8 GB). Q8_0 (~9.8 GB) if you want max quality. |
+| **Vision** | same repo | `mmproj-ornith-9b-f16.gguf` (~0.9 GB). Set Vision to **Same as chat** — one llama-server, no second copy. |
+
+Other GPU-aware chat picks (Qwen Coder, Gemma 4, Devstral, …) stay in the store. Dedicated VL alternatives: Qwen3-VL 8B, MiniCPM-V, Gemma 3 12B.
 
 Public installers are intended to be Authenticode-signed via
 [SignPath Foundation](https://signpath.org/) (free for open source) once approved —

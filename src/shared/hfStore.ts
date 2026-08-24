@@ -92,24 +92,50 @@ export const HF_RECOMMENDED_MODELS: HfRecommendedModel[] = [
     tags: ['coding', 'popular']
   },
   {
-    repoId: 'protoLabsAI/Ornith-1.0-9B-MTP-GGUF',
-    title: 'Ornith 9B MTP',
+    repoId: 'satgeze/Ornith-1.0-9B-1M-GGUF',
+    title: 'Ornith 9B 1M MTP',
     description:
-      'Qwen3.5 hybrid 9B with baked-in MTP — Q4_K_M (~5.8 GB). Fast speculative decode; top pick on 8–16 GB (Ampere/Ada).',
+      'Staff pick — Qwen3.5 hybrid 9B, 1M ctx, baked-in MTP — Q4_K_M (~5.8 GB). Fast speculative decode; attach mmproj-ornith-9b-f16.gguf for vision (Same as chat).',
     descriptionRu:
-      'Гибрид Qwen3.5 9B с MTP в GGUF — Q4_K_M (~5.8 ГБ). Быстрый speculative decode; топ на 8–16 ГБ (Ampere/Ada).',
+      'Staff pick — гибрид Qwen3.5 9B, контекст 1M, MTP в GGUF — Q4_K_M (~5.8 ГБ). Быстрый speculative decode; для vision — mmproj-ornith-9b-f16.gguf (та же что Chat).',
+    preferredFile: 'ornith-1.0-9b-1M-MTP-Q4_K_M.gguf',
+    preferredMmproj: 'mmproj-ornith-9b-f16.gguf',
+    sizeGb: 5.8,
+    minVramGb: 8,
+    tags: ['coding', 'agent', 'popular', 'vision']
+  },
+  {
+    repoId: 'satgeze/Ornith-1.0-9B-1M-GGUF',
+    title: 'Ornith 9B 1M MTP Q8',
+    description:
+      'Max-quality 1M Ornith — MTP Q8_0 (~9.8 GB). Same repo as the Q4 staff pick; needs ~12 GB+ VRAM.',
+    descriptionRu:
+      'Максимальное качество Ornith 1M — MTP Q8_0 (~9.8 ГБ). Тот же репо, что Q4 staff pick; нужно ~12 ГБ+ VRAM.',
+    preferredFile: 'ornith-1.0-9b-1M-MTP-Q8_0.gguf',
+    preferredMmproj: 'mmproj-ornith-9b-f16.gguf',
+    sizeGb: 9.8,
+    minVramGb: 12,
+    tags: ['coding', 'agent']
+  },
+  {
+    repoId: 'protoLabsAI/Ornith-1.0-9B-MTP-GGUF',
+    title: 'Ornith 9B MTP (262k)',
+    description:
+      'Native 262k Ornith MTP — Q4_K_M (~5.8 GB). Prefer the 1M satgeze pick unless you want the shorter-ctx protoLabs build.',
+    descriptionRu:
+      'Нативный 262k Ornith MTP — Q4_K_M (~5.8 ГБ). Лучше 1M satgeze, если не нужен короткий protoLabs-билд.',
     preferredFile: 'Ornith-1.0-9B-MTP-Q4_K_M.gguf',
     sizeGb: 5.8,
     minVramGb: 8,
-    tags: ['coding', 'agent', 'popular']
+    tags: ['coding', 'agent']
   },
   {
     repoId: 'protoLabsAI/Ornith-1.0-9B-MTP-GGUF',
     title: 'Ornith 9B MTP NVFP4',
     description:
-      'Same Ornith 9B MTP in NVFP4 (~6.6 GB). Fastest on Blackwell (RTX 50xx / PRO 6000). Skip on Ampere/Ada — use Q4_K_M.',
+      'Same 262k Ornith MTP in NVFP4 (~6.6 GB). Fastest on Blackwell (RTX 50xx / PRO 6000). Skip on Ampere/Ada — use the 1M Q4_K_M pick.',
     descriptionRu:
-      'Тот же Ornith 9B MTP в NVFP4 (~6.6 ГБ). Самый быстрый на Blackwell (RTX 50xx / PRO 6000). Не для Ampere/Ada — берите Q4_K_M.',
+      'Тот же 262k Ornith MTP в NVFP4 (~6.6 ГБ). Самый быстрый на Blackwell (RTX 50xx / PRO 6000). Не для Ampere/Ada — берите 1M Q4_K_M.',
     preferredFile: 'Ornith-1.0-9B-MTP-NVFP4.gguf',
     sizeGb: 6.6,
     minVramGb: 10,
@@ -242,6 +268,19 @@ export const HF_APPLY_RECOMMENDED_MODELS: HfRecommendedModel[] = [
 
 /** Vision / VL GGUF staff picks for ~16 GB VRAM (pair with mmproj from the same repo). */
 export const HF_VISION_RECOMMENDED_MODELS: HfRecommendedModel[] = [
+  {
+    repoId: 'satgeze/Ornith-1.0-9B-1M-GGUF',
+    title: 'Ornith 9B 1M + Vision',
+    description:
+      'Same coding staff pick with vision — MTP Q4_K_M (~5.8 GB) + mmproj-ornith-9b-f16.gguf (~0.9 GB). Set Vision to Same as chat.',
+    descriptionRu:
+      'Тот же coding staff pick с vision — MTP Q4_K_M (~5.8 ГБ) + mmproj-ornith-9b-f16.gguf (~0.9 ГБ). Vision = та же что Chat.',
+    preferredFile: 'ornith-1.0-9b-1M-MTP-Q4_K_M.gguf',
+    preferredMmproj: 'mmproj-ornith-9b-f16.gguf',
+    sizeGb: 5.8,
+    minVramGb: 8,
+    tags: ['vision', 'coding', 'popular']
+  },
   {
     repoId: 'Qwen/Qwen3-VL-8B-Instruct-GGUF',
     title: 'Qwen3-VL 8B',
@@ -457,42 +496,38 @@ export const HF_IMAGE_GEN_LLM_MODELS: HfRecommendedModel[] = [
 
 /**
  * Top-3 staff order per VRAM tier (by preferredFile).
- * 8/12: Ornith MTP Q4 first; 16+: Devstral then Ornith. Blackwell swaps Ornith → NVFP4.
+ * 8/12: Ornith 1M MTP Q4 first; 16+: Devstral then Ornith 1M.
+ * satgeze 1M has no NVFP4 sibling — Blackwell still gets 1M Q4; protoLabs NVFP4 remains in the catalog.
  */
 export const HF_TIER_STAFF_FILES: Record<'8' | '12' | '16' | '24', string[]> = {
   '8': [
-    'Ornith-1.0-9B-MTP-Q4_K_M.gguf',
+    'ornith-1.0-9b-1M-MTP-Q4_K_M.gguf',
     'Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf',
     'Llama-3.2-3B-Instruct-Q4_K_M.gguf'
   ],
   '12': [
-    'Ornith-1.0-9B-MTP-Q4_K_M.gguf',
+    'ornith-1.0-9b-1M-MTP-Q4_K_M.gguf',
     'gemma4-v2-Q6_K.gguf',
     'Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf'
   ],
   '16': [
     'Devstral-Small-2-24B-Instruct-2512-IQ4_XS.gguf',
-    'Ornith-1.0-9B-MTP-Q4_K_M.gguf',
+    'ornith-1.0-9b-1M-MTP-Q4_K_M.gguf',
     'gemma4-v2-Q6_K.gguf'
   ],
   '24': [
     'Devstral-Small-2-24B-Instruct-2512-IQ4_XS.gguf',
-    'Ornith-1.0-9B-MTP-Q4_K_M.gguf',
+    'ornith-1.0-9b-1M-MTP-Q4_K_M.gguf',
     'gemma4-v2-Q6_K.gguf'
   ]
 }
 
-const ORNITH_MTP_Q4 = 'Ornith-1.0-9B-MTP-Q4_K_M.gguf'
-const ORNITH_MTP_NVFP4 = 'Ornith-1.0-9B-MTP-NVFP4.gguf'
-
 export function staffFilesForGpu(
   vramGb: number,
-  gpuName?: string | null
+  _gpuName?: string | null
 ): string[] {
-  const tier = vramTier(vramGb)
-  const files = [...HF_TIER_STAFF_FILES[tier]]
-  if (!isBlackwellGpuName(gpuName) || tier === '8') return files
-  return files.map((f) => (f === ORNITH_MTP_Q4 ? ORNITH_MTP_NVFP4 : f))
+  void _gpuName
+  return [...HF_TIER_STAFF_FILES[vramTier(vramGb)]]
 }
 
 export function vramTier(vramGb: number): keyof typeof HF_TIER_STAFF_FILES {
@@ -599,7 +634,7 @@ export function selectRecommendedForVram(
     picked.push(m)
   }
 
-  // Tier staff order (Blackwell swaps Ornith Q4 → NVFP4)
+  // Tier staff order (Ornith 1M Q4 / Devstral pins)
   for (const file of staffFiles) {
     const hit = HF_RECOMMENDED_MODELS.find((m) => m.preferredFile === file)
     if (hit) tryAdd(withFit(hit), { allowSameRepo: true })

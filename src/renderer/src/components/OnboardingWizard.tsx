@@ -3,7 +3,8 @@ import type { AppSettings, DiscoveredModel, UiTheme } from '../../../shared/sett
 import type { UiLanguage } from '../../../shared/i18n'
 import type { StoreDownloadTarget } from '../../../shared/hfStore'
 import { applyDocumentTheme, UI_THEMES } from '../../../shared/theme'
-import { isLikelyVisionGguf, scoreVisionGguf, VISION_SAME_AS_CHAT, isVisionSameAsChat } from '../../../shared/visionDetect'
+import { isLikelyVisionGguf, scoreVisionGguf, VISION_SAME_AS_CHAT, isVisionSameAsChat, defaultVisionPathForChat } from '../../../shared/visionDetect'
+import { looksLikeOrnithGguf } from '../../../shared/ornithDefaults'
 import { applyMonacoTheme } from '../editor/monacoSetup'
 import { useI18n } from '../i18n/I18nProvider'
 import { ModelStorePanel } from './ModelStorePanel'
@@ -28,10 +29,10 @@ export function OnboardingWizard({
 }: OnboardingWizardProps): React.JSX.Element | null {
   const { t, lang, setLang } = useI18n()
   const [step, setStep] = useState<Step>('welcome')
-  const [codingMode, setCodingMode] = useState(true)
   const [imageMode, setImageMode] = useState(false)
   const [settings, setSettings] = useState<AppSettings | null>(null)
   const [models, setModels] = useState<DiscoveredModel[]>([])
+  const [mmprojs, setMmprojs] = useState<DiscoveredModel[]>([])
   const [busy, setBusy] = useState(false)
   const [message, setMessage] = useState<string | null>(null)
   const [loadAfterSave, setLoadAfterSave] = useState(true)
@@ -55,27 +56,32 @@ export function OnboardingWizard({
     if (modelsDir) {
       await window.api.settings.save({ modelsDir })
     }
-    const list = await window.api.llm.listModels()
+    const [list, mm] = await Promise.all([
+      window.api.llm.listModels(),
+      window.api.llm.listMmproj()
+    ])
     setModels(list)
+    setMmprojs(mm)
     const s = await window.api.settings.get()
     let next = { ...s }
     if (keepModelPath) {
-      next = { ...next, modelPath: keepModelPath }
-    } else if (list.length > 0 && (!s.modelPath || !list.some((m) => m.path === s.modelPath))) {
-      next = { ...next, modelPath: list[0]!.path }
-    }
-    if (!next.visionModelPath?.trim()) {
-      if (isLikelyVisionGguf(next.modelPath || '')) {
-        next = { ...next, visionModelPath: VISION_SAME_AS_CHAT }
-      } else {
-        const ranked = [...list]
-          .map((m) => ({ m, score: scoreVisionGguf(m.path) }))
-          .filter((x) => x.score >= 0)
-          .sort((a, b) => b.score - a.score)
-        if (ranked[0]) {
-          next = { ...next, visionModelPath: ranked[0].m.path }
-        }
+      next = {
+        ...next,
+        modelPath: keepModelPath,
+        visionModelPath: defaultVisionPathForChat(keepModelPath, next.visionModelPath)
       }
+    } else if (list.length > 0 && (!s.modelPath || !list.some((m) => m.path === s.modelPath))) {
+      const chat = list[0]!.path
+      next = {
+        ...next,
+        modelPath: chat,
+        visionModelPath: defaultVisionPathForChat(chat, next.visionModelPath)
+      }
+    } else if (
+      !next.visionModelPath?.trim() &&
+      isLikelyVisionGguf(next.modelPath || '')
+    ) {
+      next = { ...next, visionModelPath: VISION_SAME_AS_CHAT }
     }
     setSettings(next)
   }
@@ -83,7 +89,6 @@ export function OnboardingWizard({
   useEffect(() => {
     if (!open) return
     setStep('welcome')
-    setCodingMode(true)
     setImageMode(false)
     setMessage(null)
     setStoreOpen(false)
@@ -120,6 +125,17 @@ export function OnboardingWizard({
     setLang(next)
   }
 
+  const setChatPath = (path: string): void => {
+    setSettings((prev) => {
+      if (!prev) return prev
+      return {
+        ...prev,
+        modelPath: path,
+        visionModelPath: defaultVisionPathForChat(path, prev.visionModelPath)
+      }
+    })
+  }
+
   const pickDir = async (): Promise<void> => {
     const dir = await window.api.workspace.pickModelsDir()
     if (!dir) return
@@ -138,7 +154,7 @@ export function OnboardingWizard({
 
   const browseModel = async (): Promise<void> => {
     const path = await window.api.workspace.pickModel()
-    if (path) patch('modelPath', path)
+    if (path) setChatPath(path)
   }
 
   const finish = async (opts?: { openSettingsPage?: 'agent' | 'model' }): Promise<void> => {
@@ -180,7 +196,10 @@ export function OnboardingWizard({
     setStoreOpen(true)
   }
 
-  const canAdvanceModes = codingMode || imageMode
+  const hasChatGguf = Boolean(settings.modelPath?.trim())
+  const chatIsVl = isLikelyVisionGguf(settings.modelPath || '')
+  const chatIsOrnith = looksLikeOrnithGguf(settings.modelPath || '')
+  const coresidentVision = chatIsVl && isVisionSameAsChat(settings.visionModelPath)
 
   return (
     <div className="absolute inset-0 z-[60] flex flex-col bg-ink-950">
@@ -188,13 +207,14 @@ export function OnboardingWizard({
         <div className="mb-8">
           <p className="text-xs font-medium tracking-[0.2em] text-signal uppercase">AFKLLM</p>
           <div className="mt-3 flex gap-2">
-            {(['welcome', 'modes', 'models', 'tip'] as Step[]).map((s, i) => (
+            {(['welcome', 'modes', 'models'] as Step[]).map((s, i) => (
               <span
                 key={s}
                 className={
                   'h-1 flex-1 rounded-full ' +
                   (step === s ||
-                  (['welcome', 'modes', 'models', 'tip'].indexOf(step) > i)
+                  step === 'tip' ||
+                  (['welcome', 'modes', 'models'].indexOf(step) > i)
                     ? 'bg-signal'
                     : 'bg-ink-800')
                 }
@@ -221,22 +241,17 @@ export function OnboardingWizard({
                 {t('onboarding.modes.title')}
               </h1>
               <p className="text-sm text-ink-mute">{t('onboarding.modes.body')}</p>
-              <label className="flex cursor-pointer items-start gap-3 rounded-lg border border-ink-line bg-ink-900/60 p-4">
-                <input
-                  type="checkbox"
-                  className="mt-1"
-                  checked={codingMode}
-                  onChange={(e) => setCodingMode(e.target.checked)}
-                />
-                <span>
-                  <span className="block text-sm font-medium text-ink-bright">
-                    {t('onboarding.modes.coding')}
-                  </span>
-                  <span className="mt-1 block text-xs text-ink-mute">
-                    {t('onboarding.modes.codingHint')}
+              <div className="rounded-lg border border-signal/30 bg-signal/5 p-4">
+                <span className="block text-sm font-medium text-ink-bright">
+                  {t('onboarding.modes.coding')}
+                  <span className="ml-2 text-[10px] font-normal uppercase tracking-wide text-signal">
+                    {t('onboarding.modes.codingOn')}
                   </span>
                 </span>
-              </label>
+                <span className="mt-1 block text-xs text-ink-mute">
+                  {t('onboarding.modes.codingHint')}
+                </span>
+              </div>
               <label className="flex cursor-pointer items-start gap-3 rounded-lg border border-ink-line bg-ink-900/60 p-4">
                 <input
                   type="checkbox"
@@ -253,9 +268,6 @@ export function OnboardingWizard({
                   </span>
                 </span>
               </label>
-              {!canAdvanceModes && (
-                <p className="text-xs text-amber-400/90">{t('onboarding.modes.required')}</p>
-              )}
             </div>
           )}
 
@@ -266,8 +278,7 @@ export function OnboardingWizard({
               </h1>
               <p className="text-sm text-ink-mute">{t('onboarding.models.body')}</p>
 
-              {codingMode && (
-                <div className="space-y-3 rounded-lg border border-ink-line bg-ink-900/50 p-4">
+              <div className="space-y-3 rounded-lg border border-ink-line bg-ink-900/50 p-4">
                   <h2 className="text-sm font-medium text-ink-bright">
                     {t('onboarding.models.chatTitle')}
                   </h2>
@@ -295,7 +306,7 @@ export function OnboardingWizard({
                     <div className="flex gap-2">
                       <select
                         value={settings.modelPath}
-                        onChange={(e) => patch('modelPath', e.target.value)}
+                        onChange={(e) => setChatPath(e.target.value)}
                         className="onb-input font-mono text-xs"
                         disabled={busy}
                       >
@@ -347,7 +358,6 @@ export function OnboardingWizard({
                     <span className="text-xs">{t('onboarding.models.loadAfter')}</span>
                   </label>
                 </div>
-              )}
 
               {imageMode && (
                 <div className="space-y-3 rounded-lg border border-ink-line bg-ink-900/50 p-4">
@@ -372,7 +382,11 @@ export function OnboardingWizard({
                   {t('onboarding.models.visionTitle')}
                 </h2>
                 <p className="text-xs leading-relaxed text-ink-mute">
-                  {t('onboarding.models.visionBody')}
+                  {chatIsOrnith
+                    ? t('onboarding.models.visionBodyOrnith')
+                    : chatIsVl
+                      ? t('onboarding.models.visionBodyCoresident')
+                      : t('onboarding.models.visionBody')}
                 </p>
                 <label className="block space-y-1">
                   <span className="text-xs text-ink-mute">
@@ -388,12 +402,14 @@ export function OnboardingWizard({
                     <option value={VISION_SAME_AS_CHAT} disabled={!settings.modelPath?.trim()}>
                       {t('settings.multimodal.visionSameAsChat')}
                     </option>
-                    {(visionModels.length > 0 ? visionModels : models).map((m) => (
-                      <option key={m.path} value={m.path}>
-                        {m.id} ({(m.sizeBytes / 1e9).toFixed(1)} GB)
-                      </option>
-                    ))}
-                    {settings.visionModelPath &&
+                    {!chatIsVl &&
+                      (visionModels.length > 0 ? visionModels : models).map((m) => (
+                        <option key={m.path} value={m.path}>
+                          {m.id} ({(m.sizeBytes / 1e9).toFixed(1)} GB)
+                        </option>
+                      ))}
+                    {!chatIsVl &&
+                      settings.visionModelPath &&
                       !isVisionSameAsChat(settings.visionModelPath) &&
                       !models.some((m) => m.path === settings.visionModelPath) && (
                         <option value={settings.visionModelPath}>
@@ -402,14 +418,66 @@ export function OnboardingWizard({
                       )}
                   </select>
                 </label>
+                {coresidentVision && (
+                  <label className="block space-y-1">
+                    <span className="text-xs text-ink-mute">
+                      {t('settings.multimodal.mmproj')}
+                    </span>
+                    <div className="flex gap-2">
+                      <select
+                        value={settings.visionMmprojPath}
+                        onChange={(e) => patch('visionMmprojPath', e.target.value)}
+                        className="onb-input font-mono text-xs"
+                        disabled={busy}
+                      >
+                        <option value="">{t('settings.multimodal.mmprojAuto')}</option>
+                        {mmprojs.map((m) => (
+                          <option key={m.path} value={m.path}>
+                            {m.id} ({(m.sizeBytes / 1e9).toFixed(1)} GB)
+                          </option>
+                        ))}
+                        {settings.visionMmprojPath &&
+                          !mmprojs.some((m) => m.path === settings.visionMmprojPath) && (
+                            <option value={settings.visionMmprojPath}>
+                              {settings.visionMmprojPath.split(/[/\\]/).pop()}
+                            </option>
+                          )}
+                      </select>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          void window.api.workspace.pickMmproj().then((p) => {
+                            if (p) patch('visionMmprojPath', p)
+                          })
+                        }}
+                        disabled={busy}
+                        className="shrink-0 rounded border border-ink-line px-2 text-xs hover:bg-ink-800 disabled:opacity-50"
+                      >
+                        {t('onboarding.file')}
+                      </button>
+                    </div>
+                  </label>
+                )}
                 <div className="flex flex-wrap gap-2">
-                  <button
-                    type="button"
-                    onClick={() => openStore('vision')}
-                    className="rounded border border-signal/40 px-3 py-1.5 text-xs text-signal hover:bg-ink-800"
-                  >
-                    {t('onboarding.models.openVisionStore')}
-                  </button>
+                  {chatIsVl ? (
+                    isVisionSameAsChat(settings.visionModelPath) ? (
+                      <button
+                        type="button"
+                        onClick={() => openStore('mmproj')}
+                        className="rounded border border-signal/40 px-3 py-1.5 text-xs text-signal hover:bg-ink-800"
+                      >
+                        {t('onboarding.models.openMmprojStore')}
+                      </button>
+                    ) : null
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => openStore('vision')}
+                      className="rounded border border-signal/40 px-3 py-1.5 text-xs text-signal hover:bg-ink-800"
+                    >
+                      {t('onboarding.models.openVisionStore')}
+                    </button>
+                  )}
                   <button
                     type="button"
                     onClick={() => {
@@ -506,9 +574,8 @@ export function OnboardingWizard({
               </button>
               <button
                 type="button"
-                disabled={!canAdvanceModes}
                 onClick={() => setStep('models')}
-                className="rounded bg-signal px-4 py-2 text-sm font-medium text-ink-950 hover:opacity-90 disabled:opacity-40"
+                className="rounded bg-signal px-4 py-2 text-sm font-medium text-ink-950 hover:opacity-90"
               >
                 {t('onboarding.next')}
               </button>
@@ -525,22 +592,26 @@ export function OnboardingWizard({
               >
                 {t('onboarding.back')}
               </button>
-              <button
-                type="button"
-                onClick={() => setStep('tip')}
-                disabled={busy}
-                className="rounded border border-ink-line px-3 py-2 text-sm text-ink-soft hover:bg-ink-800 disabled:opacity-50"
-              >
-                {t('onboarding.later')}
-              </button>
-              <button
-                type="button"
-                onClick={() => void finish()}
-                disabled={busy}
-                className="rounded bg-signal px-4 py-2 text-sm font-medium text-ink-950 hover:opacity-90 disabled:opacity-50"
-              >
-                {busy ? t('onboarding.working') : t('onboarding.finish')}
-              </button>
+              {!hasChatGguf && (
+                <button
+                  type="button"
+                  onClick={() => setStep('tip')}
+                  disabled={busy}
+                  className="rounded bg-signal px-4 py-2 text-sm font-medium text-ink-950 hover:opacity-90 disabled:opacity-50"
+                >
+                  {t('onboarding.later')}
+                </button>
+              )}
+              {hasChatGguf && (
+                <button
+                  type="button"
+                  onClick={() => void finish()}
+                  disabled={busy}
+                  className="rounded bg-signal px-4 py-2 text-sm font-medium text-ink-950 hover:opacity-90 disabled:opacity-50"
+                >
+                  {busy ? t('onboarding.working') : t('onboarding.finish')}
+                </button>
+              )}
             </>
           )}
 
@@ -585,14 +656,35 @@ export function OnboardingWizard({
         }}
         onDownloaded={(localPath) => {
           if (storeTarget === 'chat') {
-            patch('modelPath', localPath)
-            void window.api.settings.save({ modelPath: localPath })
+            setChatPath(localPath)
+            void window.api.settings.save({
+              modelPath: localPath,
+              visionModelPath: defaultVisionPathForChat(localPath, settings.visionModelPath)
+            })
             void refreshModels(settings.modelsDir, localPath)
             return
           }
           if (storeTarget === 'vision') {
             patch('visionModelPath', localPath)
             void window.api.settings.save({ visionModelPath: localPath })
+          } else if (storeTarget === 'mmproj') {
+            setSettings((prev) =>
+              prev
+                ? {
+                    ...prev,
+                    visionMmprojPath: localPath,
+                    visionModelPath: isLikelyVisionGguf(prev.modelPath)
+                      ? VISION_SAME_AS_CHAT
+                      : prev.visionModelPath
+                  }
+                : prev
+            )
+            void window.api.settings.save({
+              visionMmprojPath: localPath,
+              ...(isLikelyVisionGguf(settings.modelPath)
+                ? { visionModelPath: VISION_SAME_AS_CHAT }
+                : {})
+            })
           } else if (storeTarget === 'imageGen') {
             patch('imageGenModelPath', localPath)
             void window.api.settings.save({ imageGenModelPath: localPath })

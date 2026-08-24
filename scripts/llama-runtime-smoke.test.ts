@@ -123,6 +123,7 @@ describe('llamaSpec MTP auto', () => {
       mtpDraftMax
     } = await import('../src/shared/llamaSpec.ts')
     assert.equal(looksLikeMtpGguf('C:\\Models\\Ornith-1.0-9B-MTP-Q4_K_M.gguf'), true)
+    assert.equal(looksLikeMtpGguf('ornith-1.0-9b-1M-MTP-Q4_K_M.gguf'), true)
     assert.equal(looksLikeMtpGguf('Ornith-1.0-9B-MTP-NVFP4.gguf'), true)
     assert.equal(looksLikeMtpGguf('Devstral-Small-2-24B-Instruct-2512-IQ4_XS.gguf'), false)
     assert.equal(looksLikeNvfp4Gguf('Ornith-1.0-9B-MTP-NVFP4.gguf'), true)
@@ -235,11 +236,39 @@ describe('visionReusesChatModel', () => {
       ) > 0
     )
     assert.equal(isLikelyVisionGguf('gemma4-v2-Q6_K.gguf'), true)
+    assert.equal(isLikelyVisionGguf('ornith-1.0-9b-1M-MTP-Q4_K_M.gguf'), true)
+    assert.ok(
+      scoreMmprojForVision(
+        'C:/Models/mmproj-ornith-9b-f16.gguf',
+        'C:/Models/ornith-1.0-9b-1M-MTP-Q4_K_M.gguf'
+      ) > 0
+    )
     assert.equal(
       looksLikeMmprojMismatch(
         'mtmd_init_from_file: error: mismatch between text model (n_embd = 3840) and mmproj (n_embd = 4096) hint: you may be using wrong mmproj'
       ),
       true
+    )
+  })
+
+  it('defaults vision to Same as chat for Ornith / VL chat GGUFs', async () => {
+    const { defaultVisionPathForChat, VISION_SAME_AS_CHAT } = await import(
+      '../src/shared/visionDetect.ts'
+    )
+    assert.equal(
+      defaultVisionPathForChat('ornith-1.0-9b-1M-MTP-Q4_K_M.gguf', ''),
+      VISION_SAME_AS_CHAT
+    )
+    assert.equal(
+      defaultVisionPathForChat('Llama-3.2-3B-Instruct-Q4_K_M.gguf', VISION_SAME_AS_CHAT),
+      ''
+    )
+    assert.equal(
+      defaultVisionPathForChat(
+        'Llama-3.2-3B-Instruct-Q4_K_M.gguf',
+        'D:/models/Qwen3VL-8B-Instruct-Q4_K_M.gguf'
+      ),
+      'D:/models/Qwen3VL-8B-Instruct-Q4_K_M.gguf'
     )
   })
 })
@@ -305,5 +334,33 @@ describe('Ornith defaults + chat apply', () => {
     assert.ok(diff)
     assert.match(diff.function.description, /Chat/i)
     assert.doesNotMatch(diff.function.description, /coresident apply model/i)
+  })
+})
+
+describe('Ornith 1M staff picks', () => {
+  it('pins satgeze 1M Q4 as chat staff pick and vision mmproj pair', async () => {
+    const {
+      HF_RECOMMENDED_MODELS,
+      HF_VISION_RECOMMENDED_MODELS,
+      HF_TIER_STAFF_FILES,
+      selectRecommendedForVram,
+      staffFilesForGpu
+    } = await import('../src/shared/hfStore.ts')
+    const chat = HF_RECOMMENDED_MODELS.find(
+      (m) => m.preferredFile === 'ornith-1.0-9b-1M-MTP-Q4_K_M.gguf'
+    )
+    assert.ok(chat)
+    assert.equal(chat.repoId, 'satgeze/Ornith-1.0-9B-1M-GGUF')
+    assert.equal(chat.preferredMmproj, 'mmproj-ornith-9b-f16.gguf')
+    const vision = HF_VISION_RECOMMENDED_MODELS[0]
+    assert.equal(vision.repoId, 'satgeze/Ornith-1.0-9B-1M-GGUF')
+    assert.equal(vision.preferredFile, 'ornith-1.0-9b-1M-MTP-Q4_K_M.gguf')
+    assert.equal(vision.preferredMmproj, 'mmproj-ornith-9b-f16.gguf')
+    assert.equal(HF_TIER_STAFF_FILES['8'][0], 'ornith-1.0-9b-1M-MTP-Q4_K_M.gguf')
+    assert.equal(staffFilesForGpu(8)[0], 'ornith-1.0-9b-1M-MTP-Q4_K_M.gguf')
+    assert.equal(
+      selectRecommendedForVram(12, 6)[0]?.preferredFile,
+      'ornith-1.0-9b-1M-MTP-Q4_K_M.gguf'
+    )
   })
 })

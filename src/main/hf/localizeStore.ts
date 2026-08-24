@@ -1,5 +1,6 @@
 import {
   HF_RECOMMENDED_MODELS,
+  HF_VISION_RECOMMENDED_MODELS,
   type HfModelDetail,
   type HfModelListItem,
   type HfStoreHomeResult
@@ -8,11 +9,16 @@ import type { UiLanguage } from '../../shared/i18n'
 import { translateEnToRu, translateMarkdownEnToRu } from './translateRu'
 
 function curatedRu(repoId: string, preferredFile?: string): string | undefined {
-  const hits = HF_RECOMMENDED_MODELS.filter((r) => r.repoId === repoId)
+  const catalogs = [...HF_RECOMMENDED_MODELS, ...HF_VISION_RECOMMENDED_MODELS]
+  const hits = catalogs.filter((r) => r.repoId === repoId)
   if (!hits.length) return undefined
   const hit =
     (preferredFile
-      ? hits.find((h) => h.preferredFile === preferredFile)
+      ? hits.find(
+          (h) =>
+            h.preferredFile === preferredFile ||
+            h.preferredMmproj === preferredFile
+        )
       : undefined) ?? hits[0]
   return hit?.descriptionRu
 }

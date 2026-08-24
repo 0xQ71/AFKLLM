@@ -13,7 +13,7 @@ export function scoreVisionGguf(pathOrName: string): number {
   if (/minicpm[-_.]?v|minicpm.v/.test(n)) return 88
   if (/llava|moondream|internvl|pixtral|idefics/.test(n)) return 70
   if (/gemma[-_.]?[34]|gemma[34]/.test(n)) return 55
-  if (/ornith/.test(n) && /vision|vl/.test(n)) return 60
+  if (/ornith/.test(n)) return 60
   if (/\bvl\b|vision/.test(n)) return 60
   return -1
 }
@@ -34,6 +34,19 @@ export const VISION_SAME_AS_CHAT = '__same_as_chat__'
 
 export function isVisionSameAsChat(path?: string | null): boolean {
   return (path ?? '').trim() === VISION_SAME_AS_CHAT
+}
+
+/**
+ * Chat is already VL (Ornith 1M, Qwen-VL, …) → reuse it (mmproj on the same
+ * llama-server). Leaving a VL chat for a text-only GGUF clears “Same as chat”.
+ */
+export function defaultVisionPathForChat(
+  chatPath: string,
+  currentVisionPath?: string | null
+): string {
+  if (isLikelyVisionGguf(chatPath)) return VISION_SAME_AS_CHAT
+  if (isVisionSameAsChat(currentVisionPath)) return ''
+  return currentVisionPath?.trim() ?? ''
 }
 
 /** Family token for VL weights / mmproj (null = unknown). */
