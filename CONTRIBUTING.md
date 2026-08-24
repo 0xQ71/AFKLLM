@@ -13,7 +13,6 @@ See [docs/guides/development.md](docs/guides/development.md) for stack details, 
 ## Before opening a PR
 
 - Run `npm run typecheck`
-- Run `npm run test:smoke` when your change touches agent, git, LSP, runtime, or MCP
 - Keep PRs focused; describe what / why / how you tested
 
 ## Issues

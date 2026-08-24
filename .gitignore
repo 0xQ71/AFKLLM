@@ -16,3 +16,5 @@ release
 build/afkllm-codesign-dev.pfx
 build/codesign-dev.env
 third_party/llama.cpp/
+scripts/*-smoke.test.ts
+scripts/_probe-chain.ts

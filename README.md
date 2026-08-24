@@ -210,7 +210,6 @@ Optional offline backend: put an official llama.cpp Windows build in `./bin/`.
 
 ```bash
 npm run typecheck
-npm run test:smoke
 npm run dist          # NSIS setup → ./release/
 ```
 
@@ -237,7 +236,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
 
 1. **Fork** the repository and clone your fork
 2. **Create a branch** for your change
-3. Run `npm run typecheck` (and `npm run test:smoke` when touching agent / git / LSP / runtime / MCP)
+3. Run `npm run typecheck`
 4. **Open a Pull Request** — what / why / how you tested
 
 Thank you for your support and contributions!

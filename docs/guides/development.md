@@ -30,7 +30,7 @@ Defaults (overridable in Settings): `http://127.0.0.1:8080`, high GPU layer coun
 |---------|---------|
 | `npm run dev` | Electron + Vite HMR |
 | `npm run typecheck` | `tsc` for main + renderer |
-| `npm run test:smoke` | Node smoke tests |
+| `npm test` | Public unit tests (`scripts/stack-detect.test.ts`) |
 | `npm run dist` | Build + NSIS setup → `./release/` (unsigned locally) |
 | `npm run verify:installer` | Silent install smoke + Authenticode report (`-RequireSigned` after SignPath) |
 | `npm run dist:dir` | Unpacked dir only |

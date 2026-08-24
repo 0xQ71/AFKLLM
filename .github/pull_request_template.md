@@ -9,7 +9,6 @@ After:
 ### Test plan
 
 - [ ] `npm run typecheck`
-- [ ] `npm run test:smoke` (or relevant subset)
 - [ ] Manual check (describe)
 
 ### Notes for reviewers
