@@ -2927,11 +2927,20 @@ describe('honest evidence and truncation helpers', () => {
     const cliCloser = fallbackWorkDoneCloser({
       lang: 'ru',
       paths: ['wordfreq.go'],
-      previewOpened: false
+      previewOpened: false,
+      cliVerified: true
     })
     assert.match(cliCloser, /wordfreq\.go/)
     assert.match(cliCloser, /чипе терминала/)
     assert.doesNotMatch(cliCloser, /npm run dev/)
+    const cliFilesOnly = fallbackWorkDoneCloser({
+      lang: 'ru',
+      paths: ['wordfreq.go'],
+      previewOpened: false
+    })
+    assert.match(cliFilesOnly, /wordfreq\.go/)
+    assert.doesNotMatch(cliFilesOnly, /запущена/)
+    assert.doesNotMatch(cliFilesOnly, /npm run dev/)
     const poisoned = resolveTurnCloser({
       lastClosingText: 'Зависимости установлены успешно. Теперь запускаю npm run dev.',
       lang: 'ru',
@@ -2997,10 +3006,27 @@ describe('honest evidence and truncation helpers', () => {
       lastClosingText: 'Компилятор csc зависает, повтор той же команды бесполезен.',
       lang: 'ru',
       paths: ['WordFreq.cs'],
-      previewOpened: false
+      previewOpened: false,
+      cliVerified: true
     })
     assert.doesNotMatch(hang, /зависает/)
     assert.match(hang, /чипе терминала/)
+    assert.equal(
+      isNextActionNarration(
+        'Файл создан, но я забыл добавить импорт sort в код. Нужно исправить это. Заметка: забыл добавить импорт sort. Исправлю это.'
+      ),
+      true
+    )
+    const leftover = resolveTurnCloser({
+      lastClosingText:
+        'Файл создан, но я забыл добавить импорт sort в код. Нужно исправить это. Заметка: забыл добавить импорт. Исправлю это.',
+      lang: 'ru',
+      paths: ['wordfreq.go'],
+      previewOpened: false,
+      cliVerified: true
+    })
+    assert.doesNotMatch(leftover, /забыл|Исправлю/)
+    assert.match(leftover, /чипе терминала/)
   })
 
   it('truncationGuardMessage fires below 70% and respects allow_full_rewrite', () => {

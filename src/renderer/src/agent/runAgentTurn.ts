@@ -106,6 +106,7 @@ import {
   settlePlanAfterWork,
   isJunkPlanStep,
   isFalseSuccessProse,
+  isHostWorkDoneCloser,
   preferUserFacingCloser,
   looksTruncatedCloser,
   isRedundantPlanCompleteProse,
@@ -927,7 +928,7 @@ function ensureClosingMessage(
 ): void {
   const content = stripThinkBlocks(text).trim()
   if (!content || /^↻ /.test(content) || /^⏹ /.test(content)) return
-  const hostCloser = /превью\s+открыто в приложении|preview is open in the app/i.test(content)
+  const hostCloser = isHostWorkDoneCloser(content)
   if (!hostCloser && isAgentChatNoise(content) && content.length < 80) return
   const id = closingMessageId(userMessageId)
   for (let i = messages.length - 1; i >= 0; i--) {
@@ -2274,12 +2275,16 @@ export async function runAgentTurn(params: {
     if (!htmlPreviewOpened && transcriptOpenedPreview(msgs)) {
       htmlPreviewOpened = true
     }
-    if (htmlPreviewOpened && (mutatingEditOk || turnFileChanges.size > 0)) {
+    const shouldPinWorkCloser =
+      (htmlPreviewOpened && (mutatingEditOk || turnFileChanges.size > 0)) ||
+      (ranCliSmoke && mutatingEditOk && !mutatingEditFailed)
+    if (shouldPinWorkCloser) {
       lastClosingText = resolveTurnCloser({
         lastClosingText,
         lang: uiLang,
         paths: [...turnFileChanges.keys()],
-        previewOpened: true
+        previewOpened: htmlPreviewOpened,
+        cliVerified: ranCliSmoke
       })
       ensureClosingMessage(msgs, userMessageId, lastClosingText)
     } else if (lastClosingText.trim()) {
@@ -3167,7 +3172,8 @@ export async function runAgentTurn(params: {
       lastClosingText,
       lang: uiLang,
       paths: [...turnFileChanges.keys()],
-      previewOpened: htmlPreviewOpened
+      previewOpened: htmlPreviewOpened,
+      cliVerified: ranCliSmoke
     })
     lastClosingText = closer
     ensureClosingMessage(messages, userMessageId, closer)
@@ -6578,6 +6584,7 @@ export async function runAgentTurn(params: {
       ensureClosingMessage(messages, userMessageId, honest)
     } else if (
       finalText.trim() &&
+      !isNextActionNarration(finalText) &&
       (concludeAsked ||
         looksLikeClosingSummary(finalText) ||
         (completedTools > 0 && finalText.trim().length >= 60))

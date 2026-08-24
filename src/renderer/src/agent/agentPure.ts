@@ -1307,11 +1307,18 @@ export function countOccurrencesCi(content: string, needle: string): number {
   return content.match(new RegExp(escaped, 'gi'))?.length ?? 0
 }
 
+/** Host-authored turn closer (preview or CLI stdout) — never treat as noise. */
+export function isHostWorkDoneCloser(text: string): boolean {
+  return /превью\s+открыто в приложении|preview is open in the app|чипе терминала|terminal chip/i.test(
+    text ?? ''
+  )
+}
+
 /** Think/plan claiming the job is already done before any tools ran. */
 export function isFalseSuccessProse(prose: string): boolean {
   const t = prose.trim()
   if (!t) return false
-  if (/превью\s+открыто в приложении|preview is open in the app/i.test(t)) return false
+  if (isHostWorkDoneCloser(t)) return false
   return (
     /^(готово|сделано|done)[!.,:\s]/i.test(t) ||
     /все\s+упоминания\s+\w+\s+заменен/i.test(t) ||
