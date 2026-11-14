@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AFKLLM — Local AI Coding IDE for Windows</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <nav class="navbar">
+        <div class="container nav-container">
+            <a href="#" class="nav-brand">AFKLLM</a>
+            <div class="lang-switcher">
+                <button class="lang-btn active" data-lang="ru">RU</button>
+                <button class="lang-btn" data-lang="en">EN</button>
+            </div>
+        </div>
+    </nav>
+
+    <header class="hero">
+        <div class="container hero-content">
+            <div class="hero-badge dot"></div>
+            <h1 class="gradient-text">AFKLLM</h1>
+            <p class="hero-subtitle" data-i18n="heroSubtitle">Local AI coding IDE for Windows — Agent-first, on-device intelligence.</p>
+            <div class="hero-buttons">
+                <a href="https://github.com/0xQ71/AFKLLM/releases" class="btn btn-primary" data-i18n="ctaDownload">Download for Windows</a>
+                <a href="https://github.com/0xQ71/AFKLLM" class="btn btn-secondary" data-i18n="ctaGitHub">View on GitHub</a>
+            </div>
+        </div>
+    </header>
+
+    <section class="features">
+        <div class="container">
+            <h2 class="section-label" data-i18n="featuresTitle">Features</h2>
+            <div class="features-grid">
+                <div class="feature-card">
+                    <div class="feature-icon">🤖</div>
+                    <h3 data-i18n="featAgentTitle">Agent-first IDE</h3>
+                    <p data-i18n="featAgentDesc">Chat and tools on the left, editor / browser / terminal on the right — agent-driven workflow.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">🧠</div>
+                    <h3 data-i18n="featModelsTitle">Local Models</h3>
+                    <p data-i18n="featModelsDesc">Read, write, patch GGUF models. Terminal, search, git, web search — all on-device.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">💻</div>
+                    <h3 data-i18n="featEditorTitle">Monaco Editor</h3>
+                    <p data-i18n="featEditorDesc">FIM ghost text, Ctrl+K inline edit — the same editor you know and love.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">👁️</div>
+                    <h3 data-i18n="featVisionTitle">Vision & Images</h3>
+                    <p data-i18n="featVisionDesc">Attach vision images, generate images locally with FLUX / sd-cli.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">🔒</div>
+                    <h3 data-i18n="featPrivacyTitle">Privacy First</h3>
+                    <p data-i18n="featPrivacyDesc">Core loop runs on-device. MIT license. Windows x64 installer from Releases.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">📦</div>
+                    <h3 data-i18n="featStoreTitle">HF Store</h3>
+                    <p data-i18n="featStoreDesc">Browse and manage models from Hugging Face store directly in the IDE.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section class="how-it-works">
+        <div class="container">
+            <h2 class="section-label" data-i18n="howWorksTitle">How It Works</h2>
+            <div class="steps">
+                <div class="step">
+                    <div class="step-number">1</div>
+                    <div class="step-content">
+                        <h3 data-i18n="howWorksStep1">Install AFKLLM</h3>
+                        <p data-i18n="howWorksStep2">Download the Windows x64 installer from GitHub Releases and install.</p>
+                    </div>
+                </div>
+                <div class="step">
+                    <div class="step-number">2</div>
+                    <div class="step-content">
+                        <h3 data-i18n="howWorksStep3">Add Models</h3>
+                        <p data-i18n="howWorksStep4">Browse Hugging Face store or add local GGUF files. Read, write, patch models on-device.</p>
+                    </div>
+                </div>
+                <div class="step">
+                    <div class="step-number">3</div>
+                    <div class="step-content">
+                        <h3 data-i18n="howWorksStep5">Start Coding</h3>
+                        <p data-i18n="howWorksStep6">Chat with your local model, use tools, edit in Monaco — all locally, no cloud.</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section class="why-local">
+        <div class="container">
+            <h2 class="section-label" data-i18n="whyLocalTitle">Why Local?</h2>
+            <div class="why-grid">
+                <div class="why-card">
+                    <h3 data-i18n="whyLocalPoint1">Privacy</h3>
+                    <p data-i18n="whyLocalPoint1Desc">Your code, your models, your data — never sent to a cloud server.</p>
+                </div>
+                <div class="why-card">
+                    <h3 data-i18n="whyLocalPoint2">Offline</h3>
+                    <p data-i18n="whyLocalPoint2Desc">Works without internet. No API keys, no subscriptions, no dependencies.</p>
+                </div>
+                <div class="why-card">
+                    <h3 data-i18n="whyLocalPoint3">Control</h3>
+                    <p data-i18n="whyLocalPoint3Desc">Choose your model, tune parameters, patch weights — full control over your stack.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section class="download">
+        <div class="container">
+            <h2 class="section-label" data-i18n="downloadTitle">Download</h2>
+            <p class="download-desc" data-i18n="downloadSubtitle">Windows x64 installer — MIT license.</p>
+            <a href="https://github.com/0xQ71/AFKLLM/releases" class="btn btn-primary" data-i18n="ctaDownload">Download for Windows</a>
+        </div>
+    </section>
+
+    <footer class="footer">
+        <div class="container">
+            <div class="footer-links">
+                <a href="https://github.com/0xQ71/AFKLLM" data-i18n="footerGitHub">GitHub</a>
+                <a href="https://github.com/0xQ71/AFKLLM/releases" data-i18n="footerReleases">Releases</a>
+            </div>
+            <p class="footer-copy" data-i18n="footerText">© 2026 AFKLLM. MIT License.</p>
+        </div>
+    </footer>
+
+    <script src="js/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,10 @@
+{
+  "name": "dsh-image-afkllm",
+  "version": "1.0.0",
+  "description": "DeepSeek Harness slash command /image: sends the prompt as written straight to AFKLLM's image generator (afk api MCP generate_image, Qwen-Image), without the language model",
+  "type": "module",
+  "main": "index.js",
+  "exports": { ".": "./index.js", "./package.json": "./package.json" },
+  "license": "MIT",
+  "private": true
+}

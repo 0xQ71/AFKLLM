@@ -1,0 +1,6 @@
+id,customer,day,qty,price,discount
+A100,Ivanov,03.02.2026,3,199.90,
+A101,Petrova,15.01.2026,1,1250.00,10%
+A102,Sidorov,28.12.2025,10,15.50,
+A103,Ivanov,07.01.2026,2,499.99,5%
+A104,Kuznetsova,03.02.2025,4,75.25,

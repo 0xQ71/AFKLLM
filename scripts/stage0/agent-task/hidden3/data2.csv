@@ -1,0 +1,6 @@
+id,customer,day,qty,price,discount
+Z1,Orlov,31.12.2024,1,10.00,15%
+Z2,Belova,01.01.2025,7,3.33,
+Z3,Orlov,09.11.2025,2,1000.00,50%
+Z4,Nikitin,10.10.2025,5,19.99,
+Z5,Belova,02.01.2025,1,0.99,1%

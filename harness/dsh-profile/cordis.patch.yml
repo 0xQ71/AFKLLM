@@ -1,0 +1,447 @@
+# Your patch layer for this dsh profile, applied after every bundle layer:
+# a top-level YAML array of loader patch entries (id-targeted config
+# overrides, disables, and insert lists; `!!js` expressions allowed).
+#
+# AFKLLM setup. Backend: `afk api` (scripts\afk.cmd api, or scripts\harness.cmd) =
+#   http://127.0.0.1:18300/v1   llama-server, Qwen3.8 27B + MTP @104K, vision projector (mmproj, CPU)
+#   http://127.0.0.1:18300/mcp  AFKLLM tools: generate_image (Qwen-Image 2.1, GPU swap), screenshot
+#   http://127.0.0.1:18300/search  keyless multi-engine search behind the harness's own web_search (plugin
+#                                  dsh-web-search-afkllm = <AFKLLM>\harness\dsh-web-search-afkllm, linked)
+# Start `afk api` before the harness (or reload the harness after it is up).
+- id: ui-theme
+  name: "@deepseek-ai/dsh-client-ui-theme"
+  config:
+    preference: dark
+
+- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers:
+      afkllm:
+        displayName: AFKLLM (local)
+        api: openai-completions
+        baseURL: http://127.0.0.1:18300/v1
+        apiKeyEnv: AFKLLM_API_KEY
+        # a 100K-token prefill streams nothing for minutes, and chat requests wait while an image is generated
+        streamIdleTimeoutMs: 900000
+        # images go to the model at most ~1366x768 (~1M px = ~1100 tokens). The vision projector runs on the CPU
+        # (the GPU keeps the 104K context): a 1920x1080 screenshot took 36 s and 2107 tokens, 1366x768 takes 15 s and
+        # 1099 tokens and the text on screen stays readable (measured 2026-11-13). llama-server allows up to 2048.
+        requestImagePixelBudget: 1048576
+        retryPolicy:
+          mode: normal
+          # survives a restart of `afk api` (the model reloads in ~10 s)
+          maxRetries: 8
+        models:
+          # afk api loads the profile a request names: picking another model here reloads llama (~10-20 s)
+          # and the conversation is re-read. An id may also be a .gguf path (the first profile using that file).
+          - id: q38
+            name: Qwen 3.8 27B · 104K · fast (q38)
+            contextWindow: 106496
+            # one step = up to 16K thinking (llama-server --reasoning-budget 16384) + the answer / tool call
+            maxTokens: 24576
+            input: [text, image]
+            # thinking is always on; the Qwen3.8 template knows low / medium / xhigh
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: xhigh
+            compat:
+              thinkingFormat: chat-template
+              chatTemplateKwargs:
+                enable_thinking: true
+                # keep earlier thinking in the prompt: stable prefix (KV reuse) and the model keeps its train of thought
+                preserve_thinking: true
+                reasoning_effort:
+                  $var: thinking.effort
+              supportsReasoningEffort: false
+              supportsDeveloperRole: false
+              supportsStrictMode: false
+              maxTokensField: max_tokens
+          - id: q38-128k
+            name: Qwen 3.8 27B · 128K · ~1/3 slower (q38-128k)
+            contextWindow: 131072
+            maxTokens: 24576
+            input: [text, image]
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: xhigh
+            compat:
+              thinkingFormat: chat-template
+              chatTemplateKwargs:
+                enable_thinking: true
+                preserve_thinking: true
+                reasoning_effort:
+                  $var: thinking.effort
+              supportsReasoningEffort: false
+              supportsDeveloperRole: false
+              supportsStrictMode: false
+              maxTokensField: max_tokens
+          - id: q38-160k
+            name: Qwen 3.8 27B · 160K · no MTP, ~2x slower (q38-160k)
+            contextWindow: 163840
+            maxTokens: 24576
+            input: [text, image]
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: xhigh
+            compat:
+              thinkingFormat: chat-template
+              chatTemplateKwargs:
+                enable_thinking: true
+                preserve_thinking: true
+                reasoning_effort:
+                  $var: thinking.effort
+              supportsReasoningEffort: false
+              supportsDeveloperRole: false
+              supportsStrictMode: false
+              maxTokensField: max_tokens
+
+- id: agent-default-model
+  name: "@deepseek-ai/dsh-agent-default-model"
+  config:
+    provider: afkllm
+    model: q38
+    reasoningEffort: high
+
+# Session title: one LLM request per new chat, on its first message (first-prompt provider), in the message's
+# language. It picks the model's lowest effort (low: thinking stays on, but short), so it costs ~5-20 s once;
+# afk api's RAM prompt cache (--cache-ram) gives the conversation its KV state back in ~3 s afterwards.
+- id: session-title-llm
+  disabled: false
+  # a row's config replaces the bundle's whole config: every required field is repeated here
+  config:
+    targetWords: 5
+    targetCjkCharacters: 10
+    maxInputBytes: 4096
+    maxOutputTokens: 2048
+    timeoutMs: 120000
+
+# Reasoning translation (bundle dsh-experimental-cot-translation-bundle in package.json): expanded thinking is
+# shown in Russian on demand. Display only — the model and the session keep the original. The text goes to the
+# anonymous Bing translator (an outside service), not to the local model, so the GPU is not touched.
+- id: cot-translation
+  config:
+    provider: bing
+    targetLanguage: ru
+
+# The AFKLLM agent preset (default for new sessions): the shipped `standard` preset, plus
+#   - AFKLLM MCP tools (generate_image, screenshot),
+#   - web_search / web_fetch of the harness, searching through AFKLLM (no account, no keys),
+#   - compaction sized for a 104K window (the default 64K headroom would compact at ~6K tokens).
+- insert:
+    - id: preset-afkllm
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: afkllm
+        name: AFKLLM
+        description: Local Qwen3.8 27B with vision, image generation and long-session compaction
+        order: 0
+        plugins:
+          - &afk_persona
+            id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: >-
+                You are AFKLLM, a careful local coding agent (Qwen3.8 27B with vision) working on the user's
+                Windows PC. You think before every step, verify facts with tools instead of guessing, and finish
+                long tasks end to end.
+          - &afk_agent_instructions
+            id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            config:
+              maxBytes: 65536
+          - &afk_time_context
+            id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          - &afk_tool_bash
+            id: tool-bash
+            name: '@deepseek-ai/dsh-tool-bash'
+            disabled: !!js process.platform === 'win32'
+          - &afk_tool_pwsh
+            id: tool-pwsh
+            name: '@deepseek-ai/dsh-tool-pwsh'
+            disabled: !!js process.platform !== 'win32'
+          - &afk_tool_fs
+            id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+          - &afk_tool_fs_search
+            id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+          - &afk_tool_jobs
+            id: tool-jobs
+            name: '@deepseek-ai/dsh-tool-jobs'
+          - &afk_tool_schedule
+            id: tool-schedule
+            name: '@deepseek-ai/dsh-tool-schedule'
+          - &afk_skill_filesystem
+            id: skill-filesystem
+            name: '@deepseek-ai/dsh-skill-filesystem'
+          - &afk_tool_skill
+            id: tool-skill
+            name: '@deepseek-ai/dsh-tool-skill'
+          - &afk_command_goal
+            id: command-goal
+            name: '@deepseek-ai/dsh-command-goal'
+          - &afk_tool_goal
+            id: tool-goal
+            name: '@deepseek-ai/dsh-tool-goal'
+          - &afk_planning
+            id: planning
+            name: cordis:group
+            group: true
+            isolate:
+              planMode: true
+            config:
+              - id: plan-mode
+                name: '@deepseek-ai/dsh-plan-mode'
+                config:
+                  section: |
+                    You are in plan mode. Stay in plan mode until the user approves your plan through exit_plan_mode or switches the session mode. Imperative language to implement changes means plan the implementation, not execute it. A user's conversational agreement — including an answer confirming something you asked — approves nothing and does not end plan mode; fold the confirmed decision into the plan and submit it through exit_plan_mode.
+
+                    Explore first. Use non-mutating reads, searches, static analysis, and checks to ground the plan in the actual repository. Do not edit or write files, change configuration, run formatters or code generation that rewrites tracked files, commit, or otherwise carry out the plan. Prefer existing functions and patterns over new machinery.
+
+                    The tool catalog stays the same across modes for request-cache stability. These plan-mode rules override any later tool description or guidance that suggests using mutation tools; those tools remain listed to keep the tool catalog unchanged. Do not use todo_write to track this planning phase: it tracks implementation after an approved plan, while the plan itself belongs in exit_plan_mode.
+
+                    Resolve discoverable facts by inspection. Use ask_user_question only for user-owned choices or material ambiguity that inspection cannot answer. Do not ask the user where code lives or how current behavior works when you can find out.
+
+                    Make the plan decision-complete: state the goal and success criteria; group implementation changes by subsystem; identify public API, schema, and data-flow changes; cover edge cases, failure modes, tests, acceptance criteria, and explicit assumptions. Keep it concise enough to review but detailed enough that another engineer can implement it without making design decisions.
+
+                    When ready, call exit_plan_mode with the complete plan markdown, starting with a # title. Make exit_plan_mode the only and final tool call in that assistant response: it presents the plan for approval, and implementation begins only in a later step after approval. Do not paste the final plan as a plain reply or ask "should I proceed?" through prose or ask_user_question. If review rejects it, incorporate the feedback and present again. If the review channel is unavailable or aborted, stay in plan mode and ask the user to switch modes manually; do not proceed with implementation.
+          - &afk_compaction
+            id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              # W = 106496, O = 24576: compaction starts at min(0.8 W, W - O - 6144) = ~75.8K tokens,
+              # keeps the newest 16K verbatim, and the summary may think (16K cap) and still fit the window.
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+                config:
+                  headroomTokens: 6144
+                  retainTokens: 16384
+                  # the summary request also thinks (up to 16K, llama --reasoning-budget): room for both
+                  maxTokens: 24576
+              - id: command-compact
+                name: '@deepseek-ai/dsh-command-compact'
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config:
+                  thresholdChars: 8192
+                  headChars: 4096
+                  tailChars: 1024
+          - &afk_delegation
+            id: delegation
+            name: cordis:group
+            group: true
+            isolate:
+              workflowEngine: true
+            config:
+              - id: tool-subagent-control
+                name: '@deepseek-ai/dsh-tool-subagent-control'
+              - id: tool-subagent-list-agents
+                name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'
+              - id: tool-subagent
+                name: '@deepseek-ai/dsh-tool-subagent'
+                config:
+                  provider: spawn
+                  toolName: subagent
+                  modelSelectionSettings: true
+              - id: tool-subagent-fork
+                name: '@deepseek-ai/dsh-tool-subagent'
+                config:
+                  provider: fork
+                  toolName: subagent_fork
+              - id: workflow-ptc
+                name: '@deepseek-ai/dsh-workflow-ptc'
+                config:
+                  provider: spawn
+              - id: tool-workflow
+                name: '@deepseek-ai/dsh-tool-workflow'
+          - &afk_tool_ask_user
+            id: tool-ask-user
+            name: '@deepseek-ai/dsh-tool-ask-user'
+          - &afk_tool_todo
+            id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+            config:
+              allowParallelInProgress: false
+          - &afk_tool_web
+            id: tool-web
+            name: '@deepseek-ai/dsh-tool-web'
+            config:
+              # web_search runs through the afkllm provider (below), so the harness shows its own search card
+              search: true
+              searchMaxResults: 8
+              searchTimeoutMs: 60000
+              fetch: true
+              fetchTimeoutMs: 60000
+          - &afk_present
+            id: present
+            name: '@deepseek-ai/dsh-tool-present'
+          - &afk_mcp_afkllm
+            id: mcp-afkllm
+            name: '@deepseek-ai/dsh-mcp-client'
+            config:
+              serverName: afkllm
+              transport: streamable-http
+              # web_search comes from the harness tool above; the MCP copy is hidden
+              url: http://127.0.0.1:18300/mcp?exclude=web_search&images=path
+              # an image takes 1-3 min (LLM unload, ComfyUI, LLM + KV cache back)
+              toolCallTimeoutMs: 900000
+              reconnect:
+                enabled: true
+                initialDelayMs: 1000
+                maxDelayMs: 30000
+                maxAttempts: 1000
+          - &afk_mcp_context7
+            id: mcp-context7
+            name: '@deepseek-ai/dsh-mcp-client'
+            config:
+              # up-to-date docs and code examples of libraries / engines (keyless public endpoint; the query text
+              # is sent to context7.com): resolve-library-id, then query-docs
+              serverName: context7
+              transport: streamable-http
+              url: https://mcp.context7.com/mcp
+              toolCallTimeoutMs: 60000
+          - &afk_tool_plugin_manager
+            id: tool-plugin-manager
+            name: '@deepseek-ai/dsh-plugin-manager/tools'
+            disabled: true
+          - &afk_tool_plugin_market
+            id: tool-plugin-market
+            name: '@deepseek-ai/dsh-plugin-market/tools'
+            disabled: true
+
+# The same agent plus a browser it drives (Playwright MCP over the installed Microsoft Edge): open the dev server or a
+# web build, click through it, read the console and network, take screenshots. Separate preset because its 25 tools
+# cost ~6K tokens of every prompt; pick "AFKLLM + браузер" for web work.
+- insert:
+    - id: preset-afkllm-web
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: afkllm-web
+        name: AFKLLM + браузер
+        description: The AFKLLM agent plus a real browser (Edge via Playwright MCP) for web apps and HTML5 games
+        order: 1
+        plugins:
+          - *afk_persona
+          - *afk_agent_instructions
+          - *afk_time_context
+          - *afk_tool_bash
+          - *afk_tool_pwsh
+          - *afk_tool_fs
+          - *afk_tool_fs_search
+          - *afk_tool_jobs
+          - *afk_tool_schedule
+          - *afk_skill_filesystem
+          - *afk_tool_skill
+          - *afk_command_goal
+          - *afk_tool_goal
+          - *afk_planning
+          - *afk_compaction
+          - *afk_delegation
+          - *afk_tool_ask_user
+          - *afk_tool_todo
+          - *afk_tool_web
+          - *afk_present
+          - *afk_mcp_afkllm
+          - *afk_mcp_context7
+          - *afk_tool_plugin_manager
+          - *afk_tool_plugin_market
+          - id: mcp-browser
+            name: '@deepseek-ai/dsh-mcp-client'
+            config:
+              serverName: browser
+              transport: stdio
+              command: C:\Program Files\nodejs\node.exe
+              args:
+                - !!js process.env.USERPROFILE + '\\.dsh\\mcp\\playwright\\node_modules\\@playwright\\mcp\\cli.js'
+                - --browser
+                - msedge
+                - --output-dir
+                - !!js process.env.USERPROFILE + '\\.dsh\\mcp\\playwright\\output'
+              toolCallTimeoutMs: 120000
+
+# Permissions: the shipped three plus workspace-auto = the workspace sandbox (writes only inside the project) without
+# approval prompts, the closest to Claude Code's accept-edits flow. Switch with /permission workspace-auto.
+- id: permission
+  config:
+    presets:
+      read-only:
+        sandbox: read-only
+        approval: ask
+      workspace-write:
+        sandbox: workspace-write
+        approval: ask
+      workspace-auto:
+        name: Проект без вопросов
+        description: Пишет только внутри проекта, команды и правки без подтверждений
+        sandbox: workspace-write
+        approval: never
+      danger-full-access:
+        sandbox: danger-full-access
+        approval: never
+    defaultPreset: workspace-write
+
+# Search provider for the harness web_search: AFKLLM (afk api /search), instead of DeepSeek's (needs an account).
+- id: web
+  config:
+    searchProvider: afkllm
+    # (a row config replaces the whole bundle config: keep the fetch provider too)
+    fetchProvider: http
+- insert:
+    - id: web-search-afkllm
+      name: dsh-web-search-afkllm
+
+- id: agent-preset-registry
+  config:
+    default: afkllm
+
+- id: ui-chat
+  name: "@deepseek-ai/dsh-client-ui-chat"
+  config:
+    transcriptView: standard
+    performanceUsage: detailed
+
+- id: ui-settings
+  name: "@deepseek-ai/dsh-client-ui-settings"
+  config:
+    enabled: true
+
+- id: ui-settings-account
+  name: "@deepseek-ai/dsh-client-ui-settings-account"
+  config:
+    version: 1
+    step: done
+    usage: detailed
+    developerTools: true
+    purpose: null
+    process: standard
+    completion: api-key
+
+# /image and /image-clean (<AFKLLM>\harness\dsh-image-afkllm, linked): private, fully local image generation
+# straight from the prompt, without the language model. The agent's own generate_image tool is unchanged.
+- insert:
+    - id: image-command-afkllm
+      name: dsh-image-afkllm
+
+# No telemetry: nothing leaves the PC. Product usage events and the session upload that
+# FEEDBACK_ONLY would do after a rating or /feedback (the whole session log) are both off.
+- id: session-telemetry-otel
+  config:
+    mode: DISABLED
+    shutdownTimeoutMillis: 3000
+- id: product-analytics
+  config:
+    enabled: false
+    appVersion: !!js process.env.DSH_CLIENT_VERSION
+- id: desktop-product-telemetry
+  disabled: true

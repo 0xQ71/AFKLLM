@@ -1,0 +1,10 @@
+{
+  "name": "dsh-web-search-afkllm",
+  "version": "1.0.0",
+  "description": "DeepSeek Harness search provider backed by AFKLLM (afk api /search): keyless multi-engine web search, shown in the harness's own web_search card",
+  "type": "module",
+  "main": "index.js",
+  "exports": { ".": "./index.js", "./package.json": "./package.json" },
+  "license": "MIT",
+  "private": true
+}
