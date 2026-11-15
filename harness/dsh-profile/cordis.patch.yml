@@ -244,16 +244,20 @@
             isolate:
               workflowEngine: true
             config:
+              # Harness 0.2.1+: the control row registers send_message, interrupt_agent and list_agents together
+              # (the separate /list-agents plugin was removed); same config as the shipped standard preset
               - id: tool-subagent-control
                 name: '@deepseek-ai/dsh-tool-subagent-control'
-              - id: tool-subagent-list-agents
-                name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'
+                config:
+                  interrupt: false
               - id: tool-subagent
                 name: '@deepseek-ai/dsh-tool-subagent'
                 config:
                   provider: spawn
                   toolName: subagent
-                  modelSelectionSettings: true
+                  # Harness 0.2.1+: modelSelection (was modelSelectionSettings); modelDiscovery adds list_subagent_models
+                  modelSelection: true
+                  modelDiscovery: true
               - id: tool-subagent-fork
                 name: '@deepseek-ai/dsh-tool-subagent'
                 config:
