@@ -145,8 +145,15 @@
     timeoutMs: 120000
 
 # Reasoning translation (bundle dsh-experimental-cot-translation-bundle in package.json): expanded thinking is
-# shown in Russian on demand. Display only — the model and the session keep the original. The text goes to the
-# anonymous Bing translator (an outside service), not to the local model, so the GPU is not touched.
+# shown in Russian on demand. Display only — the model and the session keep the original. Translated OFFLINE on
+# this PC: the translator's Bing endpoint points at afk api, which runs OPUS-MT on the CPU (scripts\mt-server.py,
+# set up by scripts\mt-setup.cmd); nothing goes to Microsoft. Harness keeps a chat's translations inside that chat.
+- id: translator
+  config:
+    provider: bing
+    bingEndpoint: http://127.0.0.1:18300/translate/translatetext
+    # the first request starts the translator (~3 s); a long block is translated in parts
+    timeoutMs: 120000
 - id: cot-translation
   config:
     provider: bing

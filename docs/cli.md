@@ -186,10 +186,19 @@ screenshot took 36 s and 2107 tokens (ArenaFPS run: prompts with two screenshots
 tokens, on-screen text stays readable; 1024×576 is 7 s / 643 tokens but misreads small text.
 
 The model thinks in English. The monitor shows the reasoning in Russian, and DeepSeek Harness Desktop translates
-expanded reasoning to Russian (its reasoning-translation bundle, `targetLanguage: ru`). Both use Microsoft's anonymous
-Edge translator: it needs the internet, the reasoning text (which can contain code) goes to Microsoft, and the
-endpoint is not an official API, so it may rate-limit or stop working; then the original English is shown. The
-model, the session and the GPU are not involved. `harness-watch.mjs --en` shows the original.
+expanded reasoning to Russian (its reasoning-translation bundle, `targetLanguage: ru`). Both go to `afk api`'s
+offline translator, nothing to Microsoft: the profile points the Harness translator's `bingEndpoint` at
+`http://127.0.0.1:18300/translate/translatetext`, and `afk api` answers that endpoint in the Edge protocol
+(`src/core/translate.ts`) by forwarding to `scripts/mt-server.py`, a CPU worker it starts on the first request and
+that exits after 15 min idle. Models: OPUS-MT tc-big en→zle (with `>>rus<<`) and zle→en (Helsinki-NLP, CC-BY 4.0)
+converted to CTranslate2 int8 (235 MB each, `C:\Models\mt`), 2 threads at idle priority, beam 2. Code spans, paths,
+file names, identifiers and symbols the model has no tokens for are swapped for placeholders and put back; a
+sentence whose placeholder got lost stays in English. About 600 characters per 0.7 s; while it translates, the
+Flash-Next decode on Strata (which uses the CPU for MoE experts) runs ~12 % slower (measured 48 → 42 t/s at 1 and 2
+threads alike: the shared resource is memory bandwidth, so 2 threads finish sooner for the same cost). No text is
+written to disk or logged: en→ru results stay in the worker's memory; Harness stores a chat's translations in that
+chat's session and they go with it. Setup once: `scripts\mt-setup.cmd` (venv in `~/.afkllm/mt`, conversion, self-test).
+Not installed → 503, Harness shows the original. `harness-watch.mjs --en` shows the original.
 
 Switching models: `afk api` loads the profile a chat request names as its `model` (a profile name, or a `.gguf`
 path = the first profile using that file). DeepSeek Harness lists `q38` (104K), `q38-128k`, `q38-160k` and `flash` in its
@@ -256,12 +265,22 @@ into the desktop profile) sends the prompt as written to `generate_image` on `af
 Nothing leaves the PC (only 127.0.0.1). The prompt is not in the Harness session log (`recordInput: false`), not
 in the proxy console (`private` flag, not in the tool schema the model sees), and not inside the PNG: afk strips
 the PNG text chunks where ComfyUI writes its workflow and prompt, and deletes ComfyUI's copy in
-`~/.afkllm/comfy-output` (both for every generated image). Pictures go to `~/.afkllm/private-images` (outside the
-Pictures library) and open in the default viewer. `/image-clean` deletes them, their Windows "Recent" shortcuts and
-leftover ComfyUI copies; the session itself is deleted in the Harness session list. The agent's own `generate_image`
+`~/.afkllm/comfy-output` (both for every generated image). Pictures go to `~/.afkllm/private-images/chat-<session id>` (outside the
+Pictures library, one folder per chat, marked "not content indexed" so Windows Search keeps no entries) and open in
+the default viewer (opening through the file association adds no "Recent" item; checked with Windows Photo Viewer).
+`/image-clean` deletes this chat's pictures, their Windows "Recent" shortcuts and their ComfyUI copies (afk api names
+them `afk_<chat folder>_<file>`; normally deleted right after each image, left only by a crash); other chats are not
+touched. `/image-clean all` does it for every chat plus older pictures and any ComfyUI leftovers. Explorer's shared
+thumbnail cache is not touched. The session itself is deleted in the Harness session list. The agent's own `generate_image`
 is unchanged. Harness telemetry is off in the desktop profile: product analytics and product telemetry disabled,
-session telemetry `DISABLED` (`FEEDBACK_ONLY` would upload the whole session after a rating or `/feedback`). The
-reasoning translation (Microsoft) only runs when you expand the model's reasoning; `/image` has none.
+session telemetry `DISABLED` (`FEEDBACK_ONLY` would upload the whole session after a rating or `/feedback`). A
+prompt with Cyrillic is first translated to English by the offline translator (`/translate/translatetext?from=ru&to=en`
+on 127.0.0.1; Qwen-Image follows English much better). The English text goes to `generate_image` and into the
+command's reply, so it is in that chat's session file until the chat is deleted (Harness logs a command's reply
+verbatim and has no "show but do not record" option; the typed prompt itself stays unrecorded). The translator keeps
+no copy (the ru→en direction has no cache at all); config `translate: false` turns translation off.
+`/image-clean` does not touch the translator: it holds no prompts, and its en→ru cache holds no chat's data (each
+chat's reasoning translations live in that chat). `POST /translate/forget` empties that cache by hand.
 
 ## Design notes
 

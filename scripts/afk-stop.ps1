@@ -3,7 +3,8 @@
 #   - the "AFKLLM: прокси" window (`afk api`) and the "llama-server" window (scripts\afk-llama.ps1, `afk llama`);
 #   - every llama-server.exe (afk api restarts it detached after a model switch or an image) and the Strata server
 #     afk started for the profile flash (with its engine);
-#   - ComfyUI that afk api starts for image generation (port 8190) and the harness-watch window.
+#   - ComfyUI that afk api starts for image generation (port 8190), the offline translator (mt-server.py) and the
+#     harness-watch window.
 # Other node / python processes (other projects, MCP servers of other apps) are not touched.
 #   scripts\afk-stop.cmd             everything above
 #   scripts\afk-stop.cmd -KeepHarness only the model side: Harness stays open
@@ -44,6 +45,8 @@ foreach ($p in Find { $_.Name -match '^(powershell|pwsh)\.exe$' -and $_.CommandL
 foreach ($p in Find { $_.Name -eq 'node.exe' -and $_.CommandLine -like '*src\cli\main.ts*' -and $_.CommandLine -match '\s(api|llama)(\s|$)' }) { Stop-Tree $p.ProcessId 'afk' }
 foreach ($p in Find { $_.Name -eq 'node.exe' -and $_.CommandLine -like '*harness-watch.mjs*' }) { Stop-Tree $p.ProcessId 'harness-watch' }
 foreach ($p in Find { $_.Name -eq 'python.exe' -and $_.CommandLine -like '*ComfyUI*main.py*' -and $_.CommandLine -match '--port\s+8190\b' }) { Stop-Tree $p.ProcessId 'ComfyUI (картинки)' }
+# the offline translator afk api starts on demand (it also exits by itself after 15 min idle)
+foreach ($p in Find { $_.Name -eq 'python.exe' -and $_.CommandLine -like '*mt-server.py*' }) { Stop-Tree $p.ProcessId 'переводчик' }
 # whatever is left of the model: detached restarts, leftovers of a crashed proxy
 foreach ($p in Get-Process -Name 'llama-server' -ErrorAction SilentlyContinue) { Stop-Tree $p.Id 'llama-server' }
 # Strata (profile flash): the Python server afk started on its config in ~/.afkllm/strata, with the engine under it

@@ -4,7 +4,7 @@
 // The GPU (16 GB) cannot hold the 27B coder and the image model at once, so the host swaps them: see swap.ts.
 import { spawn, type ChildProcess } from 'node:child_process'
 import { createWriteStream, existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { CONFIG_DIR } from './server'
 
 const MODELS = process.env.AFK_MODELS_DIR || 'C:\\Models'
@@ -78,6 +78,14 @@ export function stripPngText(png: Buffer): Buffer {
 }
 
 export interface ImageResult { path: string; width: number; height: number; seconds: number; seed: number }
+
+/** ComfyUI filename_prefix for an output path: `afk_<parent folder>_<file name>` (filesystem-safe, bounded). */
+export function comfyPrefix(out: string): string {
+  const safe = (s: string) => s.replace(/[^\w.-]/g, '_')
+  const file = basename(out).replace(/\.png$/i, '')
+  const parent = basename(dirname(out))
+  return `afk_${safe(parent).slice(0, 90)}_${safe(file).slice(0, 60)}`
+}
 
 const round16 = (n: number) => Math.max(256, Math.min(2048, Math.round(n / 16) * 16))
 
@@ -162,7 +170,9 @@ export class ComfyRunner {
       width: round16(req.width ?? 1024), height: round16(req.height ?? 1024),
       seed: req.seed ?? Math.floor(Math.random() * 2 ** 48),
     }
-    const prefix = `afk_${Date.now()}`
+    // ComfyUI's own copy is named after the output (<chat folder>_<file>), so a copy left by a crash can be cleaned
+    // with the chat it belongs to (/image-clean); it is deleted right after a normal run anyway
+    const prefix = comfyPrefix(req.out)
     onProgress?.(`image ${r.width}x${r.height} · seed ${r.seed}` +
       (req.quiet ? '' : ` · prompt: ${r.prompt.length > 240 ? r.prompt.slice(0, 240) + '…' : r.prompt}`))
     // live stages and sampler steps from ComfyUI's websocket (falls back to plain polling if it cannot connect)

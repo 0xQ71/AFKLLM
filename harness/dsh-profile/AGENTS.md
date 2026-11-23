@@ -79,6 +79,10 @@ whatever language suits you; only these user-facing words follow the user.
   simplest working option (a stub, a plainer API, a fallback), note it in AGENTS.md as a known gap, and move on
   to the next todo. Something that can only be checked elsewhere (a browser, a phone, a store SDK) gets a stub
   plus a note, not an investigation.
+- npm packages: the installed type definitions are the source of truth (`node_modules/<pkg>/**/*.d.ts` or
+  `@types/<pkg>`) — one grep in the `.d.ts`, never in the `.js` sources. Do not write `node -e` probes to see how a
+  library behaves: write the code and let the type check / build (`tsc`, `npm run build`) catch the mistakes. Read a
+  library's source only after a build or a test showed behaviour you cannot explain.
 - Commit early: the first commit as soon as the skeleton checks clean, then after every working stage.
 - Finish what was asked. Do not stop with "I'll now do X" — do X. Stop and ask only for decisions that are
   genuinely the user's (product choices, deleting data, spending money, pushing to remotes).

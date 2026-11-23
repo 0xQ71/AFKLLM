@@ -1,7 +1,7 @@
 // Live view of a DeepSeek Harness session: what the agent thinks and does, todo progress, context, compaction, speed.
 //   node scripts/harness-watch.mjs [project-substring | session-id] [--log <headless stderr file | folder>] [--from-start] [--en]
-// The model thinks in English; its reasoning is shown in Russian through the anonymous Bing translator that DeepSeek
-// Harness' own reasoning translation uses (the text leaves this PC). --en shows the original.
+// The model thinks in English; its reasoning is shown in Russian through afk api's offline translator (OPUS-MT on the
+// CPU, the same one DeepSeek Harness' reasoning translation uses; nothing leaves this PC). --en shows the original.
 // Without arguments it follows the most recently active session. --log streams the reasoning live from a headless run's
 // stderr (the session file only gets a step's reasoning when the step ends).
 import { readFileSync, readdirSync, statSync, existsSync, openSync, readSync, closeSync } from 'node:fs'
@@ -27,10 +27,12 @@ const clip = (s, n) => { s = String(s ?? '').replace(/\s+/g, ' ').trim(); return
 const rawLog = console.log
 let printQ = Promise.resolve()
 console.log = (...a) => { printQ = printQ.then(() => rawLog(...a)) }
-const BING = 'https://edge.microsoft.com/translate/translatetext?to=ru&isEnterpriseClient=false'
+// afk api's offline translator (OPUS-MT on the CPU, scripts/mt-server.py): nothing leaves this PC. Not running or
+// not installed → the original English is shown.
+const TRANSLATE = `${process.env.AFKLLM_URL || 'http://127.0.0.1:18300'}/translate/translatetext?to=ru`
 async function toRussian(text) {
   if (english || !/[a-z]{3}/i.test(text)) return text
-  // the endpoint takes ~4000 characters per request: split on line breaks
+  // ~4000 characters per request: split on line breaks
   const parts = []
   let chunk = ''
   for (const line of text.split('\n')) { if ((chunk + line).length > 3500 && chunk) { parts.push(chunk); chunk = '' } chunk += (chunk ? '\n' : '') + line }
@@ -38,7 +40,7 @@ async function toRussian(text) {
   const out = []
   for (const part of parts) {
     try {
-      const r = await fetch(BING, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify([part]), signal: AbortSignal.timeout(10000) })
+      const r = await fetch(TRANSLATE, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify([part]), signal: AbortSignal.timeout(120000) })
       const j = await r.json()
       out.push(j?.[0]?.translations?.[0]?.text ?? part)
     } catch { out.push(part) }

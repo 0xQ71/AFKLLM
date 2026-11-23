@@ -99,6 +99,11 @@ New-Item -ItemType Directory -Force (Split-Path $cfgPath) | Out-Null
 [IO.File]::WriteAllText($cfgPath, ($cfg | ConvertTo-Json -Depth 8), (New-Object Text.UTF8Encoding $false))
 Ok "модель по умолчанию: $Model (~/.afkllm/cli.json)"
 
+# offline translator (CPU): Harness reasoning en->ru and /image prompts ru->en without the internet
+Step 'Офлайн-переводчик (рассуждения на русском, /image по-русски)'
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'scripts\mt-setup.ps1')
+if ($LASTEXITCODE) { Warn 'переводчик не установлен: рассуждения останутся на английском (повторите scripts\mt-setup.cmd)' }
+
 # ---------------------------------------------------------------- 3. DeepSeek Harness
 Step 'DeepSeek Harness'
 $harness = Join-Path $env:LOCALAPPDATA 'Programs\DeepSeek Harness\DeepSeek Harness.exe'

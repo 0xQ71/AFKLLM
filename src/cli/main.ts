@@ -18,6 +18,7 @@ import { LlmClient } from '../core/llm'
 import { CONFIG_DIR, defaultProfileName, ensureServer, lanIPv4, loadConfig, profileForModel, profiles, startLanProxy, type ModelProfile, type RunningServer } from '../core/server'
 import { imageGenMissing } from '../core/imagegen'
 import { mcpRoute, searchRoute } from '../core/harness'
+import { TranslatorWorker, translateRoutes, translatorMissing } from '../core/translate'
 import { dangerousFolder, isDirectory } from '../core/workspace'
 import { createInterface as createLineReader } from 'node:readline/promises'
 import { GpuSwap, killListener, waitDown } from '../core/swap'
@@ -405,6 +406,9 @@ async function serveApi(a: Args): Promise<number> {
     log: (m) => line(`· ${m}`),
     setImageProgress: (fn) => { progressSink = fn },
   })
+  // offline translation (Harness reasoning en→ru, /image prompts ru→en): a CPU worker started on the first request
+  const translator = new TranslatorWorker(undefined, (m) => line(`· ${m}`))
+  const translatorGap = translatorMissing(translator.cfg)
   const proxy = await startLanProxy({
     listenHost: a.lan ? '0.0.0.0' : '127.0.0.1', listenPort: port, upstreamPort: port + 1,
     sampling: () => conn.profile?.sampling,
@@ -413,6 +417,7 @@ async function serveApi(a: Args): Promise<number> {
     routes: {
       '/mcp': route,
       '/search': searchRoute((m) => line(`· ${m}`)),
+      ...translateRoutes(translator),
       // the profiles a client may pick (DeepSeek Harness lists them in its own config; this is for other clients)
       '/v1/models': (_req, res) => {
         res.writeHead(200, { 'content-type': 'application/json' })
@@ -440,6 +445,8 @@ async function serveApi(a: Args): Promise<number> {
       process.platform === 'win32' ? 'screenshot' : '',
       'web_search',
     ].filter(Boolean).join(', '),
+    `Offline translation: http://127.0.0.1:${proxy.port}/translate/translatetext  ` +
+      (translatorGap.length ? `OFF (scripts\\mt-setup.cmd; missing ${translatorGap[0]})` : 'en→ru, ru→en on the CPU, starts on first use'),
     '',
     'api key: not required (send any string if the client insists)',
     server.reused || a.keepServer
@@ -451,6 +458,7 @@ async function serveApi(a: Args): Promise<number> {
   process.stdout.write(lines.join('\n') + '\n')
   process.on('exit', () => {
     proxy.stop()
+    translator.stop()
     const s = conn.server
     if (s && !s.reused && !a.keepServer && !conn.detached) s.stop()
   })
