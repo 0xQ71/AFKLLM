@@ -1,7 +1,7 @@
 ﻿# Installs the AFKLLM setup into a DeepSeek Harness profile (default: the desktop app's profile "desktop"):
 #   - harness\dsh-profile\cordis.patch.yml -> <DSH_HOME>\profiles\<profile>\cordis.patch.yml (the old one is kept as .bak-<date>)
-#     provider "afkllm" (afk api on 127.0.0.1:18300, models q38 / q38-128k / q38-160k), presets "AFKLLM" and
-#     "AFKLLM + браузер", compaction for a 104K window, MCP tools of afk api + Context7, permission preset
+#     provider "afkllm" (afk api on 127.0.0.1:18300, models q38 / q38-128k / q38-160k / flash), presets "AFKLLM" and
+#     "AFKLLM + браузер", compaction for local windows, MCP tools of afk api + Context7, permission preset
 #     workspace-auto, no telemetry
 #   - the bundles from harness\dsh-profile\bundles.json (reasoning translation, session search, ...) into the profile
 #   - plugins dsh-web-search-afkllm (search card through afk api) and dsh-image-afkllm (/image), linked from this repo

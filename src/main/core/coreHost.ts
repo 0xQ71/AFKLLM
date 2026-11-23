@@ -5,7 +5,7 @@ import { BrowserWindow, dialog, ipcMain } from 'electron'
 import { Agent } from '../../core/agent'
 import { imageGenMissing } from '../../core/imagegen'
 import { LlmClient } from '../../core/llm'
-import { ensureServer, loadConfig, profiles, type ModelProfile, type RunningServer } from '../../core/server'
+import { defaultProfileName, ensureServer, loadConfig, profiles, type ModelProfile, type RunningServer } from '../../core/server'
 import { listSessions, loadSession, newSessionId, saveSession } from '../../core/session'
 import { GpuSwap, killListener, waitDown } from '../../core/swap'
 import { dangerousFolder, isDirectory } from '../../core/workspace'
@@ -44,7 +44,7 @@ const send = (ev: CoreEvent) => {
 }
 
 class CoreHost {
-  private profileName = loadConfig().defaultProfile ?? 'q38'
+  private profileName = defaultProfileName()
   private server: RunningServer | null = null
   private llm: LlmClient | null = null
   private status: CoreStatus = { state: 'idle', profile: this.profileName, vision: false, imagegen: false }
@@ -95,7 +95,7 @@ class CoreHost {
         })
         this.setStatus({
           state: 'ready', message: undefined, ctx: this.llm.ctxSize,
-          vision: !!profile.args?.mmproj, imagegen: !!this.swap,
+          vision: !!profile.args?.mmproj || !!profile.strata, imagegen: !!this.swap,
         })
       } catch (e) {
         this.setStatus({ state: 'error', message: (e as Error).message })
@@ -117,7 +117,7 @@ class CoreHost {
     const profile = this.profile()
     return new Agent({
       cwd, llm: this.llm!, mode: 'default', sampling: profile.sampling as never,
-      vision: !!profile.args?.mmproj,
+      vision: !!profile.args?.mmproj || !!profile.strata,
       generateImage: this.swap ? this.generateImage : undefined,
       emit: (event) => send({ kind: 'agent', sessionId: id, event }),
       ask: (request) => new Promise((resolve) => {

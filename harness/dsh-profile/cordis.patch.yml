@@ -3,7 +3,8 @@
 # overrides, disables, and insert lists; `!!js` expressions allowed).
 #
 # AFKLLM setup. Backend: `afk api` (scripts\afk.cmd api, or scripts\harness.cmd) =
-#   http://127.0.0.1:18300/v1   llama-server, Qwen3.8 27B + MTP @104K, vision projector (mmproj, CPU)
+#   http://127.0.0.1:18300/v1   llama-server, Qwen3.8 27B + MTP @104K, vision projector (mmproj, CPU),
+#                               or Strata, Qwen3.8-Flash-Next @256K (model `flash`, 64 GB RAM)
 #   http://127.0.0.1:18300/mcp  AFKLLM tools: generate_image (Qwen-Image 2.1, GPU swap), screenshot
 #   http://127.0.0.1:18300/search  keyless multi-engine search behind the harness's own web_search (plugin
 #                                  dsh-web-search-afkllm = <AFKLLM>\harness\dsh-web-search-afkllm, linked)
@@ -98,6 +99,30 @@
               supportsDeveloperRole: false
               supportsStrictMode: false
               maxTokensField: max_tokens
+          # Qwen3.8-Flash-Next (512-expert MoE) on the Strata engine: experts in GPU + RAM, 55-80 t/s, 750-1850 t/s
+          # prompt, its native 256K window (decode still ~60 t/s at 200K deep). Switching to or from it takes ~60-80 s
+          # (47 GB of weights are read into RAM). Compaction starts at min(0.8 W, W - O - 6144) = ~210K tokens.
+          - id: flash
+            name: Qwen 3.8 Flash-Next · 256K · Strata (flash)
+            contextWindow: 262144
+            # one step = up to 32K thinking (Strata reasoning_budget_tokens 32768) + the answer / tool call
+            maxTokens: 40960
+            input: [text, image]
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: xhigh
+            compat:
+              thinkingFormat: chat-template
+              chatTemplateKwargs:
+                enable_thinking: true
+                preserve_thinking: true
+                reasoning_effort:
+                  $var: thinking.effort
+              supportsReasoningEffort: false
+              supportsDeveloperRole: false
+              supportsStrictMode: false
+              maxTokensField: max_tokens
 
 - id: agent-default-model
   name: "@deepseek-ai/dsh-agent-default-model"
@@ -130,14 +155,14 @@
 # The AFKLLM agent preset (default for new sessions): the shipped `standard` preset, plus
 #   - AFKLLM MCP tools (generate_image, screenshot),
 #   - web_search / web_fetch of the harness, searching through AFKLLM (no account, no keys),
-#   - compaction sized for a 104K window (the default 64K headroom would compact at ~6K tokens).
+#   - compaction sized for local windows (the default 64K headroom would compact the 104K q38 at ~6K tokens).
 - insert:
     - id: preset-afkllm
       name: '@deepseek-ai/dsh-agent-preset'
       config:
         id: afkllm
         name: AFKLLM
-        description: Local Qwen3.8 27B with vision, image generation and long-session compaction
+        description: Local Qwen3.8 (27B or Flash-Next) with vision, image generation and long-session compaction
         order: 0
         plugins:
           - &afk_persona
@@ -145,7 +170,7 @@
             name: '@deepseek-ai/dsh-persona'
             config:
               prefix: >-
-                You are AFKLLM, a careful local coding agent (Qwen3.8 27B with vision) working on the user's
+                You are AFKLLM, a careful local coding agent (a Qwen3.8 model with vision) working on the user's
                 Windows PC. You think before every step, verify facts with tools instead of guessing, and finish
                 long tasks end to end.
           - &afk_agent_instructions

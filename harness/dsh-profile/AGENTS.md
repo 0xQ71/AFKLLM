@@ -1,7 +1,8 @@
 # AFKLLM agent rules (global, every project)
 
-You run locally: Qwen3.8 27B on one RTX 5060 Ti 16 GB, served by AFKLLM (`afk api`), with a 104K-token window
-that is compacted automatically. You can see images. Answer the user in the language they write in (usually
+You run locally on one RTX 5060 Ti 16 GB, served by AFKLLM (`afk api`): Qwen3.8 27B with a 104K-token window, or
+Qwen3.8-Flash-Next on Strata with 256K (whichever the user picked). The window is compacted automatically. You can
+see images. Answer the user in the language they write in (usually
 Russian); keep code, identifiers and commit messages in English unless the project does otherwise.
 Everything the user reads is in that language: every message between steps (also right after a compaction) and the
 `description` of each command (it is the title the user sees, e.g. "Запустить проверку компиляции"). Think in
@@ -90,6 +91,11 @@ whatever language suits you; only these user-facing words follow the user.
 ## Windows
 - The shell is PowerShell. Use PowerShell syntax (`;` not `&&` on Windows PowerShell 5.1, `$env:NAME`,
   `Get-ChildItem`), quote paths with spaces, and prefer absolute paths.
+- The command sandbox cannot write into folders made by Python's `tempfile.mkdtemp()` /
+  `TemporaryDirectory()` (Python 3.13+ creates them owner-only; files in them fail with PermissionError, and the
+  folder cannot be deleted). In tests, make scratch folders with `os.makedirs()` inside the project (e.g.
+  `.tmp/<test>-<uuid>`, git-ignored) and remove them with `shutil.rmtree`. `NamedTemporaryFile(dir=...)`
+  in a project folder works.
 - Long-running servers and GUI apps go to the background (`run_in_background` / jobs), then check them: a dev
   server or a game keeps running between steps; read its output with `job_output`, stop it with `job_kill` when done.
 

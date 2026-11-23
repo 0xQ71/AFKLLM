@@ -1,14 +1,15 @@
 // Starts (or reuses) a llama-server for a model profile. Profiles are tuned on the stage-0 bench
 // (scripts/stage0/bench.py, RTX 5060 Ti 16 GB) and can be overridden in ~/.afkllm/cli.json:
 //   { "llamaServer": "C:\\Models\\llama.cpp\\b12063\\llama-server.exe",
-//     "defaultProfile": "q38",
+//     "defaultProfile": "q38",   (unset: flash with 64 GB RAM and Strata set up, else q38 — defaultProfileName)
 //     "profiles": { "mine": { "model": "D:\\x.gguf", "ctx": 65536, "args": { "n-gpu-layers": "99" } } } }
 import { spawn, type ChildProcess } from 'node:child_process'
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, writeSync } from 'node:fs'
 import { createServer, request as httpRequest, type IncomingMessage, type ServerResponse } from 'node:http'
-import { homedir, networkInterfaces } from 'node:os'
+import { homedir, networkInterfaces, totalmem } from 'node:os'
 import { join } from 'node:path'
 import type { Sampling } from './llm'
+import { strataCommand, strataMissing, strataModelName, type StrataSpec } from './strata'
 
 export interface ModelProfile {
   label: string
@@ -17,6 +18,8 @@ export interface ModelProfile {
   args: Record<string, string | null>
   sampling: Sampling
   thinking?: boolean
+  /** set: the model runs on the Strata engine (strata.ts) instead of llama-server; `args` are then unused */
+  strata?: StrataSpec
 }
 
 const MODELS = process.env.AFK_MODELS_DIR || 'C:\\Models'
@@ -76,6 +79,49 @@ export const BUILTIN_PROFILES: Record<string, ModelProfile> = {
     },
     sampling: QWEN_CODE,
   },
+  // ---- Qwen3.8-Flash-Next on Strata (2026-11-22): 512-expert MoE, 10 active, 47 GB of weights in GPU + RAM ----
+  // ISTA-DASLab GSQ-RCO IQ3_XXS (LiveCodeBench v6 86.3 vs 87.4 for BF16). Strata keeps ~8.6 GB of the most-routed
+  // experts in VRAM and the other ~40 GB in pinned RAM (CPU AVX2 kernels); shard 2 (the 29 GB n-gram table) is read
+  // from the NVMe row by row. DFlash2 drafter, int8 KV with 32K cells per layer in VRAM and the rest streamed from RAM.
+  // Measured: decode 55-80 t/s, prefill 750-1850 t/s (llama.cpp b12063 on the same files: 18.5 / 297). Load ~55-80 s.
+  // 256K check (2026-11-23): a 200K-token prompt read in 108 s, 3/3 needles at 10/50/90 % depth, decode at that
+  // depth still 60-63 t/s (sparse attention), the next turn reused 200,071 tokens and answered in 4 s.
+  // The preset is made once by scripts\strata-setup.cmd (`strata launch ... --save-preset afk-flash`).
+  flash: {
+    label: 'Qwen3.8-Flash-Next IQ3_XXS (Strata) @256K',
+    model: join(MODELS, 'ISTA-DASLab__Qwen3.8-Flash-Next-GSQ-RCO-GGUF', 'IQ3_XXS', 'Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf'),
+    // the model's native window (262,144). Only 12 of 48 layers keep K/V (2 heads x 256, int8): ~12 KB a token,
+    // 3.3 GB of pinned RAM for the whole window, 32K cells of it in VRAM
+    ctx: 262144,
+    args: {},
+    strata: {
+      preset: 'afk-flash',
+      engineArgs: {
+        // Park the conversation in RAM when a side request (session title, sub-agent, compaction) takes the slot,
+        // instead of re-reading it afterwards (measured without: an 18K prompt re-read in 19 s; ~1.2 GB per 63K tokens).
+        // Strata switches it off by itself when the Windows commit limit is tight: it needs RAM + page file >= ~96 GB.
+        'conversation-cache-mib': '4096',
+        // tiny side requests are not parked: they would push the long conversation out of the slots
+        'conversation-cache-min-tokens': '4096',
+        // The hybrid model can only rewind to a checkpoint: with the default one every 16K prompt tokens, a client
+        // that rewrites its history re-read up to 16K tokens (seen once: a 12K first prompt read twice, 24 s).
+        // Same number of checkpoints (--prompt-cache 6, ~118 MB each), just denser.
+        'prompt-cache-every': '4096',
+      },
+      config: {
+        // GPU swap for images (swap.ts): the conversation goes to a file and comes back instead of being re-read
+        slot_save_path: join(MODELS, '_kv'),
+        // a ceiling against runaway thinking, twice the 27B's: the model card puts no limit on thinking and says a
+        // shallower analysis costs more agent retries than it saves (~7 min at 75 t/s if a step ever uses it all;
+        // agent steps measured 0.1-2.4K). The Harness model entry gives a step 40K: thinking + the answer.
+        reasoning_budget_tokens: 32768,
+        // screenshots: Strata's CPU reader defaults to 300 image tokens, too few to read text on a screen
+        vision: { max_tokens: 1024 },
+      },
+    },
+    // the model card's thinking-mode sampling (also what its agentic evals used): temperature 1.0, not the 27B's 0.6
+    sampling: { temperature: 1.0, top_p: 0.95, top_k: 20, min_p: 0, presence_penalty: 0 },
+  },
 }
 
 const COMMON_ARGS: Record<string, string | null> = {
@@ -115,6 +161,22 @@ export const CONFIG_DIR = join(homedir(), '.afkllm')
 export function loadConfig(): CliConfig {
   const p = join(CONFIG_DIR, 'cli.json')
   try { return existsSync(p) ? JSON.parse(readFileSync(p, 'utf8')) : {} } catch { return {} }
+}
+
+/** RAM the `flash` profile needs: Strata pins ~40 GB of experts + the K/V and commits ~61 GB. */
+export const FLASH_MIN_RAM_GB = 60
+
+/**
+ * The profile used when none is named: `defaultProfile` from cli.json, else the best one this PC can run —
+ * `flash` (Qwen3.8-Flash-Next on Strata, 256K) with 60+ GB of RAM once Strata and its preset are set up
+ * (scripts\setup.cmd), otherwise `q38` (the 27B, fully on a 16 GB GPU).
+ */
+export function defaultProfileName(cfg: CliConfig = loadConfig()): string {
+  if (cfg.defaultProfile) return cfg.defaultProfile
+  const flash = profiles(cfg).flash
+  const ramGb = totalmem() / 1024 ** 3
+  if (flash?.strata && ramGb >= FLASH_MIN_RAM_GB - 4 && existsSync(flash.model) && !strataMissing(flash.strata)) return 'flash'
+  return 'q38'
 }
 
 export function profiles(cfg: CliConfig): Record<string, ModelProfile> {
@@ -163,23 +225,38 @@ export function findLlamaServer(cfg: CliConfig): string | null {
   return candidates.find((c) => existsSync(c)) ?? null
 }
 
-async function health(url: string): Promise<boolean> {
+/**
+ * The server answers (anyLoad) or answers with its model loaded. Strata's /health is ok with "loaded": false when it
+ * runs unloaded (lazy / idle unload): it loads on the next request, so it counts as running, not as a free port.
+ */
+async function health(url: string, anyLoad = false): Promise<boolean> {
   try {
     const r = await fetch(`${url}/health`, { signal: AbortSignal.timeout(1500) })
-    return r.ok
+    if (!r.ok) return false
+    if (anyLoad) return true
+    const j = (await r.json().catch(() => ({}))) as { loaded?: boolean }
+    return j.loaded !== false
   } catch {
     return false
   }
 }
 
+/** What a running server serves: llama-server's model path, or "strata:<model name>". '' when unknown. */
 async function servedModel(url: string): Promise<string> {
   try {
+    const h = (await (await fetch(`${url}/health`, { signal: AbortSignal.timeout(2000) })).json().catch(() => ({}))) as any
+    if (h?.service === 'strata') return `strata:${h.model ?? ''}`
     const r = await fetch(`${url}/props`, { signal: AbortSignal.timeout(2000) })
     const j = (await r.json()) as any
     return String(j?.model_path ?? '')
   } catch {
     return ''
   }
+}
+
+/** servedModel's value for a profile. */
+function servedId(profile: ModelProfile): string {
+  return profile.strata ? `strata:${strataModelName(profile.strata)}` : profile.model
 }
 
 export interface RunningServer {
@@ -203,9 +280,9 @@ export async function ensureServer(profile: ModelProfile, cfg: CliConfig, opts: 
   // Probe and the returned url stay on loopback. `host` is only the bind address (0.0.0.0 = LAN).
   const host = !opts.host || opts.host === 'localhost' ? '127.0.0.1' : opts.host
   const url = `http://127.0.0.1:${port}`
-  if (await health(url)) {
+  if (await health(url, true)) {
     const served = await servedModel(url)
-    if (served && served.toLowerCase() !== profile.model.toLowerCase()) {
+    if (served && served.toLowerCase() !== servedId(profile).toLowerCase()) {
       throw new Error(`port ${port} is busy with another model (${served}). Stop it or pass --port.`)
     }
     if (host !== '127.0.0.1' && !(await lanReachable(port))) {
@@ -213,26 +290,39 @@ export async function ensureServer(profile: ModelProfile, cfg: CliConfig, opts: 
     }
     return { url, reused: true, stop: () => {} }
   }
-  const exe = findLlamaServer(cfg)
-  if (!exe) throw new Error('llama-server.exe not found. Set AFK_LLAMA_SERVER or "llamaServer" in ~/.afkllm/cli.json, or pass --url.')
   if (!existsSync(profile.model)) throw new Error(`model file not found: ${profile.model}`)
-
-  const args = ['-m', profile.model, '--host', host, '--port', String(port)]
-  const all = { ...COMMON_ARGS, ...profile.args, 'ctx-size': String(opts.ctx ?? profile.ctx) }
-  for (const [k, v] of Object.entries(all)) {
-    if (v === '__off__') continue
-    args.push(`--${k}`)
-    if (v !== null) args.push(v)
-  }
   const logDir = join(CONFIG_DIR, 'logs')
   mkdirSync(logDir, { recursive: true })
   mkdirSync(join(MODELS, '_kv'), { recursive: true })
   const logPath = join(logDir, `llama-server-${port}.log`)
-  // llama-server writes the log file itself (not through a pipe of this process): `afk llama`'s window tails it,
+  const name = profile.strata ? 'Strata' : 'llama-server'
+
+  let exe: string, args: string[], cwd: string
+  let env: NodeJS.ProcessEnv | undefined
+  if (profile.strata) {
+    const missing = strataMissing(profile.strata)
+    if (missing) throw new Error(missing)
+    ;({ exe, args, cwd } = strataCommand(profile.strata, { port, host, ctx: opts.ctx ?? profile.ctx, configDir: join(CONFIG_DIR, 'strata'), logDir }))
+    // no daily update-feed read: nothing leaves the PC while serving
+    env = { ...process.env, STRATA_UPDATE_CHECK: '0', PYTHONIOENCODING: 'utf-8', PYTHONUNBUFFERED: '1' }
+  } else {
+    const found = findLlamaServer(cfg)
+    if (!found) throw new Error('llama-server.exe not found. Set AFK_LLAMA_SERVER or "llamaServer" in ~/.afkllm/cli.json, or pass --url.')
+    exe = found
+    cwd = join(exe, '..')
+    args = ['-m', profile.model, '--host', host, '--port', String(port)]
+    const all = { ...COMMON_ARGS, ...profile.args, 'ctx-size': String(opts.ctx ?? profile.ctx) }
+    for (const [k, v] of Object.entries(all)) {
+      if (v === '__off__') continue
+      args.push(`--${k}`)
+      if (v !== null) args.push(v)
+    }
+  }
+  // the server writes the log file itself (not through a pipe of this process): `afk llama`'s window tails it,
   // and a detached server keeps logging after its parent exits
   const fd = openSync(logPath, 'w')
   writeSync(fd, `${exe} ${args.join(' ')}\n\n`)
-  const child: ChildProcess = spawn(exe, args, { windowsHide: true, cwd: join(exe, '..'), stdio: ['ignore', fd, fd], detached: !!opts.detached })
+  const child: ChildProcess = spawn(exe, args, { windowsHide: true, cwd, env, stdio: ['ignore', fd, fd], detached: !!opts.detached })
   closeSync(fd)
   if (opts.detached) child.unref()
   let exited: number | null | undefined
@@ -247,13 +337,13 @@ export async function ensureServer(profile: ModelProfile, cfg: CliConfig, opts: 
   const t0 = Date.now()
   while (Date.now() - t0 < 600_000) {
     if (opts.signal?.aborted) { stop(); throw new Error('aborted') }
-    if (exited !== undefined) throw new Error(`llama-server exited with code ${exited} while loading; see ${logPath}`)
+    if (exited !== undefined) throw new Error(`${name} exited with code ${exited} while loading; see ${logPath}`)
     if (await health(url)) return { url, reused: false, logPath, stop }
     opts.onProgress?.(`loading ${profile.label} · ${Math.round((Date.now() - t0) / 1000)}s`)
     await new Promise((r) => setTimeout(r, 1000))
   }
   stop()
-  throw new Error(`llama-server did not become ready in 10 min; see ${logPath}`)
+  throw new Error(`${name} did not become ready in 10 min; see ${logPath}`)
 }
 
 /** Qwen3.8's chat template only accepts xhigh, medium, and low. Clients often send OpenAI's "high". */

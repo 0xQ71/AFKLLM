@@ -51,11 +51,14 @@ async function slot(url: string, action: 'save' | 'restore', filename: string): 
   if (!res.ok) throw new Error(`slot ${action}: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`)
 }
 
-/** Stop whatever llama-server listens on this port (for servers this process did not start, e.g. --keep-server). */
+/**
+ * Stop whatever model server listens on this port (for servers this process did not start, e.g. --keep-server), with
+ * its child processes: Strata's port belongs to its Python server, the engine holding the GPU and RAM is its child.
+ */
 export function killListener(port: number): void {
   if (process.platform !== 'win32') return
   spawnSync('powershell', ['-NoProfile', '-Command',
-    `Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force }`],
+    `Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue | ForEach-Object { taskkill /PID $_.OwningProcess /T /F | Out-Null }`],
   { windowsHide: true })
 }
 

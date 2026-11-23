@@ -1,6 +1,6 @@
 ﻿# One click: the local model + DeepSeek Harness on top of it. Windows: "llama-server" (the model and its live
 # progress, scripts\afk-llama.ps1) and "AFKLLM: прокси" (afk api: /v1, MCP tools, search, image generation).
-#   scripts\harness.cmd                 default model (q38: 104K, MTP, all on the GPU) + Harness desktop, no questions
+#   scripts\harness.cmd                 default model (flash with 64 GB RAM and Strata set up, else q38) + Harness, no questions
 #   scripts\harness.cmd -Ask            asks which model to load first (Enter = default)
 #   scripts\harness.cmd -Model q38-128k this profile (list: scripts\afk.cmd models)
 #   scripts\harness.cmd -Watch          ...and a window that shows what the agent is doing (scripts/harness-watch.mjs)
@@ -66,7 +66,8 @@ function Wait-Up([int]$p, [string]$what, [string]$window) {
   while (-not (Test-Up $p)) {
     Start-Sleep 1; $t++
     Write-Host -NoNewline "`r$what... $t с"
-    if ($t -ge 240) { Write-Host ''; throw "$what`: нет ответа за 4 минуты, посмотрите окно '$window'" }
+    # Strata (flash) reads ~47 GB into RAM: ~80 s, longer on the first start after a reboot
+    if ($t -ge 300) { Write-Host ''; throw "$what`: нет ответа за 5 минут, посмотрите окно '$window'" }
   }
   Write-Host "`r$what`: готово за $t с          "
 }
@@ -80,8 +81,11 @@ if (-not (Test-Model)) {
   if (Test-Up $llamaPort) {
     # a model window is already up: start the proxy on the model it serves, a switch (below) loads the chosen one
     $servedPath = ''
-    try { $servedPath = [string](Invoke-RestMethod "http://127.0.0.1:$llamaPort/props" -TimeoutSec 5).model_path } catch {}
-    $served = ($profiles | Where-Object { $_.model -eq $servedPath } | Select-Object -First 1).name
+    $isStrata = $false
+    try { $isStrata = (Invoke-RestMethod "http://127.0.0.1:$llamaPort/health" -TimeoutSec 5).service -eq 'strata' } catch {}
+    if (-not $isStrata) { try { $servedPath = [string](Invoke-RestMethod "http://127.0.0.1:$llamaPort/props" -TimeoutSec 5).model_path } catch {} }
+    $served = if ($isStrata) { ($profiles | Where-Object { $_.engine -eq 'strata' } | Select-Object -First 1).name }
+              else { ($profiles | Where-Object { $_.model -eq $servedPath } | Select-Object -First 1).name }
     $apiModel = if ($served) { $served } else { $Model }
     Write-Host "llama-server уже работает ($apiModel)."
   } else {

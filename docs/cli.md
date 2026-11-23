@@ -21,9 +21,40 @@ RTX 5060 Ti 16 GB, files under `C:\Models`):
 
 | profile | model | ctx | notes (stage 0, thinking on) |
 |---|---|---|---|
-| `q38` (default) | Qwen3.8 27B baa-ai RAM-13GB + grafted MTP + Q5_K head | 104K | **agent default**: coder 16/16, agent tasks 2/2 (T3 140 s, T2 234 s); ~69 t/s, 750 t/s prefill, needle 6/6 at 90K; fully on the GPU |
+| `q38` (default below 64 GB RAM) | Qwen3.8 27B baa-ai RAM-13GB + grafted MTP + Q5_K head | 104K | **16 GB GPU only**: coder 16/16, agent tasks 2/2 (T3 140 s, T2 234 s); ~69 t/s, 750 t/s prefill, needle 6/6 at 90K; fully on the GPU |
 | `q38-128k` | same, MTP draft 2, FFN of 5 layers on CPU | 128K | ~46 t/s, 620 t/s prefill — a third slower for +24K |
 | `q38-160k` | same file, MTP off | 160K | ~30 t/s (15 t/s at 138K deep), needle 6/6 at 100K — for reading huge inputs |
+| `flash` (default with 64 GB RAM) | Qwen3.8-Flash-Next IQ3_XXS (MoE, 47 GB of weights) on Strata | 256K (native) | **64 GB RAM**: 55–85 t/s (~60 at 200K deep), 750–1850 t/s prefill (llama.cpp b12063 on the same files: 18.5 / 300); needle 3/3 at 200K; Harness e2e: module + 18 tests in 94 s, a 12-file package + 23 tests + commit in 433 s |
+
+### `flash`: a MoE bigger than the GPU, on Strata
+
+[Strata](https://github.com/Niko1221/Strata) (MIT) keeps the hottest experts in VRAM (~8.6 GB) and the rest in pinned
+RAM (~40 GB), computed on the CPU, with int8 KV, a DFlash2 drafter and its own prefill kernels. `scripts\strata-setup.cmd`
+runs `strata launch` once (model prepared where the GGUF files lie, engine + drafter download, quick tune) and saves
+the preset `afk-flash`. AFKLLM then starts Strata's own server (`serve/server.py`, bundled Python) on a copy of that
+launch config in `~/.afkllm/strata/` with the profile's overrides (`src/core/server.ts`, `src/core/strata.ts`), on
+:18301 where llama-server would run. Strata answers llama-server's `/health`, `/props`, `/slots/0?action=save|restore`
+and OpenAI `/v1`, so the proxy, model switching and the image GPU swap (slot saved in 0.5 s, unload 1.6 s, reload
+~80 s, restore 0.5 s) need no special path; the process tree is killed with `taskkill /T` because the engine is a
+child of the Python server.
+
+Profile overrides: `--conversation-cache-mib 4096` + `--conversation-cache-min-tokens 4096` park the conversation in
+RAM while a side request (title, sub-agent, compaction) takes the slot (returning: 1.3 s instead of 19 s for 18K);
+`--prompt-cache-every 4096` keeps the hybrid model's rewind checkpoints dense, so a client that rewrites its history
+re-reads at most ~4K tokens; thinking budget 32768 per step (the Harness entry allows 40960 output tokens a step);
+images capped at 1024 tokens. Sampling is the model card's thinking mode: temperature 1.0, top_p 0.95, top_k 20,
+min_p 0, presence 0; reasoning effort `xhigh` (Harness "high"), which the card recommends for agent work.
+
+Context: the native 262,144 tokens. Only 12 of the 48 layers keep K/V (2 heads x 256, int8), ~12 KB a token: 3.1 GB
+of pinned RAM for the whole window, 32K cells per layer of it in VRAM. Checked at 200K: read in 108 s (1857 t/s),
+3/3 needles at 10/50/90 % depth, decode 60-63 t/s at that depth, the next turn reused 200,071 tokens (4 s).
+Harness compacts at ~210K.
+
+Quantization: IQ3_XXS weights (3.0 bpw, 18 of 48 layers raised to IQ4_NL; ISTA-DASLab measured 99.4 % of BF16 on their
+task average, GPQA-D 91.4 vs 91.9, LCB v6 86.3 vs 87.4); IQ3_S (+7.8 GB) does not fit next to Strata in 64 GB.
+
+Memory: the engine commits ~61 GB, so the Windows commit limit (RAM + page file) must be about 96 GB or more; below
+that Strata turns the conversation cache off itself. Update checks are off (`STRATA_UPDATE_CHECK=0`).
 
 Why 104K and not more for the 27B: VRAM, not the model (native 262K). With MTP each 1K of context costs ~29 MiB
 (q4 KV, the MTP layer's KV, and two flash-attention buffers that grow with context), and llama-server must stay
@@ -141,6 +172,10 @@ the Harness provider needs). It opens two windows:
   When the proxy has to restart llama (a model switch, an image), the new server is detached, so it keeps that
   property; the llama window keeps showing its progress (same log file) and still stops it on exit.
 
+`scripts\afk-stop.cmd` is the counterpart: it stops Harness (with its MCP children), both windows, any llama-server,
+the Strata server and an engine left without it, ComfyUI on :8190 and harness-watch, then reports the freed VRAM
+(`-KeepHarness` stops only the model side). Other node/python processes are left alone.
+
 `-Watch` also opens `scripts/harness-watch.mjs`, a live view of the agent's session: its reasoning, tool calls and
 results, todo progress with a rough time estimate, context use, compactions, decode speed. `-NoHarness` starts only
 the model and the proxy.
@@ -157,8 +192,8 @@ endpoint is not an official API, so it may rate-limit or stop working; then the 
 model, the session and the GPU are not involved. `harness-watch.mjs --en` shows the original.
 
 Switching models: `afk api` loads the profile a chat request names as its `model` (a profile name, or a `.gguf`
-path = the first profile using that file). DeepSeek Harness lists `q38` (104K), `q38-128k` and `q38-160k` in its
-model picker; choosing one reloads llama-server (~10-20 s, the conversation is re-read) while requests wait. Image
+path = the first profile using that file). DeepSeek Harness lists `q38` (104K), `q38-128k`, `q38-160k` and `flash` in its
+model picker; choosing one reloads llama-server (~10-20 s; `flash` ~60-80 s; the conversation is re-read) while requests wait. Image
 generation and switches take turns on the GPU. `GET /v1/models` lists the profiles with the loaded one marked.
 
 In DeepSeek Harness, search runs through the harness's own `web_search` tool, so it gets the harness's search card

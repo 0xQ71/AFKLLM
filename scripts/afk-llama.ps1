@@ -96,16 +96,37 @@ while (Alive) {
       if ($lastGen) { Say $lastGen 'Green'; $lastGen = $null }
       Say ("  контекст: {0} / {1} ток{2}" -f (N $used), (N $ctxMax), $pct) 'DarkGray'
     }
-    elseif ($l -match '^\S+ E ' -or $l -match 'CUDA error|out of memory') { Say ("  ошибка llama: " + $l.Trim()) 'Red' }
+    # ---- Strata (profile flash): its server prints plain progress lines ----
+    elseif ($l -match '^\[strata\] (still starting \((\d+) s\)|experts loaded: ([\d.]+) GiB|filling the GPU''s expert cache|almost ready)') {
+      $what = if ($Matches[2]) { "загрузка: {0} с" -f $Matches[2] } elseif ($Matches[3]) { "эксперты в RAM: {0} GiB" -f $Matches[3] } elseif ($l -match 'filling') { 'заполняю кэш экспертов на GPU' } else { 'почти готово' }
+      Status "  Strata: $what"
+    }
+    elseif ($l -match '^ready: http.*context (\d+) tokens') { $ctxMax = [int]$Matches[1]; Say ("  модель загружена (Strata), контекст {0} ток" -f (N $ctxMax)) 'DarkGray' }
+    elseif ($l -match '^\[strata\] reading the prompt: ([\d,]+) of ([\d,]+) tokens, (\d+) s so far') {
+      $a = [double]($Matches[1] -replace ',', ''); $b = [double]($Matches[2] -replace ',', ''); $s = [double]$Matches[3]
+      Status ("  читаю промпт: {0,3:N0}%  {1} ток · {2:N0} t/s" -f (100 * $a / [Math]::Max(1, $b)), (N $a), ($a / [Math]::Max(1, $s)))
+    }
+    elseif ($l -match '^\[strata\] done: (\d+) tokens in (\d+) s \(([\d.]+) tok/s\)(?:.*expert cache ([\d.]+)% hit)?') {
+      $hit = if ($Matches[4]) { "  · эксперты в VRAM {0}%" -f $Matches[4] } else { '' }
+      Say ("  ответ: {0} ток за {1} с · {2:N1} t/s{3}" -f (N $Matches[1]), $Matches[2], [double]$Matches[3], $hit) 'Green'
+      try {
+        $used = [int](Invoke-RestMethod "http://127.0.0.1:$llamaPort/slots" -TimeoutSec 3)[0].n_prompt_tokens
+        $pct = if ($ctxMax) { ' ({0:N0}%)' -f (100 * $used / $ctxMax) } else { '' }
+        Say ("  контекст: {0} / {1} ток{2}" -f (N $used), (N $ctxMax), $pct) 'DarkGray'
+      } catch {}
+    }
+    elseif ($l -match '^\[strata\] thinking budget reached') { Say '  размышление упёрлось в бюджет, модель переходит к ответу' 'Yellow' }
+    elseif ($l -match '^\S+ E ' -or $l -match 'CUDA error|out of memory|Traceback|engine (stopped|exited)') { Say ("  ошибка модели: " + $l.Trim()) 'Red' }
   }
 }
 $done = $true
 Say "llama-server остановлен (afk llama, код $($proc.ExitCode))." 'Yellow'
 } finally {
-  # Ctrl+C: this window owns the model, also the one afk api restarted detached
+  # Ctrl+C: this window owns the model, also the one afk api restarted detached. The whole tree: Strata's port belongs
+  # to its Python server, and the engine holding the GPU and ~47 GB of RAM is its child.
   if (-not $done) {
     Get-NetTCPConnection -State Listen -LocalPort $llamaPort -ErrorAction SilentlyContinue |
-      ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }
+      ForEach-Object { taskkill /PID $_.OwningProcess /T /F 2>$null | Out-Null }
     if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
   }
 }

@@ -32,8 +32,9 @@
 
 </div>
 
-AFKLLM — это локальный бэкенд и агент для программирования. Он запускает языковую модель через llama.cpp на вашей
-видеокарте и даёт к ней три входа:
+AFKLLM — это локальный бэкенд и агент для программирования. Он запускает языковую модель на вашей видеокарте (через
+llama.cpp, а модели больше видеокарты — через [Strata](https://github.com/Niko1221/Strata), видеокарта + ОЗУ) и даёт
+к ней три входа:
 
 - **CLI `afk`**: агент в терминале в духе Claude Code. Читает и правит файлы, запускает команды, ведёт список дел,
   работает в режиме AUTO MODE часами без присмотра.
@@ -42,6 +43,17 @@ AFKLLM — это локальный бэкенд и агент для прог�
 - **Desktop-приложение** (Electron) на том же ядре.
 
 Модель, картинки, поиск и сессии остаются на вашем компьютере. Аккаунт, ключи и облако не нужны.
+
+**Быстрый старт** (Windows, NVIDIA): установите [DeepSeek Harness](#3-deepseek-harness) и запустите его один раз, затем
+
+```powershell
+git clone https://github.com/0xQ71/AFKLLM.git; cd AFKLLM; npm install
+scripts\setup.cmd
+```
+
+`setup` смотрит на железо и советует модель (64 ГБ ОЗУ → `flash`, 256K контекста; иначе `q38`), скачивает и
+проверяет её, ставит движок, профиль Harness и ярлыки «AFKLLM — запустить / остановить модель / выключить всё» на
+рабочий стол. Повторный запуск безопасен: готовые шаги пропускаются, оборванная загрузка докачивается.
 
 👏 Отзывы и баги → [GitHub Issues](https://github.com/0xQ71/AFKLLM/issues) · подробная документация → [docs/cli.md](docs/cli.md)
 
@@ -132,9 +144,10 @@ AFKLLM — это локальный бэкенд и агент для прог�
 
 | Профиль | Модель | Контекст | Скорость и качество |
 |---|---|---|---|
-| **`q38`** (по умолчанию) | Qwen3.8 27B (baa-ai RAM-13GB) + встроенный MTP + LM-голова Q5_K | 104K | **рекомендуется**: coder-тест 16/16, агентные задачи 2/2, ~69 t/s на коротком ответе, ~40–50 t/s в реальной агентной работе, needle 6/6 на 90K; целиком на GPU |
+| **`q38`** (по умолчанию при ОЗУ < 64 ГБ) | Qwen3.8 27B (baa-ai RAM-13GB) + встроенный MTP + LM-голова Q5_K | 104K | **для 16 ГБ видеокарты**: coder-тест 16/16, агентные задачи 2/2, ~69 t/s на коротком ответе, ~40–50 t/s в реальной агентной работе, needle 6/6 на 90K; целиком на GPU |
 | `q38-128k` | тот же файл, MTP draft 2, FFN 5 слоёв на CPU | 128K | ~46 t/s, на треть медленнее ради +24K |
 | `q38-160k` | тот же файл без MTP | 160K | ~30 t/s (15 t/s на глубине 138K), для чтения очень больших входов |
+| **`flash`** (по умолчанию при 64 ГБ ОЗУ) | Qwen3.8-Flash-Next IQ3_XXS (MoE, 47 ГБ весов) на [Strata](https://github.com/Niko1221/Strata) | **256K** (родной) | **рекомендуется, нужно 64 ГБ ОЗУ**: горячие эксперты в VRAM, остальные в ОЗУ на CPU; 55–85 t/s генерация (и на глубине 200K ~60), 750–1850 t/s чтение промпта (llama.cpp на этой модели: 18,5 и 300); needle 3/3 на 200K; мышление до 32K на шаг; агентная задача на 12 файлов и 23 теста в Harness за 7 мин |
 
 Почему 104K, а не больше: модель умеет 262K, но упирается VRAM. С MTP каждый 1K контекста стоит ~29 МиБ, а
 llama-server должен оставаться ниже ~15,5 ГБ: дальше Windows молча уносит память в ОЗУ, и скорость падает до
@@ -155,6 +168,29 @@ llama-server должен оставаться ниже ~15,5 ГБ: дальше
 3. llama.cpp **b12063** (CUDA 13.4) в `C:\Models\llama.cpp\b12063\`. Его и всё для картинок скачивает
    `python -u scripts/stage0/download-models.py --root C:\Models`. Более новая b12329 на этом профиле оказалась на
    12–23 % медленнее (ниже принятие MTP), поэтому закреплена b12063.
+
+**Профиль `flash` (Strata)** — модель больше видеокарты, основная на ПК с 64 ГБ ОЗУ. Всё ниже делает
+`scripts\setup.cmd -Model flash`; вручную:
+
+1. ОЗУ 64 ГБ и файл подкачки так, чтобы ОЗУ + подкачка было не меньше ~96 ГБ (Strata резервирует ~61 ГБ; при
+   меньшем лимите она сама выключает кэш разговоров). Видеокарта NVIDIA от 12 ГБ.
+2. Файлы модели (~72 ГБ) в `C:\Models\ISTA-DASLab__Qwen3.8-Flash-Next-GSQ-RCO-GGUF\IQ3_XXS\`:
+
+   | Файл | Размер | Что |
+   |---|---|---|
+   | [`Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf`](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/resolve/main/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf) | 43,8 ГБ | веса |
+   | [`Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf`](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/resolve/main/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf) | 26,8 ГБ | таблица n-грамм |
+   | [`mmproj-Qwen3.8-Flash-Next-BF16.gguf`](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/resolve/main/mmproj-Qwen3.8-Flash-Next-BF16.gguf) | 0,9 ГБ | зрение |
+
+   Удобнее загрузчиком (8 потоков, докачка, проверка SHA-256; уже скачанные файлы только проверяет):
+   `python -u scripts/stage0/download-models.py --flash`
+3. [Strata Terminal](https://github.com/Niko1221/Strata) (MIT; ставится в `%LOCALAPPDATA%\Strata`, без прав
+   администратора, PATH не трогает): `irm https://github.com/Niko1221/Strata/releases/latest/download/install.ps1 | iex`.
+   Затем один раз `scripts\strata-setup.cmd`: подготовка модели на месте (+1,7 ГБ), загрузка движка и драфтера
+   DFlash2, подбор настроек, пресет `afk-flash`.
+4. `scripts\harness.cmd` (или `afk api`): при 64 ГБ ОЗУ и готовой Strata профиль `flash` выбирается сам. Загрузка
+   ~60–80 с. AFKLLM запускает сервер Strata на порту 18301 вместо llama-server, поэтому прокси, смена модели и
+   GPU-своп для картинок работают как обычно. Проверки обновлений Strata выключены (`STRATA_UPDATE_CHECK=0`).
 
 Своя модель или другая видеокарта: добавьте профиль в `~/.afkllm/cli.json` (см. [Своё использование](#4-своё-использование)).
 
@@ -292,7 +328,7 @@ DeepSeek Harness (Desktop-приложение DeepSeek для агентной 
    powershell -ExecutionPolicy Bypass -File harness\install-profile.ps1
    ```
    Скрипт сохраняет старый `cordis.patch.yml` как `.bak-<дата>` и кладёт [`harness/dsh-profile/cordis.patch.yml`](harness/dsh-profile/cordis.patch.yml):
-   провайдер `afkllm` (модели `q38`, `q38-128k`, `q38-160k`), пресеты **AFKLLM** и **AFKLLM + браузер**
+   провайдер `afkllm` (модели `q38`, `q38-128k`, `q38-160k`, `flash`), пресеты **AFKLLM** и **AFKLLM + браузер**
    (Playwright MCP на Edge), сжатие под окно 104K, MCP-инструменты AFKLLM и Context7, режим прав `workspace-auto`,
    выключенная телеметрия. Ещё он подключает плагины поиска и `/image` из этого репозитория, кладёт правила агента
    `AGENTS.md` и навыки (`init`, `review`, `debug`, `commit`, `remember`, `simplify`, `browser-test`, `godot`) в
@@ -301,11 +337,12 @@ DeepSeek Harness (Desktop-приложение DeepSeek для агентной 
 **Каждый раз:**
 
 ```powershell
-scripts\harness.cmd             # модель q38 + прокси + DeepSeek Harness
+scripts\harness.cmd             # модель по умолчанию (flash при 64 ГБ ОЗУ, иначе q38) + прокси + Harness
 scripts\harness.cmd -Ask        # спросить, какую модель грузить
 scripts\harness.cmd -Model q38-128k
 scripts\harness.cmd -Watch      # ещё окно harness-watch: что делает агент
 scripts\harness.cmd -NoHarness  # только модель и прокси
+scripts\afk-stop.cmd            # остановить всё (модель, прокси, Harness) и освободить VRAM; -KeepHarness оставит Harness
 ```
 
 Откроются окна **llama-server** (модель и её живая работа на русском: чтение промпта в %, скорость, принятие MTP,

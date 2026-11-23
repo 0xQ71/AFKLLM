@@ -8,19 +8,20 @@
 //   afk serve --stdio           headless core: NDJSON commands on stdin, events on stdout
 //   afk api                     backend for an external harness: llama-server on /v1 + AFKLLM tools on /mcp
 //
-// Model: --model <profile|file.gguf> starts llama-server (profiles: q38, q38-128k, q38-160k, or ~/.afkllm/cli.json),
+// Model: --model <profile|file.gguf> starts llama-server (profiles: q38, q38-128k, q38-160k, flash = Qwen3.8-Flash-Next on Strata, or ~/.afkllm/cli.json),
 //        --url http://127.0.0.1:8080 uses a running llama-server instead.
 import { createInterface } from 'node:readline'
 import { existsSync, statSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { Agent } from '../core/agent'
 import { LlmClient } from '../core/llm'
-import { CONFIG_DIR, ensureServer, lanIPv4, loadConfig, profileForModel, profiles, startLanProxy, type ModelProfile, type RunningServer } from '../core/server'
+import { CONFIG_DIR, defaultProfileName, ensureServer, lanIPv4, loadConfig, profileForModel, profiles, startLanProxy, type ModelProfile, type RunningServer } from '../core/server'
 import { imageGenMissing } from '../core/imagegen'
 import { mcpRoute, searchRoute } from '../core/harness'
 import { dangerousFolder, isDirectory } from '../core/workspace'
 import { createInterface as createLineReader } from 'node:readline/promises'
 import { GpuSwap, killListener, waitDown } from '../core/swap'
+import { strataMissing } from '../core/strata'
 import type { GenerateImageRequest, GenerateImageResult } from '../core/tools'
 import { PERMISSION_MODES, type AgentEvent, type PermissionDecision, type PermissionMode } from '../core/types'
 import { c } from './ansi'
@@ -61,7 +62,7 @@ Options:
   -p, --print               run the prompt non-interactively and print the result
   --auto                    AUTO MODE: act without asking (risky actions still ask / are refused)
   --mode <m>                default | acceptEdits | plan | auto
-  -m, --model <profile|gguf> model profile (q38, q38-128k, q38-160k) or a .gguf path
+  -m, --model <profile|gguf> model profile (q38, q38-128k, q38-160k, flash) or a .gguf path
   --url <url>               use a running llama-server instead of starting one
   --ctx <n>                 context size when starting llama-server
   --port <n>                llama-server port (default 18300)
@@ -129,14 +130,14 @@ function parseArgs(argv: string[]): Args {
 
 /** The name the chosen profile goes by: a profile name, or the .gguf path given with -m. */
 function profileName(a: Args, cfg = loadConfig()): string {
-  const name = a.model ?? process.env.AFK_MODEL ?? cfg.defaultProfile ?? 'q38'
+  const name = a.model ?? process.env.AFK_MODEL ?? defaultProfileName(cfg)
   return profiles(cfg)[name] ? name : resolve(name)
 }
 
 function pickProfile(a: Args): ModelProfile {
   const cfg = loadConfig()
   const all = profiles(cfg)
-  const name = a.model ?? process.env.AFK_MODEL ?? cfg.defaultProfile ?? 'q38'
+  const name = a.model ?? process.env.AFK_MODEL ?? defaultProfileName(cfg)
   if (all[name]) return all[name]
   if (/\.gguf$/i.test(name) && existsSync(name)) {
     return { label: name.split(/[\\/]/).pop()!, model: resolve(name), ctx: a.ctx ?? 32768, args: { 'n-gpu-layers': '99' }, sampling: { temperature: 0.6, top_p: 0.95, top_k: 20 } }
@@ -196,9 +197,14 @@ function imageGen(a: Args, conn: { llm: LlmClient; profile?: ModelProfile; serve
   }
 }
 
-/** A profile sees images when llama-server is started with a multimodal projector. */
+/** The model file is there (and for a Strata profile: Strata is installed and its preset set up). */
+function profileReady(p: ModelProfile): boolean {
+  return existsSync(p.model) && (!p.strata || !strataMissing(p.strata))
+}
+
+/** A profile sees images when llama-server is started with a multimodal projector (Strata: its picture reader). */
 function hasVision(p?: ModelProfile): boolean {
-  return !!p?.args?.mmproj || process.env.AFK_VISION === '1'
+  return !!p?.args?.mmproj || (!!p?.strata && (p.strata.config as { vision?: unknown } | undefined)?.vision !== false) || process.env.AFK_VISION === '1'
 }
 
 // ---------------------------------------------------------------- print mode
@@ -411,7 +417,7 @@ async function serveApi(a: Args): Promise<number> {
       '/v1/models': (_req, res) => {
         res.writeHead(200, { 'content-type': 'application/json' })
         res.end(JSON.stringify({ object: 'list', data: Object.entries(all).map(([id, p]) => ({
-          id, object: 'model', owned_by: 'afkllm', label: p.label, context_window: p.ctx, loaded: id === current, available: existsSync(p.model),
+          id, object: 'model', owned_by: 'afkllm', label: p.label, context_window: p.ctx, loaded: id === current, available: profileReady(p),
         })) }))
       },
     },
@@ -503,8 +509,8 @@ async function main(): Promise<number> {
   if (a.listModels) {
     const cfg = loadConfig()
     const all = profiles(cfg)
-    const def = cfg.defaultProfile ?? 'q38'
-    const rows = Object.entries(all).map(([name, p]) => ({ name, label: p.label, ctx: p.ctx, model: p.model, available: existsSync(p.model), default: name === def }))
+    const def = defaultProfileName(cfg)
+    const rows = Object.entries(all).map(([name, p]) => ({ name, label: p.label, ctx: p.ctx, model: p.model, engine: p.strata ? 'strata' : 'llama', available: profileReady(p), default: name === def }))
     if (a.json) process.stdout.write(JSON.stringify(rows) + '\n')
     else for (const r of rows) process.stdout.write(`${r.default ? '*' : ' '} ${r.name.padEnd(12)} ${r.label}${r.available ? '' : '  (file missing)'}\n`)
     return 0

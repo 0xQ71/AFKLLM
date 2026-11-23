@@ -4,7 +4,7 @@ Shows a live console view (per-file and total: size, %, speed, elapsed, ETA),
 resumes interrupted downloads from *.part files, verifies SHA-256 and writes a
 machine-readable status file so progress can be watched from another process.
 
-Usage:  python -u scripts/stage0/download-models.py [--root C:\\Models] [--only substr]
+Usage:  python -u scripts/stage0/download-models.py [--root C:\\Models] [--only substr] [--flash]
 """
 from __future__ import annotations
 
@@ -75,6 +75,22 @@ def build_plan(root: Path) -> list[Item]:
             "[image] Qwen3-VL 8B text encoder W4A8", root),
         img(QWEN_IMAGE, "vae/qwen_image_2.1_vae_bf16.safetensors", "vae",
             "[image] Qwen-Image 2.1 VAE bf16", root),
+    ]
+
+
+FLASH_REPO = "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF"
+
+
+def flash_plan(root: Path) -> list[Item]:
+    """The `flash` profile: Qwen3.8-Flash-Next IQ3_XXS (shard 1 = weights, shard 2 = the n-gram table) + the
+    vision projector, all in <root>\\ISTA-DASLab__Qwen3.8-Flash-Next-GSQ-RCO-GGUF\\IQ3_XXS (where Strata's preset
+    and src/core/server.ts look). ~76.7 GB."""
+    q = root / FLASH_REPO.replace("/", "__") / "IQ3_XXS"
+    base = f"https://huggingface.co/{FLASH_REPO}/resolve/main"
+    names = [f"IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-0000{i}-of-00002.gguf" for i in (1, 2)]
+    return [Item(f"[flash] {Path(n).name}", f"{base}/{n}", q / Path(n).name) for n in names] + [
+        Item("[flash] mmproj-Qwen3.8-Flash-Next-BF16.gguf", f"{base}/mmproj-Qwen3.8-Flash-Next-BF16.gguf",
+             q / "mmproj-Qwen3.8-Flash-Next-BF16.gguf"),
     ]
 
 
@@ -367,6 +383,18 @@ def fetch_segment(it: Item, path: Path, start: int, end: int, view: View, lock: 
 def download(it: Item, idx: int, view: View, streams: int) -> None:
     it.dest.parent.mkdir(parents=True, exist_ok=True)
     marker = it.dest.with_name(it.dest.name + ".verified")
+    if it.dest.exists() and it.dest.stat().st_size == it.size and it.sha256 and not marker.exists():
+        # a complete file from elsewhere (a browser, another tool): check it instead of downloading it again
+        view.println(f"   {it.label}: файл уже есть, проверяю SHA-256…")
+        h = hashlib.sha256()
+        with open(it.dest, "rb") as f:
+            for chunk in iter(lambda: f.read(CHUNK), b""):
+                h.update(chunk)
+        if h.hexdigest() == it.sha256:
+            marker.write_text(it.sha256, encoding="utf-8")
+        else:
+            view.println(f"   {it.label}: SHA-256 не совпал, скачиваю заново")
+            it.dest.unlink()
     if it.dest.exists() and it.dest.stat().st_size == it.size and (marker.exists() or not it.sha256):
         it.done_bytes = it.size
         view.println(f" ✓ {it.label}: уже скачан ({fmt_bytes(it.size).strip()})")
@@ -452,6 +480,8 @@ def main() -> int:
     ap.add_argument("--streams", type=int, default=8, help="parallel HTTP range streams per file")
     ap.add_argument("--only", default=None, help="download only items whose label contains this")
     ap.add_argument("--stage0", action="store_true", help="the old stage-0 LLM candidate list instead")
+    ap.add_argument("--flash", action="store_true",
+                    help="only the `flash` model (Qwen3.8-Flash-Next IQ3_XXS for Strata, ~76.7 GB, needs 64 GB RAM)")
     args = ap.parse_args()
     if os.name == "nt":
         os.system("")  # enable ANSI cursor control in the Windows console
@@ -463,7 +493,7 @@ def main() -> int:
     root.mkdir(parents=True, exist_ok=True)
     status = root / "_download-status.json"
 
-    items = stage0_candidates(root) if args.stage0 else build_plan(root)
+    items = stage0_candidates(root) if args.stage0 else flash_plan(root) if args.flash else build_plan(root)
     if args.only:
         items = [i for i in items if args.only.lower() in i.label.lower()]
     print(" AFKLLM · загрузка моделей в", root)
