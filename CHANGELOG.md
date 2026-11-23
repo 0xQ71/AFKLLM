@@ -3,6 +3,19 @@
 Заметки к каждому релизу публикуются в описании [GitHub Release](https://github.com/0xQ71/AFKLLM/releases),
 полный текст лежит в [`docs/releases/`](docs/releases/).
 
+## 0.5.2-20261124
+
+Strata 0.2.20 и DeepSeek Harness 0.2.3: запуск активной версии Strata и настройки, которые возвращают скорость нового движка на 16 ГБ.
+
+Подробно: [`docs/releases/v0.5.2-20261124.md`](docs/releases/v0.5.2-20261124.md).
+
+- `afk api` запускает сервер из активной версии Strata (после `strata update` она в `components\control\<версия>`).
+- Настройки движка профиля идут в `user_args`, их сервер Strata не пересобирает.
+- Профиль `flash` на Strata 0.2.20: `STRATA_NV_CHUNK=16` и `--vram-reserve-mib 350` — чтение промпта 1658 / 1984 т/с на 30K / 125K
+  (без них 1020 / 1043, на 0.2.18 — 1591 / 1939), генерация как раньше.
+- `scripts\strata-setup.cmd`: 256K и полный подбор настроек (`--tune thorough --retune`).
+- Проверено с DeepSeek Harness 0.2.3-alpha.2.
+
 ## 0.5.1-20261123
 
 Офлайн-перевод рассуждений и промптов `/image` на этом ПК, `/image-clean` по чатам.
