@@ -3,7 +3,11 @@
 Заметки к каждому релизу публикуются в описании [GitHub Release](https://github.com/0xQ71/AFKLLM/releases),
 полный текст лежит в [`docs/releases/`](docs/releases/).
 
-## Не выпущено
+## 0.5.1-20261123
+
+Офлайн-перевод рассуждений и промптов `/image` на этом ПК, `/image-clean` по чатам.
+
+Подробно: [`docs/releases/v0.5.1-20261123.md`](docs/releases/v0.5.1-20261123.md).
 
 - Офлайн-переводчик в `afk api` (`/translate/translatetext`, протокол переводчика Edge): рассуждения в DeepSeek Harness
   и `harness-watch` переводятся на русский на этом ПК, а не через Microsoft. OPUS-MT tc-big в CTranslate2 int8 на
