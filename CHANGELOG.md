@@ -3,8 +3,18 @@
 Заметки к каждому релизу публикуются в описании [GitHub Release](https://github.com/0xQ71/AFKLLM/releases),
 полный текст лежит в [`docs/releases/`](docs/releases/).
 
-## Не выпущено
+## 0.5.0-20261123
 
+Qwen3.8-Flash-Next на Strata (256K, по умолчанию на ПК с 64 ГБ), подготовка ПК одной командой, хуки как в
+Claude Code для DeepSeek Harness, ярлыки на рабочем столе.
+
+Подробно: [`docs/releases/v0.5.0-20261123.md`](docs/releases/v0.5.0-20261123.md).
+
+- Хуки для DeepSeek Harness (плагин `harness/dsh-hooks-afkllm`, `/hooks`): защита от разрушительных команд,
+  проверка синтаксиса после каждой правки, проверка перед концом хода с возвратом агента к сломанным файлам или
+  упавшим тестам, уведомление Windows после долгого хода, свои `PreToolUse` / `PostToolUse` / `Stop` в формате
+  Claude Code (`~/.dsh/hooks.json`, `<проект>/.dsh/hooks.json` после `/hooks trust`).
+- Навыки агента `security-review` и `test`.
 - Профиль `flash`: Qwen3.8-Flash-Next IQ3_XXS (MoE, 47 ГБ весов) на движке [Strata](https://github.com/Niko1221/Strata)
   для ПК с 64 ГБ ОЗУ: родной контекст 256K, 55–85 t/s и 750–1850 t/s чтения промпта против 18,5 и 300 у llama.cpp
   на тех же файлах, мышление xhigh до 32K на шаг с сэмплингом из карточки модели.
