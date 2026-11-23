@@ -227,7 +227,7 @@ used with it lives in `~/.dsh/profiles/desktop/cordis.patch.yml` (provider `afkl
   network, screenshots. Separate because its 25 tools cost ~6K tokens of every prompt.
 - permission preset `workspace-auto`: writes only inside the project, no approval prompts (`/permission
   workspace-auto`); the default stays `workspace-write` (asks).
-- skills in `~/.dsh/skills`: `init`, `review`, `debug`, `godot`, `commit`, `remember`, `simplify`, `browser-test`.
+- skills in `~/.dsh/skills`: `init`, `review`, `security-review`, `test`, `debug`, `godot`, `commit`, `remember`, `simplify`, `browser-test`.
 
 The headless profile `~/.dsh/profiles/afk-headless` has Context7 too.
 

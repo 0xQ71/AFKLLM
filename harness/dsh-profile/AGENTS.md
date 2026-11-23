@@ -52,6 +52,8 @@ whatever language suits you; only these user-facing words follow the user.
 - `commit` — a clean commit in the repo's style (never push). `remember` — save a durable fact or user preference
   for future sessions ("запомни"). `simplify` — clean up the code you changed without changing behaviour.
   `browser-test` — check a web app / HTML5 game in Edge (preset "AFKLLM + браузер").
+  `test` — write / extend tests and get them green without weakening them. `security-review` — injection, paths,
+  secrets, auth: proven findings only.
 
 ## Godot: the API from the official class reference
 - Find the engine version first (`& <godot> --version`, or `config/features` in project.godot). Before writing a

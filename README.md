@@ -331,7 +331,7 @@ DeepSeek Harness (Desktop-приложение DeepSeek для агентной 
    провайдер `afkllm` (модели `q38`, `q38-128k`, `q38-160k`, `flash`), пресеты **AFKLLM** и **AFKLLM + браузер**
    (Playwright MCP на Edge), сжатие под окно 104K, MCP-инструменты AFKLLM и Context7, режим прав `workspace-auto`,
    выключенная телеметрия. Ещё он подключает плагины поиска и `/image` из этого репозитория, кладёт правила агента
-   `AGENTS.md` и навыки (`init`, `review`, `debug`, `commit`, `remember`, `simplify`, `browser-test`, `godot`) в
+   `AGENTS.md` и навыки (`init`, `review`, `security-review`, `test`, `debug`, `commit`, `remember`, `simplify`, `browser-test`, `godot`) в
    `~/.dsh` (существующие не трогает) и задаёт `AFKLLM_API_KEY=local`. Проверяет, что профиль собирается.
 
 **Каждый раз:**
