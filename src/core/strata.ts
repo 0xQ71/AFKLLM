@@ -21,10 +21,24 @@ export interface StrataSpec {
 }
 
 export const STRATA_HOME = process.env.STRATA_DATA_DIR || join(process.env.LOCALAPPDATA || join(homedir(), 'AppData', 'Local'), 'Strata')
-const TERMINAL = join(STRATA_HOME, 'terminal', 'current')
+
+/**
+ * The active Strata Control: its Python, serve/server.py and data. The installer's copy is terminal\current; a newer
+ * one installed by `strata update` lives in components\control\<folder> (named by control\active.json), and the old
+ * terminal's strata.py hands over to it the same way. Measured 2026-11-23: after updating 0.2.18 -> 0.2.20,
+ * terminal\current still pointed at 0.1.64 while 0.1.66 was active.
+ */
+export function strataRoot(home: string = STRATA_HOME): string {
+  try {
+    const active = JSON.parse(readFileSync(join(home, 'components', 'control', 'active.json'), 'utf8')) as { folder?: string; version?: string }
+    const dir = join(home, 'components', 'control', String(active.folder ?? active.version ?? ''))
+    if ((active.folder || active.version) && existsSync(join(dir, 'python', 'python.exe')) && existsSync(join(dir, 'serve'))) return dir
+  } catch { /* no update installed: the installer's terminal */ }
+  return join(home, 'terminal', 'current')
+}
 
 export function strataPython(): string {
-  return join(TERMINAL, 'python', 'python.exe')
+  return join(strataRoot(), 'python', 'python.exe')
 }
 
 export function strataLaunchConfig(preset: string): string {
@@ -33,7 +47,7 @@ export function strataLaunchConfig(preset: string): string {
 
 /** What is missing before this profile can start, as a message with the fix; undefined when ready. */
 export function strataMissing(spec: StrataSpec): string | undefined {
-  if (!existsSync(strataPython())) return `Strata is not installed (${TERMINAL}). Install it, then run scripts\\strata-setup.cmd.`
+  if (!existsSync(strataPython())) return `Strata is not installed (${strataRoot()}). Install it, then run scripts\\strata-setup.cmd.`
   if (!existsSync(strataLaunchConfig(spec.preset))) return `Strata preset "${spec.preset}" is not set up (${strataLaunchConfig(spec.preset)}). Run scripts\\strata-setup.cmd.`
   return undefined
 }
@@ -73,7 +87,13 @@ export function strataCommand(spec: StrataSpec, opts: { port: number; host: stri
       ? { ...(old as object), ...(v as object) } : v
   }
   const args = Array.isArray(base.args) ? (base.args as string[]) : []
-  cfg.args = mergeEngineArgs(args, { ...(spec.engineArgs ?? {}), 'max-context': String(opts.ctx) })
+  const over = { ...(spec.engineArgs ?? {}), 'max-context': String(opts.ctx) }
+  cfg.args = mergeEngineArgs(args, over)
+  // The server rebuilds some engine options at every start (the drafter's --spec / --draft-conf, a VRAM fit): only the
+  // options in "user_args" count as the person's and win over that (Strata strata_control/user_args.py). Measured
+  // 2026-11-23: without it a --spec of ours was replaced by the server's 8.
+  const userArgs = Array.isArray(base.user_args) ? (base.user_args as string[]) : []
+  cfg.user_args = mergeEngineArgs(userArgs, Object.fromEntries(Object.entries(over).filter(([, v]) => v !== '__off__')))
   delete cfg.args_written
   delete cfg.args_derived
   cfg.port = opts.port
@@ -88,7 +108,7 @@ export function strataCommand(spec: StrataSpec, opts: { port: number; host: stri
   return {
     exe: strataPython(),
     args: ['-u', '-m', 'serve.server', '--engine', 'strata', '--config', configPath, '--host', opts.host, '--port', String(opts.port), '--parallel', '1'],
-    cwd: TERMINAL,
+    cwd: strataRoot(),
     configPath,
   }
 }

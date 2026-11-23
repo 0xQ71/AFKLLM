@@ -30,13 +30,22 @@ RTX 5060 Ti 16 GB, files under `C:\Models`):
 
 [Strata](https://github.com/Niko1221/Strata) (MIT) keeps the hottest experts in VRAM (~8.6 GB) and the rest in pinned
 RAM (~40 GB), computed on the CPU, with int8 KV, a DFlash2 drafter and its own prefill kernels. `scripts\strata-setup.cmd`
-runs `strata launch` once (model prepared where the GGUF files lie, engine + drafter download, quick tune) and saves
-the preset `afk-flash`. AFKLLM then starts Strata's own server (`serve/server.py`, bundled Python) on a copy of that
-launch config in `~/.afkllm/strata/` with the profile's overrides (`src/core/server.ts`, `src/core/strata.ts`), on
+runs `strata launch` once (model prepared where the GGUF files lie, engine + drafter download, thorough tune at 256K)
+and saves the preset `afk-flash`. AFKLLM then starts Strata's own server (`serve/server.py`, the Python of the active
+Control: `components\control\<folder>` from `control\active.json` after a `strata update`, else `terminal\current`) on a
+copy of that launch config in `~/.afkllm/strata/` with the profile's overrides (`src/core/server.ts`,
+`src/core/strata.ts`; engine flags also go to `user_args`, the only ones the server does not rebuild), on
 :18301 where llama-server would run. Strata answers llama-server's `/health`, `/props`, `/slots/0?action=save|restore`
 and OpenAI `/v1`, so the proxy, model switching and the image GPU swap (slot saved in 0.5 s, unload 1.6 s, reload
 ~80 s, restore 0.5 s) need no special path; the process tree is killed with `taskkill /T` because the engine is a
 child of the Python server.
+
+Strata 0.2.18 → 0.2.20 (engine 0.1.64 → 0.1.66, measured 2026-11-24 through `afk api`, same prompts, fresh caches):
+on a 16 GB card 0.1.66 holds back 1280 MiB of VRAM against WDDM paging and keeps prompt chunks at 8192, which cost
+36-46 % of prefill here (30K / 125K: 1591 / 1939 → 1020 / 1043 t/s) and some decode. The profile sets
+`--vram-reserve-mib 350` (5139 expert slots, ~750 MB of VRAM left, 0.1.64 had 5188 / 738 MB) and `STRATA_NV_CHUNK=16`
+(16384-token chunks): 1658 / 1984 t/s, decode 62-64 t/s short and 46-51 t/s deep (0.2.18: 60-66 / 47-52), the
+125K needle found. The thorough tune of 0.2.20 itself said "already fastest" (it does not search these two).
 
 Profile overrides: `--conversation-cache-mib 4096` + `--conversation-cache-min-tokens 4096` park the conversation in
 RAM while a side request (title, sub-agent, compaction) takes the slot (returning: 1.3 s instead of 19 s for 18K);

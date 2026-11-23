@@ -107,8 +107,16 @@ export const BUILTIN_PROFILES: Record<string, ModelProfile> = {
         // that rewrites its history re-read up to 16K tokens (seen once: a 12K first prompt read twice, 24 s).
         // Same number of checkpoints (--prompt-cache 6, ~118 MB each), just denser.
         'prompt-cache-every': '4096',
+        // Strata 0.2.20 (engine 0.1.66) on a 16 GB card holds back 1280 MiB of VRAM against WDDM paging (#6128) and so
+        // caches fewer experts: 4572 slots instead of 0.1.64's 5188, with 1.7 GB of VRAM left unused after loading.
+        // 350 MiB brings it back to 5139 slots and ~750 MB free (0.1.64 ran stable with 738 MB free).
+        'vram-reserve-mib': '350',
       },
       config: {
+        // 0.1.66 also keeps prompt chunks at 8192 on 16 GB cards (#5199); 16384 (0.1.64's) is what reads long prompts
+        // fast here. Measured 2026-11-24, 30K / 125K prompts: 0.2.18 1591 / 1939 t/s, 0.2.20 as shipped 1020 / 1043,
+        // 0.2.20 with these two settings 1658 / 1984; decode the same within noise (62-64 short, 46-51 deep).
+        env: { STRATA_NV_CHUNK: '16' },
         // GPU swap for images (swap.ts): the conversation goes to a file and comes back instead of being re-read
         slot_save_path: join(MODELS, '_kv'),
         // a ceiling against runaway thinking, twice the 27B's: the model card puts no limit on thinking and says a
