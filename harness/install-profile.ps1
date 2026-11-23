@@ -4,7 +4,8 @@
 #     "AFKLLM + браузер", compaction for local windows, MCP tools of afk api + Context7, permission preset
 #     workspace-auto, no telemetry
 #   - the bundles from harness\dsh-profile\bundles.json (reasoning translation, session search, ...) into the profile
-#   - plugins dsh-web-search-afkllm (search card through afk api) and dsh-image-afkllm (/image), linked from this repo
+#   - plugins dsh-web-search-afkllm (search card through afk api), dsh-image-afkllm (/image) and dsh-hooks-afkllm
+#     (guard, syntax check after edits, Stop check, notifications, your hooks.json; /hooks), linked from this repo
 #   - agent rules harness\dsh-profile\AGENTS.md -> <DSH_HOME>\AGENTS.md and skills -> <DSH_HOME>\skills (existing ones
 #     are not overwritten: a different AGENTS.md is saved next to it as AGENTS.afkllm.md)
 #   - user environment variable AFKLLM_API_KEY=local (the provider needs a key; llama-server accepts any)
@@ -42,7 +43,7 @@ else { $pkg.dsh.profile | Add-Member -NotePropertyName bundles -NotePropertyValu
 [IO.File]::WriteAllText($pkgPath, ($pkg | ConvertTo-Json -Depth 20), $utf8)
 
 # 3. plugins of this repo, linked (an update of the repo updates them)
-foreach ($p in 'dsh-web-search-afkllm', 'dsh-image-afkllm') {
+foreach ($p in 'dsh-web-search-afkllm', 'dsh-image-afkllm', 'dsh-hooks-afkllm') {
   $link = 'link:' + ((Join-Path $PSScriptRoot $p) -replace '\\', '/')
   & $dsh plugin --profile $Profile add $link
   if ($LASTEXITCODE) { throw "dsh plugin add ${link}: код $LASTEXITCODE" }

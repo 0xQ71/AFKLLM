@@ -462,6 +462,21 @@
     - id: image-command-afkllm
       name: dsh-image-afkllm
 
+# Hooks like Claude Code (D:\CocosLoc\AFKLLM\harness\dsh-hooks-afkllm, linked): a guard against destructive
+# commands, a syntax check after every edit, a check before the turn ends (sends the agent back to broken files or a
+# failing Stop hook), a Windows notification after a long turn, and your own commands from ~/.dsh/hooks.json and
+# <project>/.dsh/hooks.json (the project file runs only after /hooks trust). /hooks shows the state.
+- insert:
+    - id: hooks-afkllm
+      name: dsh-hooks-afkllm
+      config:
+        guard: true
+        check: true
+        stopCheck: true
+        stopMaxContinues: 3
+        notify: { minSeconds: 60 }
+        # checkers: { ".gd": "godot --headless --check-only --script {file}" }
+
 # No telemetry: nothing leaves the PC. Product usage events and the session upload that
 # FEEDBACK_ONLY would do after a rating or /feedback (the whole session log) are both off.
 - id: session-telemetry-otel

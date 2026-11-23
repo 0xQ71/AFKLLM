@@ -231,6 +231,26 @@ used with it lives in `~/.dsh/profiles/desktop/cordis.patch.yml` (provider `afkl
 
 The headless profile `~/.dsh/profiles/afk-headless` has Context7 too.
 
+Hooks in the style of Claude Code: plugin `harness/dsh-hooks-afkllm` (linked into both profiles; row `hooks-afkllm`,
+config `guard` / `check` / `stopCheck` / `stopMaxContinues` / `notify` / `checkers`). It uses the Harness's own
+extension points: `ctx.tools.guard()` (built-in denials: deleting a drive root or the profile, formatting,
+diskpart, reboot, Defender off, HKLM deletes, writes to the hook / profile settings), `tools/pre-execute` (`ask` before
+`git push --force`, `reset --hard`, `clean -f`, `branch -D`, download-and-run; user PreToolUse commands),
+`fs/write-intent` + `fs/edit-intent` (which files a tool call changed), `tools/post-execute` (syntax check of those
+files: Python `ast`, `node --check`, TypeScript `transpileModule` from the project's `node_modules`, JSON, the
+PowerShell parser, merge-conflict markers, `checkers: { ".ext": "command {file}" }`; problems are appended to the tool
+result; user PostToolUse commands), `agent/turn-stopping` (re-check of the turn's edited files and user Stop commands;
+a failure goes back to the agent with `agent.inject()`, at most `stopMaxContinues` = 3 times per turn; subagents are
+skipped) and `turn/end` (a Windows toast as "DeepSeek Harness" after turns of `notify.minSeconds` = 60 s or more; off
+in afk-headless). User hooks: `~/.dsh/hooks.json` and `<project>/.dsh/hooks.json`, Claude Code's format (`matcher`
+is a regex over the Harness tool name or its Claude Code alias: `Bash` = `pwsh`, `Edit` = `edit` / `apply_patch`,
+`Write` = `write`); a command runs through cmd.exe in the project folder with the event JSON on stdin; exit 2 blocks
+with stderr, JSON stdout (`decision`, `hookSpecificOutput.permissionDecision` / `additionalContext`) works too; a
+hook's `allow` never bypasses the Harness approval. Stop hooks run only in turns that edited files unless
+`"always": true`. The project file runs only when its SHA-256 is in `~/.dsh/hooks-trust.json` (`/hooks trust`), so a
+cloned repo or the agent itself cannot add commands that run outside the sandbox. Tests: `node --test
+harness/dsh-hooks-afkllm/index.test.mjs`.
+
 Private images straight from a prompt: `/image [WxH] [seed=N] <prompt>` (plugin `harness/dsh-image-afkllm`, linked
 into the desktop profile) sends the prompt as written to `generate_image` on `afk api`, without the language model.
 Nothing leaves the PC (only 127.0.0.1). The prompt is not in the Harness session log (`recordInput: false`), not

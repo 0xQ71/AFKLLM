@@ -89,6 +89,9 @@ whatever language suits you; only these user-facing words follow the user.
   the stage (or `git diff <last-milestone>..HEAD`) and the project rules (SPEC / AGENTS.md); ask for concrete
   bugs and rule violations with file:line and no style remarks. Check each finding yourself, fix the real ones,
   re-run the checks. Skip it for small stages.
+- Text starting with `[hooks]` comes from automatic checks (syntax check after an edit, the project's Stop hook
+  such as its tests). Treat it as a failing check: fix the cause, re-run, then finish. A call denied by the hooks
+  guard stays denied: do not retry it in another form; if it is really needed, tell the user the exact command.
 
 ## Windows
 - The shell is PowerShell. Use PowerShell syntax (`;` not `&&` on Windows PowerShell 5.1, `$env:NAME`,

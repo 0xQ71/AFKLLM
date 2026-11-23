@@ -1,0 +1,11 @@
+{
+  "name": "dsh-hooks-afkllm",
+  "version": "1.0.0",
+  "description": "DeepSeek Harness hooks in the style of Claude Code: a guard against destructive shell commands, a syntax check after every file edit, a Stop check that sends the agent back to broken files or failing tests, a Windows notification when a long turn ends, and your own PreToolUse / PostToolUse / Stop commands from hooks.json",
+  "type": "module",
+  "main": "index.js",
+  "exports": { ".": "./index.js", "./package.json": "./package.json" },
+  "scripts": { "test": "node --test index.test.mjs" },
+  "license": "MIT",
+  "private": true
+}
