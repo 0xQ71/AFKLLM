@@ -124,7 +124,19 @@ export const BUILTIN_PROFILES: Record<string, ModelProfile> = {
         // agent steps measured 0.1-2.4K). The Harness model entry gives a step 40K: thinking + the answer.
         reasoning_budget_tokens: 32768,
         // screenshots: Strata's CPU reader defaults to 300 image tokens, too few to read text on a screen
-        vision: { max_tokens: 1024 },
+        // Images read on the GPU, only while pictures come (Strata's elastic encoder, #533): the expert cache gives the
+        // encoder ~0.8 GB while it runs and takes it back 60 s after the last picture. Measured 2026-11-24 on a 36-frame
+        // contact sheet: CPU 1K/2K/4K tokens 11 / 31-34 / 77 s to the first token; GPU 2.8 / 4.8 / 10 s (first picture
+        // +3-16 s to start the encoder); 2K reads all 18 caption words, 4K also tiny badges (the user's pick: 4K for
+        // everything; a picture is ~4.2K tokens of context). While the encoder runs, prefill is ~33 % slower
+        // (1120 vs 1665 t/s at 30K), decode unchanged; after the idle stop everything is back (1983 t/s).
+        // elastic_idle_s 60 (Strata's default 120): the cache gets its VRAM back a minute sooner; shorter would restart
+        // the encoder (+3-16 s) on most pictures of a screenshot loop, where pictures come 30-90 s apart
+        vision: { max_tokens: 4096, gpu: true, elastic: true, elastic_idle_s: 60 },
+        // also lets POST /v1/vram (on :18301) lend VRAM to another program, e.g. a video render: 35-450 ms to free
+        // 5.6-8.2 GB, 0.8-1 s to take it back, the whole cache again (8510 of 8509 MiB). While the image encoder runs it
+        // keeps its ~1.3 GB, which the cache gets back at the encoder's idle stop.
+        vram_elastic: true,
       },
     },
     // the model card's thinking-mode sampling (also what its agentic evals used): temperature 1.0, not the 27B's 0.6

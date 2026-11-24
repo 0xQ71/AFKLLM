@@ -47,6 +47,15 @@ on a 16 GB card 0.1.66 holds back 1280 MiB of VRAM against WDDM paging and keeps
 (16384-token chunks): 1658 / 1984 t/s, decode 62-64 t/s short and 46-51 t/s deep (0.2.18: 60-66 / 47-52), the
 125K needle found. The thorough tune of 0.2.20 itself said "already fastest" (it does not search these two).
 
+Vision on `flash`: Strata's elastic image encoder on the GPU (`vision: {gpu, elastic, max_tokens 4096,
+elastic_idle_s 60}` + `vram_elastic`): it starts with the first picture (3-16 s), the expert cache keeps ~0.8 GB free
+for it and takes it back 60 s after the last picture. A 36-frame contact sheet (1800x2665), time to the first token:
+CPU 1K / 2K / 4K tokens 11 / 31-34 / 77 s, GPU 2.8 / 4.8 / 10 s; 2K reads all 18 caption words, 4K also a tiny
+badge. While the encoder runs prefill is ~33 % slower (1120 vs 1665 t/s at 30K; only big uncached reads notice),
+decode unchanged; afterwards the cache is full again. `vram_elastic` also lets another program borrow VRAM without an
+unload: `POST :18301/v1/vram {"reserve_mib": N}` frees 5.6-8.2 GB in 35-450 ms, `{"reserve_mib": 0}` takes it back in
+0.8-1 s to the full cache (8510 of 8509 MiB); the model keeps working meanwhile (~39 t/s decode with a 1 GB cache).
+
 Profile overrides: `--conversation-cache-mib 4096` + `--conversation-cache-min-tokens 4096` park the conversation in
 RAM while a side request (title, sub-agent, compaction) takes the slot (returning: 1.3 s instead of 19 s for 18K);
 `--prompt-cache-every 4096` keeps the hybrid model's rewind checkpoints dense, so a client that rewrites its history
