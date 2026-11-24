@@ -1,6 +1,6 @@
 {
   "name": "afkllm",
-  "version": "0.5.2-20261124",
+  "version": "0.5.3-20261124",
   "description": "Local AI code editor powered by llama.cpp",
   "main": "./out/main/index.js",
   "author": "0xQ71 <https://github.com/0xQ71>",
