@@ -412,6 +412,7 @@ async function serveApi(a: Args): Promise<number> {
   const proxy = await startLanProxy({
     listenHost: a.lan ? '0.0.0.0' : '127.0.0.1', listenPort: port, upstreamPort: port + 1,
     sampling: () => conn.profile?.sampling,
+    effortBudgets: () => conn.profile?.effortBudgets,
     gate: () => gate ?? Promise.resolve(),
     onChat,
     routes: {

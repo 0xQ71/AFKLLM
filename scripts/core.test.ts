@@ -322,6 +322,21 @@ test('LAN proxy rewrites reasoning_effort high to xhigh', async () => {
   }
 })
 
+test('chat body: low / medium effort get the profile thinking budget unless the request names one', async () => {
+  const { rewriteChatBody } = await import('../src/core/server')
+  const budgets = { low: 1024, medium: 4096 }
+  const run = (b: object) => JSON.parse(rewriteChatBody(Buffer.from(JSON.stringify({ messages: [], ...b })), 'application/json', undefined, budgets).toString())
+  assert.equal(run({ chat_template_kwargs: { reasoning_effort: 'low' } }).reasoning_budget_tokens, 1024)
+  assert.equal(run({ reasoning_effort: 'minimal' }).reasoning_budget_tokens, 1024)
+  assert.equal(run({ reasoning: { effort: 'medium' } }).reasoning_budget_tokens, 4096)
+  assert.equal(run({ chat_template_kwargs: { reasoning_effort: 'high' } }).reasoning_budget_tokens, undefined)
+  assert.equal(run({}).reasoning_budget_tokens, undefined)
+  assert.equal(run({ reasoning_effort: 'low', reasoning_budget_tokens: 50 }).reasoning_budget_tokens, 50)
+  assert.equal(run({ reasoning_effort: 'low', thinking_budget_tokens: 70 }).reasoning_budget_tokens, undefined)
+  const plain = JSON.parse(rewriteChatBody(Buffer.from(JSON.stringify({ messages: [], reasoning_effort: 'low' })), 'application/json').toString())
+  assert.equal(plain.reasoning_budget_tokens, undefined)
+})
+
 test('harness proxy fills missing sampling, keeps client values, and waits while the GPU is swapped', async () => {
   const { startLanProxy } = await import('../src/core/server')
   const upstream = createServer((req, res) => {

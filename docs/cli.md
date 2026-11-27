@@ -171,7 +171,10 @@ opencode, ...) on this PC:
 - `http://127.0.0.1:18300/v1`: OpenAI-compatible chat. llama-server itself runs on :18301 with the profile's
   vision projector. A proxy in front of it fills in the profile's sampling (Qwen: temp 0.6, top_p 0.95,
   top_k 20, min_p 0) when the client sends none, maps `reasoning_effort` high/max to the template's `xhigh`, and
-  converts WebP images to PNG (llama-server cannot decode WebP).
+  converts WebP images to PNG (llama-server cannot decode WebP). For `flash`, low / medium effort also get a thinking
+  budget (`reasoning_budget_tokens` 2048 / 4096, profile `effortBudgets`) unless the request names one: the
+  template's levels alone do not make the thinking reliably shorter (a quest screenshot took 9-176 s at any level,
+  13-18 s with a 1K budget; first-year university test pages: 5-18 s, all right with 1K and 2K). high keeps the engine's 32K ceiling.
 - `http://127.0.0.1:18300/mcp`: MCP (Streamable HTTP, stateless) with `generate_image` (Qwen-Image 2.1, GPU swap:
   the LLM is unloaded, ComfyUI draws, the LLM comes back with its KV cache; chat requests that arrive meanwhile
   wait), `screenshot` (a window or the screen) and `web_search` (keyless). Pictures are returned as MCP image
@@ -299,6 +302,21 @@ verbatim and has no "show but do not record" option; the typed prompt itself sta
 no copy (the ru→en direction has no cache at all); config `translate: false` turns translation off.
 `/image-clean` does not touch the translator: it holds no prompts, and its en→ru cache holds no chat's data (each
 chat's reasoning translations live in that chat). `POST /translate/forget` empties that cache by hand.
+
+Screen reading (plugin `harness/dsh-screen-afkllm`, linked into the desktop profile): a global hotkey (default
+`Ctrl+Alt+S`, config `hotkey`) pressed in any window, e.g. a test page or a game quest, captures that window and
+sends it to the last-used chat as an ordinary user message: the picture (stored like a pasted image) plus the task
+"read the text, solve it, put `Ответ: …` first, then explain" (config `prompt`). The answer lands in the chat, and its
+`Ответ:` line also shows up as a Windows notification, so a game does not have to be left (config `notify`).
+`/screen [question]` typed in Harness captures the window right behind Harness (the one used before switching);
+`/screen status` shows the hotkey state and makes this chat the hotkey's target. A screenshot turn runs at its own
+thinking level, then the chat gets its own level back (`agent.model.select`, this chat only; a busy chat switches
+when its running turn ends): `low` by default (an answer in ~5-18 s), `/screen effort low|medium|high|chat` changes it
+(saved in `~/.afkllm/screen.json`, config `effort`), `/screen high [question]` sets it for one capture. Capture is `capture.ps1` (GDI, no
+modules): the window's area of the screen, or the window drawing itself (`PrintWindow`) when it is behind Harness on
+the same monitor. Exclusive-fullscreen games can come out black: run them borderless/windowed. The temporary PNG
+(%TEMP%\afkllm-screen) is deleted once it is in the chat. Needs a model with image input (flash, q38). Tests:
+`node --test harness/dsh-screen-afkllm/index.test.mjs`.
 
 ## Design notes
 

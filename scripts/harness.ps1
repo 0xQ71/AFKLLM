@@ -25,7 +25,9 @@ if ([Environment]::GetEnvironmentVariable('AFKLLM_API_KEY', 'User') -ne 'local')
 }
 
 # Model profiles: afk's own list (built-in + ~/.afkllm/cli.json)
-# (Windows PowerShell 5.1 returns a JSON array as one object: enumerate it)
+# (Windows PowerShell 5.1 returns a JSON array as one object: enumerate it). The first run after a reboot takes
+# ~10 s (node/tsx cold start + antivirus scan) with nothing on screen, so say what is going on.
+Write-Host 'AFKLLM: читаю список моделей (после перезагрузки до ~15 с)...'
 $json = & $afk models --json | ConvertFrom-Json
 $profiles = @($json | ForEach-Object { $_ })
 if (-not $profiles.Count) { throw 'afk models вернул пустой список' }

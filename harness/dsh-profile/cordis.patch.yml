@@ -496,3 +496,17 @@
     appVersion: !!js process.env.DSH_CLIENT_VERSION
 - id: desktop-product-telemetry
   disabled: true
+
+# Screen reading (<AFKLLM>\harness\dsh-screen-afkllm, linked): Ctrl+Alt+S anywhere (a test, a game quest) captures
+# the window in front and sends it to the last-used chat with "read it, solve it, answer first"; the answer comes to
+# the chat and as a Windows notification. /screen [question] in Harness captures the window behind it; /screen status.
+- insert:
+    - id: screen-afkllm
+      name: dsh-screen-afkllm
+      config:
+        hotkey: Ctrl+Alt+S
+        notify: true
+        # thinking level of a screenshot turn: low (default, ~5-18 s) | medium | high | chat (the chat's own);
+        # `/screen effort <level>` in a chat overrides it (saved in ~/.afkllm/screen.json)
+        effort: low
+        # prompt: "..."   (the task text sent with the picture; default: answer first, then a short explanation)

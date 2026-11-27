@@ -20,6 +20,12 @@ export interface ModelProfile {
   thinking?: boolean
   /** set: the model runs on the Strata engine (strata.ts) instead of llama-server; `args` are then unused */
   strata?: StrataSpec
+  /**
+   * Thinking budget (tokens) the proxy adds to a chat request at a lower effort that names none of its own: the
+   * template's low / medium are only a hint and do not make the thinking reliably shorter. Strata closes the thinking
+   * at the budget (wrap-up, </think>, the answer). high / xhigh keep the engine's own ceiling.
+   */
+  effortBudgets?: Partial<Record<'low' | 'medium', number>>
 }
 
 const MODELS = process.env.AFK_MODELS_DIR || 'C:\\Models'
@@ -141,6 +147,14 @@ export const BUILTIN_PROFILES: Record<string, ModelProfile> = {
     },
     // the model card's thinking-mode sampling (also what its agentic evals used): temperature 1.0, not the 27B's 0.6
     sampling: { temperature: 1.0, top_p: 0.95, top_k: 20, min_p: 0, presence_penalty: 0 },
+    // Measured 2026-11-27 on screenshots of tests (Harness /screen): low / medium / xhigh without a budget all took
+    // 5-13 s on ordinary questions, but a Caesar-cipher quest took 9-176 s at any level (medium once thought 10K tokens
+    // and answered wrong). low with a 1024 budget: 13-18 s, 3/3 right, ordinary questions unchanged (they think
+    // 100-600 tokens). First-year university pages (calculus, linear algebra, ODE, CS, English, Russian; 36 runs):
+    // 1024 and 2048 equally right and fast (the model stops by itself at ~300-800 tokens); 2048 = headroom for a long
+    // page of questions at no cost on short ones (~17 s more at worst).
+    // Harness: low = screenshots and session titles; medium = a capped agent step (steps use 0.1-2.4K).
+    effortBudgets: { low: 2048, medium: 4096 },
   },
 }
 
@@ -376,6 +390,15 @@ export function mapReasoningEffort(level: string): string {
   }
 }
 
+/** The effort a chat body asks for (top-level, `reasoning.effort` or the template kwarg), mapped; undefined: none. */
+function bodyEffort(body: Record<string, unknown>): string | undefined {
+  const r = body.reasoning, k = body.chat_template_kwargs
+  const raw = [body.reasoning_effort, r && typeof r === 'object' ? (r as Record<string, unknown>).effort : undefined,
+    k && typeof k === 'object' ? (k as Record<string, unknown>).reasoning_effort : undefined]
+    .find((v): v is string => typeof v === 'string' && v.length > 0)
+  return raw === undefined ? undefined : mapReasoningEffort(raw)
+}
+
 function mapEffortField(value: unknown): { value: string; changed: boolean } | undefined {
   if (typeof value !== 'string' || !value) return undefined
   const mapped = mapReasoningEffort(value)
@@ -387,7 +410,8 @@ function mapEffortField(value: unknown): { value: string; changed: boolean } | u
  * and the profile's sampling (Qwen: temp 0.6, top_p 0.95, top_k 20, min_p 0) for every field the client did not set —
  * harness clients send none, and llama-server's own defaults (temp 0.8, top_k 40, min_p 0.05) are worse for code.
  */
-export function rewriteChatBody(raw: Buffer, contentType?: string, sampling?: Sampling): Buffer {
+export function rewriteChatBody(raw: Buffer, contentType?: string, sampling?: Sampling,
+  effortBudgets?: ModelProfile['effortBudgets']): Buffer {
   if (contentType && !contentType.toLowerCase().includes('json')) return raw
   if (!raw.length) return raw
   const text = raw.toString('utf8')
@@ -412,6 +436,12 @@ export function rewriteChatBody(raw: Buffer, contentType?: string, sampling?: Sa
   if (Array.isArray(body.messages)) {
     for (const [k, v] of fill) {
       if (body[k] === undefined || body[k] === null) { body[k] = v; changed = true }
+    }
+    const effort = bodyEffort(body)
+    const budget = effort === 'low' || effort === 'medium' ? effortBudgets?.[effort] : undefined
+    if (budget && body.reasoning_budget_tokens == null && body.thinking_budget_tokens == null) {
+      body.reasoning_budget_tokens = budget
+      changed = true
     }
   }
   return changed ? Buffer.from(JSON.stringify(body)) : raw
@@ -483,6 +513,8 @@ export interface LanProxyOptions {
   upstreamPort: number
   /** sampling defaults filled into chat requests that do not set them (a function: read per request, after onChat) */
   sampling?: Sampling | (() => Sampling | undefined)
+  /** thinking budgets for low / medium effort (ModelProfile.effortBudgets), read per request like `sampling` */
+  effortBudgets?: () => ModelProfile['effortBudgets']
   /**
    * Called for each chat request with its `model` field once the gate is open, before the request is forwarded:
    * `afk api` loads the profile the client asked for here (the request waits). A throw answers 503.
@@ -522,7 +554,7 @@ export function startLanProxy(opts: LanProxyOptions): Promise<LanProxy> {
         await gate()
         if (opts.onChat) await opts.onChat(chatModel(body))
         const sampling = typeof opts.sampling === 'function' ? opts.sampling() : opts.sampling
-        const out = rewriteChatBody(body, req.headers['content-type'], sampling)
+        const out = rewriteChatBody(body, req.headers['content-type'], sampling, opts.effortBudgets?.())
         forwardToLlama(req, res, await webpToPng(out).catch(() => out), opts.upstreamPort)
       })().catch((e) => {
         if (!res.headersSent) res.writeHead(503, { 'content-type': 'application/json' })

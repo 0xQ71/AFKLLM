@@ -1,0 +1,11 @@
+{
+  "name": "dsh-screen-afkllm",
+  "version": "1.0.0",
+  "description": "DeepSeek Harness: a hotkey (Ctrl+Alt+S) or /screen captures the window with a test, quiz or game quest and sends it to the chat; the model reads it, solves it and answers in the chat and a Windows notification",
+  "type": "module",
+  "main": "index.js",
+  "exports": { ".": "./index.js", "./package.json": "./package.json" },
+  "files": ["index.js", "capture.ps1"],
+  "license": "MIT",
+  "private": true
+}
